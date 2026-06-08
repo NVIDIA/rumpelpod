@@ -1,0 +1,9 @@
+#!/bin/sh
+# Enforce DCO sign-off (CONTRIBUTING.md). git merge runs this too.
+if grep -q '^Signed-off-by: ' "$1"; then
+    exit 0
+fi
+
+echo "commit-msg: missing Signed-off-by trailer." >&2
+echo "Commit with 'git commit -s'. Merge pods with 'rumpel merge <pod> --signoff'." >&2
+exit 1

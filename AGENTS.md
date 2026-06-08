@@ -3,6 +3,7 @@ This is a rust project implementing an isolated LLM agent runner (rumpelpod).
 - Comments and commit messages should explain "why", not "what".
   Don't paraphrase code next to the comment.
 - If you write code, you should commit your changes.
+- Every commit must be signed off (`git commit -s`).
 - Always run tests via `cargo pipeline`, not `cargo xtest` directly.
   The pipeline records xtest output to `target/xtest/<timestamp>.log`.
   `--continue` parses that log to skip already-passed tests.

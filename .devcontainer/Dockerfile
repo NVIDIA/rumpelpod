@@ -203,6 +203,8 @@ USER ${USER}
 RUN git clone https://github.com/nvidia/rumpelpod /workspaces/rumpelpod
 WORKDIR /workspaces/rumpelpod
 
+COPY --chown=${USER}:${USER} --chmod=755 commit-msg /workspaces/rumpelpod/.git/hooks/commit-msg
+
 # Populate target/ so incremental builds are fast.
 RUN cargo build --bin rumpel --target x86_64-unknown-linux-musl \
     && cargo build --bin rumpel --target aarch64-unknown-linux-musl \
