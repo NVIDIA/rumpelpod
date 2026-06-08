@@ -1,8 +1,8 @@
 Hard-code the devcontainer repo URL
 
-The repo URL is constant, so there is no need to thread it through a
-REPO_URL build arg and host environment variable. Inline the GitHub
-URL directly in the Dockerfile git clone and drop the arg.
+The repo is now public, so there is no need to make its URL
+configurable via a REPO_URL build arg and host environment variable.
+Inline the public HTTPS URL directly in the Dockerfile git clone.
 
-Since the clone now uses a public HTTPS URL, the SSH mount and the
-"--ssh default" build option are no longer needed.
+A public HTTPS clone needs no authentication, so the SSH mount and the
+"--ssh default" build option are dropped as well.
