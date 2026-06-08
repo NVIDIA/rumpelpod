@@ -1,0 +1,5 @@
+Hard-code the devcontainer repo URL
+
+The repo URL is constant, so there is no need to thread it through a
+REPO_URL build arg and host environment variable. Inline the GitHub
+URL directly in the Dockerfile git clone and drop the arg.

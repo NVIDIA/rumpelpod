@@ -200,10 +200,9 @@ RUN ARCH=$(uname -m) && \
 RUN mkdir /workspaces && chown -R ${USER}:${USER} /workspaces
 USER ${USER}
 
-ARG REPO_URL
 RUN --mount=type=ssh,uid=${USER_ID},gid=${GROUP_ID} \
     GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
-    git clone "${REPO_URL}" /workspaces/rumpelpod
+    git clone https://github.com/nvidia/rumpelpod /workspaces/rumpelpod
 WORKDIR /workspaces/rumpelpod
 
 # Populate target/ so incremental builds are fast.

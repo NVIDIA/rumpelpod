@@ -2,8 +2,7 @@
     "build": {
         "dockerfile": "Dockerfile",
         "args": {
-            "BASE_IMAGE": "${localEnv:BASE_IMAGE:debian:trixie}",
-            "REPO_URL": "${localEnv:REPO_URL}"
+            "BASE_IMAGE": "${localEnv:BASE_IMAGE:debian:trixie}"
         },
         "options": ["--ssh", "default"]
     },
