@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG BASE_IMAGE=debian:trixie
+ARG BASE_IMAGE=debian:testing
 
 FROM $BASE_IMAGE
 
@@ -157,7 +157,7 @@ RUN if ! getent group ${USER} > /dev/null 2>&1; then \
         useradd -m -u ${USER_ID} -g ${USER} ${USER}; \
     fi && \
     echo "${USER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
-    usermod -aG docker ${USER}
+    usermod -aG docker -s /bin/bash ${USER}
 
 USER ${USER}
 
