@@ -1,0 +1,17 @@
+Use inherited DNS for the nested k3d cluster
+
+The devcontainer hard-coded a public DNS override (8.8.8.8, 1.1.1.1)
+in the Docker daemon config so that k3d nodes could resolve
+registry-1.docker.io and pull the k3s pause image. Without it CoreDNS
+never started.
+
+The real cause was not that the inherited resolver was unreachable: a
+plain container in the pod resolves fine through it. It was a service
+CIDR collision. The nested k3s defaulted to 10.43.0.0/16, the same
+range the outer k8s cluster uses for its DNS service (10.43.0.10).
+Inside each k3d node the nested kube-proxy then claimed that range and
+hijacked the forwarded DNS queries, routing them to the nested CoreDNS
+service that had no endpoints yet.
+
+Move the nested cluster to 10.45.0.0/16 so the inherited resolver
+works as-is, and drop the public DNS override.

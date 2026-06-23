@@ -43,10 +43,21 @@ if k3d cluster list -o json | grep -q "\"name\":\"$CLUSTER_NAME\""; then
     k3d cluster delete "$CLUSTER_NAME"
 fi
 
+# The nested k3s service CIDR must not overlap the outer cluster's.
+# When this devcontainer runs as a pod on an outer k8s cluster, the
+# inherited /etc/resolv.conf points at the outer cluster DNS (k3s
+# default 10.43.0.10). k3d nodes forward DNS there, but if the nested
+# cluster also uses the default 10.43.0.0/16 its own kube-proxy claims
+# that range inside the nodes and hijacks the forwarded queries (the
+# nested CoreDNS has no endpoints yet), so image pulls fail and CoreDNS
+# never starts. Moving the nested CIDR off 10.43.0.0/16 lets the
+# inherited resolver work as-is, no public DNS override needed.
 echo "==> Creating k3d cluster $CLUSTER_NAME..."
 k3d cluster create "$CLUSTER_NAME" \
     --registry-create "$REGISTRY_NAME:0.0.0.0:$REGISTRY_PORT" \
     --k3s-arg "--disable=traefik@server:0" \
+    --k3s-arg "--service-cidr=10.45.0.0/16@server:0" \
+    --k3s-arg "--cluster-dns=10.45.0.10@server:0" \
     --no-lb
 
 echo "==> Exporting kubeconfig..."

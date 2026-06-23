@@ -43,15 +43,15 @@ RUN export DEBIAN_FRONTEND=noninteractive \
 # - insecure-registries: the k3d built-in registry speaks HTTP. The
 #   .localhost suffix resolves to ::1 (IPv6), which falls outside
 #   Docker's default insecure range (127.0.0.0/8).
-# - dns: when the devcontainer runs as a pod on an outer k8s cluster,
-#   /etc/resolv.conf points at a cluster service IP (10.x) that's not
-#   reachable from Docker's bridge network namespace. Without explicit
-#   DNS here, k3d nodes cannot resolve registry-1.docker.io and k3s
-#   fails to pull the pause image, so CoreDNS never starts.
+# No "dns" override: k3d nodes inherit the pod's resolver from
+# /etc/resolv.conf, which already forwards to the real host upstreams.
+# The collision that used to break this (the nested k3s service CIDR
+# overlapping the outer cluster's, so the inherited resolver IP got
+# hijacked inside the nodes) is avoided by moving the nested CIDR in
+# provision-k3d.sh.
 RUN mkdir -p /etc/docker && printf '%s\n' \
     '{' \
-    '  "insecure-registries": ["rumpelpod-registry.localhost:5000"],' \
-    '  "dns": ["8.8.8.8", "1.1.1.1"]' \
+    '  "insecure-registries": ["rumpelpod-registry.localhost:5000"]' \
     '}' > /etc/docker/daemon.json
 
 RUN dpkg_arch=$(dpkg --print-architecture) && \
