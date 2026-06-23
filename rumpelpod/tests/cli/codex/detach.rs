@@ -17,7 +17,7 @@ fn codex_detach_reattach() {
 
     // -- First session: dummy conversation, then detach -----------------
 
-    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &["-m", "o3"]);
+    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     session.dismiss_dialogs();
     session.send("What is the capital of France? Reply with just the city name, nothing else.");
     session.wait_for("Paris");
@@ -32,6 +32,6 @@ fn codex_detach_reattach() {
     // buffer so the previous question and answer are visible
     // immediately, with no dismiss_dialogs() needed.
 
-    let mut session2 = CodexSession::spawn(&repo, &daemon, home.path(), &["-m", "o3"]);
+    let mut session2 = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     session2.wait_for("Paris");
 }

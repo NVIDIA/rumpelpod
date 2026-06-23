@@ -32,7 +32,7 @@ fn codex_app_server_starts_in_workspace() {
     std::env::set_current_dir(original_dir).expect("restore current dir");
     fs::write(repo.path().join(".rumpelpod.json"), &executor.json).expect("write .rumpelpod.json");
 
-    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &["-m", "o3"]);
+    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     session.dismiss_dialogs();
 
     let container_cwd = wait_for_codex_app_server_cwd(&repo, &daemon, Duration::from_secs(60));

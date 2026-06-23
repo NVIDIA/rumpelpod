@@ -810,8 +810,8 @@ fn no_devcontainer_enters_with_default_image() {
 }
 
 /// Even when the daemon cannot see a host codex binary, prepared-image
-/// should still add /AGENTS.md if the devcontainer image already
-/// contains codex.
+/// should still inject the rumpelpod prompt into ~/.codex/AGENTS.md if
+/// the devcontainer image already contains codex.
 #[test]
 fn base_image_with_codex_gets_agents_prompt_without_host_codex() {
     let repo = TestRepo::new();
@@ -834,7 +834,7 @@ fn base_image_with_codex_gets_agents_prompt_without_host_codex() {
             "--",
             "sh",
             "-c",
-            "test -f /AGENTS.md && grep -F DESCRIPTION /AGENTS.md",
+            "test -f \"$HOME/.codex/AGENTS.md\" && grep -F DESCRIPTION \"$HOME/.codex/AGENTS.md\"",
         ])
         .output()
         .expect("rumpel enter failed");
@@ -842,7 +842,7 @@ fn base_image_with_codex_gets_agents_prompt_without_host_codex() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "/AGENTS.md should exist when codex is already in the image, stderr: {stderr}",
+        "~/.codex/AGENTS.md should exist when codex is already in the image, stderr: {stderr}",
     );
 }
 

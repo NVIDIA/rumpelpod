@@ -30,14 +30,25 @@ pub fn setup_controlled_home(home: &TestHome) {
         r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-fake-test-key-for-llm-cache-proxy-00000000"}"#,
     )
     .expect("write auth.json");
-    // Route API calls through the LLM cache proxy running on the
-    // pod server.  Uses config.toml rather than the deprecated
-    // OPENAI_BASE_URL env var.  `${containerEnv:...}` is substituted
-    // by /write-home-files using the pod server's environment
-    // (test-mode only; see pod/server.rs::write_home_files_impl).
+    // Route API calls through the LLM cache proxy running on the pod
+    // server via a custom model provider.  `supports_websockets = false`
+    // forces Codex onto the plain HTTPS transport: the cache proxy only
+    // speaks HTTP, so the default WebSocket transport would fail and
+    // retry-loop before falling back.  `${containerEnv:...}` is
+    // substituted in-pod when the config is extracted (test-mode only;
+    // see pod/server.rs::agent_files_put_impl).
     std::fs::write(
         codex_dir.join("config.toml"),
-        "openai_base_url = \"http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/openai/v1\"\n",
+        indoc::indoc! {r#"
+            model_provider = "cacheproxy"
+
+            [model_providers.cacheproxy]
+            name = "cacheproxy"
+            base_url = "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/openai/v1"
+            wire_api = "responses"
+            requires_openai_auth = true
+            supports_websockets = false
+        "#},
     )
     .expect("write config.toml");
 }
