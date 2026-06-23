@@ -12,18 +12,20 @@ codex`.
   or the `grok.alwaysApprove` config key.
 - Auth is forwarded two ways: the host's `XAI_API_KEY` is injected into
   the session environment, and `~/.grok/auth.json` (from `grok login`)
-  is copied into the pod when present.
+  plus `~/.grok/config.toml` are copied into the pod when present.
 - The Grok CLI is a pinned, statically-linked binary installed into the
   prepared image (and the devcontainer) per host architecture.
 - Grok state (`~/.grok`) participates in fork/recreate state transfer.
-- The LLM cache proxy gains an `xai` provider (api.x.ai, Bearer auth);
-  the grok smoke test routes grok's model-catalog fetch through it so
-  the test runs offline without reaching the public internet.
+- The LLM cache proxy gains an `xai` provider (api.x.ai, Bearer auth) so
+  the grok smoke test runs deterministically offline.
 
-The grok smoke test asserts that the integration brings grok up to an
-authenticated, ready prompt in the pod, rather than asserting a cached
-model response: grok's chat/inference client always targets the public
-xAI API and offers no base-URL override to redirect at the cache proxy.
+grok's chat/inference client does not honor a top-level base-URL
+override, but it does honor a per-model `base_url` in
+`~/.grok/config.toml`.  The smoke test sets one pointing at the cache
+proxy, so it asserts a real cached model response ("Paris") fully
+offline, like the claude and codex smoke tests.  The xai cache key keeps
+only the user turns (grok's system prompt carries volatile working-dir
+and date content).
 
 Deferred: grok session-state notification hooks (the live
 processing/waiting indicators that `rumpel claude`/`codex` surface).

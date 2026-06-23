@@ -16,37 +16,59 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use crate::common::{write_test_devcontainer, TestDaemon, TestHome, TestRepo};
 use crate::executor::ExecutorResources;
 
-/// A model the API key can access.  Only used to populate the TUI's
-/// model selection; the coding-agent default (`grok-build`) is gated to
-/// certain teams.
+/// The model grok is configured to use.  The coding-agent default
+/// (`grok-build`) is gated to certain teams, so tests pin an
+/// always-available model.  It is also the `model` field grok sends in
+/// the chat request body, so it feeds the cache key.
 pub const GROK_TEST_MODEL: &str = "grok-4.20-0309-non-reasoning";
 
-/// Write a devcontainer that points grok's model/catalog fetches at the
+/// Write a devcontainer that routes grok's model-catalog fetches at the
 /// pod server's LLM cache proxy and supplies a (fake) API key.
 ///
-/// grok's model-list client honors `GROK_XAI_API_BASE_URL` /
-/// `GROK_MODELS_BASE_URL` / `GROK_MODELS_LIST_URL`, so routing them at
-/// the proxy keeps startup off the public internet (the pod is network
-/// isolated in tests).  The fake key is enough for grok to consider
-/// itself logged in and render its prompt.
+/// grok's model-list client honors `GROK_MODELS_BASE_URL` /
+/// `GROK_MODELS_LIST_URL`, so routing them at the proxy keeps startup
+/// off the public internet (the pod is network isolated in tests).  The
+/// chat/inference client is redirected separately via the per-model
+/// `base_url` in `~/.grok/config.toml` (see `write_controlled_home`).
+/// The fake key is enough for grok to consider itself logged in.
 /// `${containerEnv:RUMPELPOD_SERVER_PORT}` resolves to the ephemeral
 /// port container-serve exports (test-mode only).
-///
-/// Note: grok's chat/inference client always targets the public xAI API
-/// and does not honor a base-URL override, so unlike the claude and
-/// codex smoke tests this setup cannot cache a model *response*.  The
-/// grok smoke test therefore asserts that the integration brings grok up
-/// to a ready prompt rather than asserting a cached answer.
 fn write_grok_test_devcontainer(repo: &TestRepo) {
     let extra_json = r#",
         "remoteEnv": {
             "XAI_API_KEY": "xai-fake-test-key-for-llm-cache-proxy-00000000",
-            "GROK_XAI_API_BASE_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/xai/v1",
             "GROK_MODELS_BASE_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/xai/v1",
             "GROK_MODELS_LIST_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/xai/v1/models"
         }"#;
 
     write_test_devcontainer(repo, "", extra_json);
+}
+
+/// Write `~/.grok/config.toml` into the test home.
+///
+/// Defines a model whose per-model `base_url` points grok's
+/// chat/inference traffic at the pod server's LLM cache proxy -- the one
+/// override grok honors for the chat client (the top-level
+/// `xai_api_base_url` does not).  `rumpel grok` copies `~/.grok` into the
+/// pod, and the agent-files handler substitutes `${containerEnv:...}` in
+/// test mode, so the port is filled in container-side.  The dummy key is
+/// replaced by the cache proxy before any forward to the real API.
+fn write_controlled_home(home: &TestHome) {
+    let grok_dir = home.path().join(".grok");
+    std::fs::create_dir_all(&grok_dir).expect("create .grok dir");
+    std::fs::write(
+        grok_dir.join("config.toml"),
+        format!(
+            "[model.localcache]\n\
+             model = \"{GROK_TEST_MODEL}\"\n\
+             base_url = \"http://127.0.0.1:${{containerEnv:RUMPELPOD_SERVER_PORT}}/llm-cache-proxy/xai/v1\"\n\
+             api_key = \"dummy-key-replaced-by-cache-proxy\"\n\
+             \n\
+             [models]\n\
+             default = \"localcache\"\n"
+        ),
+    )
+    .expect("write grok config.toml");
 }
 
 /// Set up everything needed before running a grok command.
@@ -58,32 +80,7 @@ pub fn setup_grok_test_repo() -> (TestHome, TestRepo, ExecutorResources, TestDae
     write_grok_test_devcontainer(&repo);
 
     let home = TestHome::new();
-    let executor = ExecutorResources::setup(&home);
-    let daemon = TestDaemon::start_with_local_grok(&home);
-    std::fs::write(repo.path().join(".rumpelpod.json"), &executor.json)
-        .expect("write .rumpelpod.json");
-    (home, repo, executor, daemon)
-}
-
-/// Set up a repo for the opt-in online grok test.
-///
-/// Injects a real `XAI_API_KEY` and does not route grok through the
-/// cache proxy: the online test needs grok's inference client to reach
-/// the live xAI API (it cannot be redirected at the proxy).
-pub fn setup_grok_online_test_repo(
-    api_key: &str,
-) -> (TestHome, TestRepo, ExecutorResources, TestDaemon) {
-    let repo = TestRepo::new();
-    // The key is alphanumeric plus dashes, so it needs no JSON escaping.
-    let extra_json = format!(
-        r#",
-        "remoteEnv": {{
-            "XAI_API_KEY": "{api_key}"
-        }}"#
-    );
-    write_test_devcontainer(&repo, "", &extra_json);
-
-    let home = TestHome::new();
+    write_controlled_home(&home);
     let executor = ExecutorResources::setup(&home);
     let daemon = TestDaemon::start_with_local_grok(&home);
     std::fs::write(repo.path().join(".rumpelpod.json"), &executor.json)
@@ -109,8 +106,13 @@ pub struct GrokSession {
 }
 
 impl GrokSession {
-    /// Spawn `rumpel grok --create test -- --model <model>` inside a PTY.
-    pub fn spawn(repo: &TestRepo, daemon: &TestDaemon, home: &Path, model: &str) -> Self {
+    /// Spawn `rumpel grok --create test` inside a PTY.
+    ///
+    /// No `--model` is passed: the model (and its proxy `base_url`) come
+    /// from the `[models] default` entry in the copied config.toml.
+    /// Passing `--model <upstream-id>` would select a model without the
+    /// per-model `base_url` and bypass the cache proxy.
+    pub fn spawn(repo: &TestRepo, daemon: &TestDaemon, home: &Path) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -137,7 +139,7 @@ impl GrokSession {
             std::env::var("RUMPELPOD_TEST_LLM_OFFLINE").unwrap_or_else(|_| "1".to_string()),
         );
 
-        cmd.args(["grok", "--create", "test", "--", "--model", model]);
+        cmd.args(["grok", "--create", "test"]);
 
         let child = pair.slave.spawn_command(cmd).expect("spawn rumpel grok");
 

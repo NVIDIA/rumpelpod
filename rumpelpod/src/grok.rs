@@ -9,7 +9,8 @@
 //! WebSocket route.  Authentication is forwarded two ways, mirroring the
 //! ways grok itself accepts credentials: the host's `XAI_API_KEY` is
 //! injected into the session environment, and `~/.grok/auth.json` (from
-//! `grok login`) is copied into the pod when present.
+//! `grok login`) is copied into the pod when present.  `~/.grok/config.toml`
+//! is copied alongside it so the user's model and CLI settings carry over.
 
 use std::time::Instant;
 
@@ -91,13 +92,15 @@ pub fn grok(cmd: &GrokCommand) -> Result<()> {
     Ok(())
 }
 
-/// Forward grok credentials from the local machine into the pod.
+/// Forward grok credentials and config from the local machine into the
+/// pod.
 ///
 /// Appends `XAI_API_KEY=<value>` to `session_env` when set on the host,
-/// and copies `~/.grok/auth.json` (written by `grok login`) into the
-/// pod when present.  Either is sufficient to authenticate; credentials
-/// may also be supplied by the devcontainer environment, so a missing
-/// local credential is a warning rather than an error.
+/// and copies `~/.grok/auth.json` (written by `grok login`) plus
+/// `~/.grok/config.toml` into the pod when present.  Either the env key
+/// or auth.json is sufficient to authenticate; credentials may also be
+/// supplied by the devcontainer environment, so a missing local
+/// credential is a warning rather than an error.
 fn write_grok_credentials(
     pod: &crate::pod::PodClient,
     session_env: &mut Vec<String>,
@@ -113,9 +116,23 @@ fn write_grok_credentials(
     }
 
     let local_home = dirs::home_dir().context("could not determine home directory")?;
-    let auth_path = local_home.join(".grok/auth.json");
-    if auth_path.exists() {
-        let entries = vec![(".grok/auth.json".to_string(), auth_path)];
+    let grok_dir = local_home.join(".grok");
+    let auth_path = grok_dir.join("auth.json");
+    let auth_present = auth_path.exists();
+    have_credential |= auth_present;
+
+    let entries: Vec<(String, std::path::PathBuf)> = vec![
+        (".grok/auth.json".to_string(), auth_path),
+        (
+            ".grok/config.toml".to_string(),
+            grok_dir.join("config.toml"),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, p)| p.exists())
+    .collect();
+
+    if !entries.is_empty() {
         let (read_end, write_end) = std::io::pipe().context("creating pipe for grok tar")?;
         let handle = std::thread::spawn(move || -> Result<()> {
             let mut archive = tar::Builder::new(write_end);
@@ -132,7 +149,6 @@ fn write_grok_credentials(
         handle
             .join()
             .map_err(|_| anyhow::anyhow!("grok tar thread panicked"))??;
-        have_credential = true;
     }
 
     if !have_credential {

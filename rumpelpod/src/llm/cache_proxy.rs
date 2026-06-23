@@ -108,6 +108,21 @@ fn strip_openai_non_user_input(value: &mut serde_json::Value) {
     input.retain(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"));
 }
 
+/// Drop everything but the user turns from a chat-completions `messages`
+/// array.  grok injects a volatile system prompt (working directory,
+/// date, available tools) that would otherwise make the cache key unique
+/// per run; keying on the user turns alone keeps it stable.
+fn strip_non_user_messages(value: &mut serde_json::Value) {
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    messages.retain(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"));
+}
+
 /// Extract only the fields that determine API response semantics.
 /// Everything else (system prompts, tools, metadata, temperature, etc.)
 /// is excluded so the cache survives CLI version changes.
@@ -126,6 +141,9 @@ fn extract_cache_fields(provider: &str, body: &[u8], fields: &[&str]) -> Vec<u8>
     let mut key_value = serde_json::Value::Object(key_fields);
     if provider == "openai" {
         strip_openai_non_user_input(&mut key_value);
+    }
+    if provider == "xai" {
+        strip_non_user_messages(&mut key_value);
     }
 
     serde_json::to_vec(&key_value).unwrap_or_else(|_| body.to_vec())
