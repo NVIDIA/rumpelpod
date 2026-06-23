@@ -1,0 +1,7 @@
+Test that source files carry SPDX headers
+
+Adds rumpelpod/tests/license_headers.rs, sitting alongside the
+THIRD-PARTY-NOTICES check and serving the same purpose: it walks
+every tracked .rs/.sh/.toml/.yml file and Dockerfile and fails if
+the SPDX copyright and Apache-2.0 license lines are missing from
+the top, so a new source file cannot be merged without attribution.
