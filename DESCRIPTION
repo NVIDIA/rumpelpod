@@ -16,8 +16,14 @@ codex`.
 - The Grok CLI is a pinned, statically-linked binary installed into the
   prepared image (and the devcontainer) per host architecture.
 - Grok state (`~/.grok`) participates in fork/recreate state transfer.
-- The LLM cache proxy gains an `xai` provider (api.x.ai, Bearer auth) so
-  grok integration tests run deterministically offline.
+- The LLM cache proxy gains an `xai` provider (api.x.ai, Bearer auth);
+  the grok smoke test routes grok's model-catalog fetch through it so
+  the test runs offline without reaching the public internet.
+
+The grok smoke test asserts that the integration brings grok up to an
+authenticated, ready prompt in the pod, rather than asserting a cached
+model response: grok's chat/inference client always targets the public
+xAI API and offers no base-URL override to redirect at the cache proxy.
 
 Deferred: grok session-state notification hooks (the live
 processing/waiting indicators that `rumpel claude`/`codex` surface).

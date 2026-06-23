@@ -16,25 +16,34 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use crate::common::{write_test_devcontainer, TestDaemon, TestHome, TestRepo};
 use crate::executor::ExecutorResources;
 
-/// Model the API key on this account can access.  The coding-agent
-/// default (`grok-build`) is gated to certain teams, so tests pin an
-/// always-available model to keep the request (and its cache key)
-/// deterministic.
+/// A model the API key can access.  Only used to populate the TUI's
+/// model selection; the coding-agent default (`grok-build`) is gated to
+/// certain teams.
 pub const GROK_TEST_MODEL: &str = "grok-4.20-0309-non-reasoning";
 
-/// Write a devcontainer that routes grok's API calls through the pod
-/// server's LLM cache proxy.
+/// Write a devcontainer that points grok's model/catalog fetches at the
+/// pod server's LLM cache proxy and supplies a (fake) API key.
 ///
-/// grok reads `XAI_API_BASE_URL` as the public xAI API base; pointing
-/// it at the proxy makes every `/v1/chat/completions` request cacheable.
+/// grok's model-list client honors `GROK_XAI_API_BASE_URL` /
+/// `GROK_MODELS_BASE_URL` / `GROK_MODELS_LIST_URL`, so routing them at
+/// the proxy keeps startup off the public internet (the pod is network
+/// isolated in tests).  The fake key is enough for grok to consider
+/// itself logged in and render its prompt.
 /// `${containerEnv:RUMPELPOD_SERVER_PORT}` resolves to the ephemeral
-/// port container-serve exports (test-mode only).  The fake key is fine
-/// because the cache proxy replaces the auth header before forwarding.
+/// port container-serve exports (test-mode only).
+///
+/// Note: grok's chat/inference client always targets the public xAI API
+/// and does not honor a base-URL override, so unlike the claude and
+/// codex smoke tests this setup cannot cache a model *response*.  The
+/// grok smoke test therefore asserts that the integration brings grok up
+/// to a ready prompt rather than asserting a cached answer.
 fn write_grok_test_devcontainer(repo: &TestRepo) {
     let extra_json = r#",
         "remoteEnv": {
             "XAI_API_KEY": "xai-fake-test-key-for-llm-cache-proxy-00000000",
-            "XAI_API_BASE_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/xai"
+            "GROK_XAI_API_BASE_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/xai/v1",
+            "GROK_MODELS_BASE_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/xai/v1",
+            "GROK_MODELS_LIST_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/xai/v1/models"
         }"#;
 
     write_test_devcontainer(repo, "", extra_json);
