@@ -14,6 +14,11 @@ use super::common::{setup_grok_test_repo, GrokSession};
 
 #[test]
 fn grok_smoke() {
+    // On a cold cache the prepared image build downloads the ~142 MiB
+    // grok binary; give it headroom over the default 120s timeout on
+    // slow networks (the grok binary is much larger than codex's).
+    println!("xtest:timeout=180");
+
     let (home, repo, _executor, daemon) = setup_grok_test_repo();
 
     let mut session = GrokSession::spawn(&repo, &daemon, home.path());
