@@ -364,7 +364,7 @@ fn docker_status(docker: &Docker, id: &PodId) -> Result<PodStatus> {
 async fn docker_exec(docker: &Docker, id: &PodId, req: ExecRequest) -> Result<ExecOutput> {
     use bollard::container::LogOutput;
     use bollard::exec::StartExecResults;
-    use bollard::secret::ExecConfig;
+    use bollard::models::ExecConfig;
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
 
@@ -497,7 +497,7 @@ async fn docker_exec_streaming(
 ) -> Result<ExecStreams> {
     use bollard::container::LogOutput;
     use bollard::exec::StartExecResults;
-    use bollard::secret::ExecConfig;
+    use bollard::models::ExecConfig;
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
 
@@ -604,10 +604,11 @@ async fn k8s_exec_streaming(
 }
 
 fn docker_launch(docker: &Docker, id: &PodId, spec: PodSpec) -> Result<()> {
-    use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
-    use bollard::secret::{
-        ContainerCreateBody, HostConfig, Mount as BollardMount, MountTypeEnum, PortBinding,
+    use bollard::models::{
+        ContainerCreateBody, HostConfig, Mount as BollardMount, MountType as BollardMountType,
+        PortBinding,
     };
+    use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
 
     let PodSpec {
         image,
@@ -633,9 +634,9 @@ fn docker_launch(docker: &Docker, id: &PodId, spec: PodSpec) -> Result<()> {
         .into_iter()
         .map(|m| {
             let typ = match m.mount_type {
-                MountType::Bind => MountTypeEnum::BIND,
-                MountType::Volume => MountTypeEnum::VOLUME,
-                MountType::Tmpfs => MountTypeEnum::TMPFS,
+                MountType::Bind => BollardMountType::BIND,
+                MountType::Volume => BollardMountType::VOLUME,
+                MountType::Tmpfs => BollardMountType::TMPFS,
             };
             BollardMount {
                 target: Some(m.target),
@@ -847,7 +848,7 @@ fn k8s_launch(backend: &K8sBackend, id: &PodId, spec: PodSpec) -> Result<()> {
 
 fn docker_exec_detached(docker: &Docker, id: &PodId, req: ExecRequest) -> Result<()> {
     use bollard::exec::StartExecOptions;
-    use bollard::secret::ExecConfig;
+    use bollard::models::ExecConfig;
 
     let env: Vec<String> = req.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let config = ExecConfig {
