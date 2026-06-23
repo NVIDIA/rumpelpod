@@ -168,7 +168,7 @@ RUN rustup component add rust-analyzer \
 
 # cargo-about generates ATTRIBUTION.md; the attribution integration test
 # shells out to it on every pipeline run.
-RUN cargo install cargo-about --locked
+RUN cargo install cargo-about --locked --features cli
 
 # Set default target to native architecture. Cargo merges this with the
 # project's .cargo/config.toml which has per-target linker settings.
