@@ -65,6 +65,32 @@ pub fn setup_grok_test_repo() -> (TestHome, TestRepo, ExecutorResources, TestDae
     (home, repo, executor, daemon)
 }
 
+/// Set up a repo for the opt-in online grok test.
+///
+/// Injects a real `XAI_API_KEY` and does not route grok through the
+/// cache proxy: the online test needs grok's inference client to reach
+/// the live xAI API (it cannot be redirected at the proxy).
+pub fn setup_grok_online_test_repo(
+    api_key: &str,
+) -> (TestHome, TestRepo, ExecutorResources, TestDaemon) {
+    let repo = TestRepo::new();
+    // The key is alphanumeric plus dashes, so it needs no JSON escaping.
+    let extra_json = format!(
+        r#",
+        "remoteEnv": {{
+            "XAI_API_KEY": "{api_key}"
+        }}"#
+    );
+    write_test_devcontainer(&repo, "", &extra_json);
+
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start_with_local_grok(&home);
+    std::fs::write(repo.path().join(".rumpelpod.json"), &executor.json)
+        .expect("write .rumpelpod.json");
+    (home, repo, executor, daemon)
+}
+
 // Tall enough to hold long responses without scrolling off, normal width.
 const PTY_ROWS: u16 = 500;
 const PTY_COLS: u16 = 80;

@@ -1695,7 +1695,7 @@ struct AgentFilesPutQuery {
 /// PermissionRequest hook is left as-is unless `?permission_hook=` is
 /// set.
 ///
-/// For `codex`, no post-extraction work.
+/// For `codex` and `grok`, no post-extraction work.
 async fn agent_files_put_handler(
     State(state): State<PodServerState>,
     axum::extract::Path(agent): axum::extract::Path<String>,
@@ -1797,6 +1797,9 @@ fn agent_files_put_impl(
     match agent {
         "claude" => rewrite_claude_settings(&home, pod_name, permission_hook)?,
         "codex" => {}
+        // Grok needs no post-extraction work: its notify-state hooks are
+        // not wired up, so there is no settings file to rewrite.
+        "grok" => {}
         // agent_paths() already validated the name; this is unreachable.
         _ => return Err(anyhow::anyhow!("unknown agent: {agent}")),
     }
