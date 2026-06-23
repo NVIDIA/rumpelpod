@@ -701,7 +701,7 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
     if cmd.inject_system_prompt {
         write_system_prompt(cmd.description_file.as_deref())?;
         if container_has_codex() {
-            write_codex_system_prompt(cmd.description_file.as_deref())?;
+            write_codex_system_prompt(&cmd.user, cmd.description_file.as_deref())?;
         }
     }
 
@@ -795,24 +795,52 @@ fn write_system_prompt(description_file: Option<&str>) -> Result<()> {
         .context("writing /etc/claude-code/CLAUDE.md")
 }
 
-/// Append the rumpelpod system prompt to /AGENTS.md so Codex understands the
-/// container layout and git remote conventions.  Appends rather than
-/// overwrites so a base image's existing AGENTS.md is preserved.
-fn write_codex_system_prompt(description_file: Option<&str>) -> Result<()> {
-    let path = Path::new("/AGENTS.md");
+/// Append the rumpelpod system prompt to the container user's
+/// `~/.codex/AGENTS.md`.  Codex loads this global instructions file for
+/// every session regardless of cwd; a repo-tree AGENTS.md would only be
+/// read inside the project root, and a filesystem-root `/AGENTS.md` is
+/// above the project root and never read.  Appends rather than
+/// overwrites so a base image's existing file is preserved.
+fn write_codex_system_prompt(user: &str, description_file: Option<&str>) -> Result<()> {
+    let pw = nix::unistd::User::from_name(user)
+        .with_context(|| format!("looking up user '{user}'"))?
+        .with_context(|| format!("user '{user}' not found in /etc/passwd"))?;
+    let codex_dir = pw.dir.join(".codex");
+    fs::create_dir_all(&codex_dir).with_context(|| {
+        let d = codex_dir.display();
+        format!("creating {d}")
+    })?;
+    let path = codex_dir.join("AGENTS.md");
+
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-        .context("opening /AGENTS.md for append")?;
+        .open(&path)
+        .with_context(|| {
+            let p = path.display();
+            format!("opening {p} for append")
+        })?;
     let prompt = system_prompt(description_file);
     // Separate from any existing content with a blank line.
     if path.metadata().is_ok_and(|m| m.len() > 0) {
         file.write_all(b"\n")
-            .context("writing separator to /AGENTS.md")?;
+            .context("writing AGENTS.md separator")?;
     }
     file.write_all(prompt.as_bytes())
-        .context("writing rumpelpod prompt to /AGENTS.md")
+        .context("writing rumpelpod prompt to AGENTS.md")?;
+    drop(file);
+
+    std::os::unix::fs::chown(&codex_dir, Some(pw.uid.as_raw()), Some(pw.gid.as_raw()))
+        .with_context(|| {
+            let d = codex_dir.display();
+            format!("chowning {d}")
+        })?;
+    std::os::unix::fs::chown(&path, Some(pw.uid.as_raw()), Some(pw.gid.as_raw())).with_context(
+        || {
+            let p = path.display();
+            format!("chowning {p}")
+        },
+    )
 }
 
 /// Write `.git/hooks/pre-commit` in the cloned repo.  The hook fails

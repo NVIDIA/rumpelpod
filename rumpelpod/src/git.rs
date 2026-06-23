@@ -75,7 +75,7 @@ pub fn get_current_branch(repo_path: &std::path::Path) -> Option<String> {
     let head = repo.head().ok()?;
 
     if head.is_branch() {
-        head.shorthand().map(|s| s.to_string())
+        head.shorthand().ok().map(|s| s.to_string())
     } else {
         None
     }
@@ -96,11 +96,15 @@ pub fn get_remotes(repo_path: &Path) -> Result<Vec<GitRemote>> {
     let repo = Repository::open(repo_path).context("opening repository")?;
     let remote_names = repo.remotes().context("listing remotes")?;
     let mut remotes = Vec::new();
-    for name in remote_names.iter().flatten() {
+    for name in remote_names.iter() {
+        let name = match name.context("reading remote name")? {
+            Some(name) => name,
+            None => continue,
+        };
         let remote = repo
             .find_remote(name)
             .with_context(|| format!("reading remote '{name}'"))?;
-        if let Some(url) = remote.url() {
+        if let Ok(url) = remote.url() {
             remotes.push(GitRemote {
                 name: name.to_string(),
                 url: url.to_string(),
