@@ -14,10 +14,11 @@ use std::time::Duration;
 use log::debug;
 use retry::delay::jitter;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
+use crate::async_runtime::RUNTIME;
 use crate::config::Host;
-use crate::daemon::host_connection::{HostConnectionRegistry, HostKey};
+use crate::daemon::host_connection::{HostConnectionRegistry, HostKey, HostStatus};
 use crate::pod::types::{ClaudeState, CodexState};
 
 const INITIAL_DELAY: Duration = Duration::from_secs(1);
@@ -296,129 +297,122 @@ fn pod_event_loop(
         *codex_state.lock().unwrap() = g.codex;
     };
 
-    // Initial connection -- no reconnect signalling needed.
-    let mut reader = match connect_pod_events(&container_url, &token) {
-        Ok((r, g)) => {
-            apply_greeting(g);
-            r
+    // Resolve the host connection once and follow its liveness.
+    // `get_or_create` starts (or reuses) the single per-host monitor
+    // that owns probing and reconnection; this loop never probes the
+    // host itself, it only waits for the monitor to report Connected.
+    // Holding the connection keeps that monitor alive for the pod.
+    let host_conn = loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
         }
-        Err(e) => {
-            debug!("initial pod event connection failed: {e:#}");
-            let mut backoff = INITIAL_DELAY;
-            loop {
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(jitter(backoff));
-                backoff = std::cmp::min(backoff.saturating_mul(2), MAX_DELAY);
-                match connect_pod_events(&container_url, &token) {
-                    Ok((r, g)) => {
-                        apply_greeting(g);
-                        break r;
-                    }
-                    Err(e) => {
-                        debug!("pod event reconnect failed: {e:#}");
-                    }
-                }
+        match host_connections.get_or_create(&host) {
+            Ok(conn) => break conn,
+            Err(e) => {
+                debug!("getting host connection failed: {e:#}");
+                std::thread::sleep(jitter(INITIAL_DELAY));
             }
         }
     };
+    let mut host_rx = host_conn.subscribe();
 
-    // Read events until the connection drops.  Parse `event: claude_state`
-    // lines so we can track the current session state.
-    let mut pending_event: Option<String> = None;
+    // Backoff for pod-endpoint failures while the host is up (e.g. the
+    // pod server is still starting).  Reset on every successful connect.
+    let mut backoff = INITIAL_DELAY;
+
+    // (Re)establish the /events connection, read until it drops, repeat.
     loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => {
-                // Connection lost -- enter reconnect loop.
+
+        // Gate: wait for the host before touching the pod URL.  Nudge
+        // the monitor so it checks now instead of waiting out its
+        // heartbeat.  For localhost the status is permanently Connected,
+        // so this returns immediately.
+        let _ = tx.send(ReconnectEvent::Attempting);
+        host_conn.request_probe();
+        if !wait_for_host(&mut host_rx, &stop) {
+            return;
+        }
+        let _ = tx.send(ReconnectEvent::HostConnected);
+
+        // Try the pod endpoint.  A failure here is ambiguous (pod still
+        // starting vs host actually down), so nudge the monitor and
+        // retry after a short backoff; if the host is truly down the
+        // gate above catches it on the next iteration.
+        let mut reader = match connect_pod_events(&container_url, &token) {
+            Ok((reader, greeting)) => {
+                apply_greeting(greeting);
+                let _ = tx.send(ReconnectEvent::Connected);
+                backoff = INITIAL_DELAY;
+                reader
             }
-            Ok(_) => {
-                let trimmed = line.trim();
-                if let Some(event_type) = trimmed.strip_prefix("event: ") {
-                    pending_event = Some(event_type.to_string());
-                } else if let Some(data) = trimmed.strip_prefix("data: ") {
-                    match pending_event.as_deref() {
-                        Some("claude_state") => {
-                            if let Ok(cs) = serde_json::from_str::<Option<ClaudeState>>(data) {
-                                *claude_state.lock().unwrap() = cs;
-                            }
-                        }
-                        Some("codex_state") => {
-                            if let Ok(xs) = serde_json::from_str::<Option<CodexState>>(data) {
-                                *codex_state.lock().unwrap() = xs;
-                            }
-                        }
-                        _ => {}
-                    }
-                    pending_event = None;
-                } else if trimmed.is_empty() {
-                    pending_event = None;
-                }
+            Err(e) => {
+                debug!("pod event connection failed: {e:#}");
+                let _ = tx.send(ReconnectEvent::Failed {
+                    error: format!("{e:#}"),
+                });
+                host_conn.request_probe();
+                std::thread::sleep(jitter(backoff));
+                backoff = std::cmp::min(backoff.saturating_mul(2), MAX_DELAY);
                 continue;
             }
-        }
+        };
 
-        // Reconnect loop.
-        let mut backoff = INITIAL_DELAY;
+        // Read events until the connection drops.  Parse
+        // `event: claude_state` / `event: codex_state` lines to track
+        // the current session state.
+        let mut pending_event: Option<String> = None;
         loop {
             if stop.load(Ordering::SeqCst) {
                 return;
             }
-
-            // For non-localhost hosts, ensure the host connection is up
-            // before retrying the pod URL.  `ensure_connected` is cheap
-            // when the host is already up and triggers one real
-            // bring-up attempt when it is not.  This loop owns the
-            // retry cadence for SSH; Kubernetes also has its own
-            // background monitor.
-            if !matches!(host, Host::Localhost) {
-                let _ = tx.send(ReconnectEvent::Attempting);
-                let conn = match host_connections.get_or_create(&host) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(ReconnectEvent::Failed {
-                            error: format!("{e:#}"),
-                        });
-                        std::thread::sleep(jitter(backoff));
-                        backoff = std::cmp::min(backoff.saturating_mul(2), MAX_DELAY);
-                        continue;
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                // Connection lost -- break to the gate and reconnect.
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if let Some(event_type) = trimmed.strip_prefix("event: ") {
+                        pending_event = Some(event_type.to_string());
+                    } else if let Some(data) = trimmed.strip_prefix("data: ") {
+                        match pending_event.as_deref() {
+                            Some("claude_state") => {
+                                if let Ok(cs) = serde_json::from_str::<Option<ClaudeState>>(data) {
+                                    *claude_state.lock().unwrap() = cs;
+                                }
+                            }
+                            Some("codex_state") => {
+                                if let Ok(xs) = serde_json::from_str::<Option<CodexState>>(data) {
+                                    *codex_state.lock().unwrap() = xs;
+                                }
+                            }
+                            _ => {}
+                        }
+                        pending_event = None;
+                    } else if trimmed.is_empty() {
+                        pending_event = None;
                     }
-                };
-                match conn.ensure_connected() {
-                    Ok(()) => {
-                        let _ = tx.send(ReconnectEvent::HostConnected);
-                    }
-                    Err(e) => {
-                        let _ = tx.send(ReconnectEvent::Failed {
-                            error: format!("{e:#}"),
-                        });
-                        std::thread::sleep(jitter(backoff));
-                        backoff = std::cmp::min(backoff.saturating_mul(2), MAX_DELAY);
-                        continue;
-                    }
-                }
-            }
-
-            // Try to connect to the pod's event endpoint.
-            match connect_pod_events(&container_url, &token) {
-                Ok((new_reader, g)) => {
-                    apply_greeting(g);
-                    let _ = tx.send(ReconnectEvent::Connected);
-                    reader = new_reader;
-                    break;
-                }
-                Err(e) => {
-                    let _ = tx.send(ReconnectEvent::Failed {
-                        error: format!("{e:#}"),
-                    });
-                    std::thread::sleep(jitter(backoff));
-                    backoff = std::cmp::min(backoff.saturating_mul(2), MAX_DELAY);
                 }
             }
         }
+    }
+}
+
+/// Block until the host reports `Connected`, returning false if the
+/// listener was asked to stop.  Wakes periodically to re-check `stop`,
+/// which is not awaitable.
+fn wait_for_host(host_rx: &mut watch::Receiver<HostStatus>, stop: &AtomicBool) -> bool {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        if *host_rx.borrow() == HostStatus::Connected {
+            return true;
+        }
+        let _ = RUNTIME.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), host_rx.changed()).await
+        });
     }
 }
