@@ -1712,6 +1712,7 @@ fn strip_claude_json(data: &[u8], repo_path: &Path, container_repo_path: &Path) 
         "effortCalloutV2Dismissed",
         "feedbackSurveyState",
         "firstStartTime",
+        "fullscreenUpsellSeenCount",
         "groveConfigCache",
         "hasAcknowledgedCostThreshold",
         "hasCompletedOnboarding",

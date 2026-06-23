@@ -389,6 +389,114 @@ fn merge_no_ff_flag() {
 }
 
 #[test]
+fn merge_signoff_with_description() {
+    if !executor_supports_stop() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    // Pod with a DESCRIPTION file so the description-file path drives the
+    // merge commit message.
+    let output = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "merge-signoff-desc",
+            "--",
+            "sh",
+            "-c",
+            "echo 'Add widget' > DESCRIPTION && touch pod-file && git add DESCRIPTION pod-file && git commit -m 'add widget'",
+        ])
+        .output()
+        .expect("Failed to create pod commit");
+    assert!(
+        output.status.success(),
+        "pod commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = pod_command(&repo, &daemon)
+        .args(["merge", "merge-signoff-desc", "--signoff"])
+        .output()
+        .expect("Failed to run rumpel merge");
+    assert!(
+        output.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = Command::new("git")
+        .args(["log", "-1", "--format=%B", "HEAD"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git log failed");
+    let message = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        message.contains("Add widget"),
+        "merge commit should use DESCRIPTION content: {message}"
+    );
+    assert!(
+        message.contains("Signed-off-by: Test User <test@example.com>"),
+        "merge commit should carry the sign-off footer: {message}"
+    );
+}
+
+#[test]
+fn merge_signoff_without_description() {
+    if !executor_supports_stop() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+
+    // Disable the description-file feature so the editor/no-description path
+    // builds the merge commit.
+    let config = merge_config(&executor.json, json!({"merge": {"description": "off"}}));
+    fs::write(repo.path().join(".rumpelpod.json"), &config).unwrap();
+
+    create_ahead_pod(&repo, &daemon, "merge-signoff-nodesc");
+
+    // --signoff is a plain passthrough to git merge, so it only signs a
+    // commit git actually creates.  --no-ff forces the merge commit (a
+    // fast-forward would create none), and --no-edit suppresses the editor
+    // since there is no TTY and no description file to supply the message.
+    let output = pod_command(&repo, &daemon)
+        .args([
+            "merge",
+            "merge-signoff-nodesc",
+            "--no-ff",
+            "--no-edit",
+            "--signoff",
+        ])
+        .output()
+        .expect("Failed to run rumpel merge");
+    assert!(
+        output.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = Command::new("git")
+        .args(["log", "-1", "--format=%B", "HEAD"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git log failed");
+    let message = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        message.contains("Signed-off-by: Test User <test@example.com>"),
+        "merge commit should carry the sign-off footer: {message}"
+    );
+}
+
+#[test]
 fn merge_squash_flag() {
     if !executor_supports_stop() {
         return;
