@@ -1,0 +1,6 @@
+Fix Grok smoke cache drift
+
+Normalize Grok's user-info date line when computing LLM cache keys so
+the smoke fixture remains valid across days. Move the Grok smoke fixture
+to the normalized key and replace the cached tool-call response with a
+visible text answer for the TUI assertion.

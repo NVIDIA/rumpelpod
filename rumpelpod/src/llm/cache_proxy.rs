@@ -173,16 +173,14 @@ fn extract_cache_fields(provider: &str, body: &[u8], fields: &[&str]) -> Vec<u8>
 }
 
 /// Replace volatile date fragments in the serialized cache fields so
-/// the hash stays stable across runs.  Two providers inject the
-/// current date into request bodies: Codex wraps it as
-/// `<current_date>YYYY-MM-DD</current_date>`, and the Claude CLI
-/// injects a `Today's date is YYYY-MM-DD.` line into the
-/// system-reminder context.  Both binaries get the real date from
-/// the OS clock, which would otherwise drift the cache key day to
-/// day.
+/// the hash stays stable across runs.  Codex, Claude, and Grok each
+/// inject the current date into request bodies using different text
+/// forms; all of them get the real date from the OS clock, which would
+/// otherwise drift the cache key day to day.
 fn normalize_cache_fields(data: Vec<u8>) -> Vec<u8> {
     let data = replace_dates_between(data, b"<current_date>", b"</current_date>");
-    replace_dates_between(data, b"Today's date is ", b".")
+    let data = replace_dates_between(data, b"Today's date is ", b".");
+    replace_dates_between(data, b"Today's date: ", b"\\n")
 }
 
 /// Replace every `YYYY-MM-DD` that sits between `prefix` and `suffix`
@@ -509,4 +507,21 @@ pub async fn handle_llm_cache_proxy(
     })
     .await
     .expect("API forwarding task panicked")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_cache_fields;
+
+    #[test]
+    fn normalizes_grok_user_info_date() {
+        let normalized = normalize_cache_fields(
+            br#"{"content":"<user_info>\nToday's date: 2026-06-24\n</user_info>"}"#.to_vec(),
+        );
+
+        assert_eq!(
+            normalized,
+            br#"{"content":"<user_info>\nToday's date: 0000-00-00\n</user_info>"}"#
+        );
+    }
 }
