@@ -43,7 +43,7 @@ pub fn prune(cmd: &PruneCommand) -> Result<()> {
     let prunable: Vec<_> = pods.iter().filter(|p| is_prunable(&p.status)).collect();
 
     if prunable.is_empty() {
-        eprintln!("No stopped pods to remove.");
+        eprintln!("no stopped pods to remove");
         return Ok(());
     }
 
@@ -66,7 +66,7 @@ pub fn prune(cmd: &PruneCommand) -> Result<()> {
                 }
             } else {
                 let name = &pod.name;
-                eprintln!("pod '{name}' has unmerged commits ({state}); use --force to delete");
+                eprintln!("pod '{name}' has unmerged commits ({state}), use --force to delete");
                 failed += 1;
                 continue;
             }
@@ -81,7 +81,7 @@ pub fn prune(cmd: &PruneCommand) -> Result<()> {
         }
     }
 
-    eprintln!("Deleted {deleted} pod(s).");
+    eprintln!("deleted {deleted} pod(s)");
 
     if failed > 0 {
         return Err(anyhow::anyhow!("{failed} pod(s) could not be deleted"));

@@ -63,7 +63,7 @@ pub fn fork(cmd: &ForkCommand) -> Result<()> {
 
     let new_name = &cmd.new_name;
     let source = &cmd.source;
-    println!("Pod '{new_name}' forked from '{source}'.");
+    println!("pod '{new_name}' forked from '{source}'");
     Ok(())
 }
 
@@ -100,7 +100,7 @@ fn confirm_processing_if_needed(
         (false, false) => unreachable!(),
     };
     eprint!(
-        "Source pod '{source}' is processing ({agents}). \
+        "source pod '{source}' is processing ({agents}). \
          Forking now may capture half-written session state. Proceed? [y/N] "
     );
     std::io::stderr().flush().ok();

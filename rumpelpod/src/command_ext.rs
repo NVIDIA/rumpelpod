@@ -97,7 +97,7 @@ impl CommandExt for Command {
         self.stdout(Stdio::piped());
         self.stderr(Stdio::piped());
 
-        let mut child = self.spawn().context("Failed to spawn process")?;
+        let mut child = self.spawn().context("failed to spawn process")?;
 
         let prefix = prefix.to_string();
 
@@ -119,7 +119,7 @@ impl CommandExt for Command {
                     }
                 }
             })
-            .with_context(|| format!("Failed to spawn {thread_name} thread"))?;
+            .with_context(|| format!("failed to spawn {thread_name} thread"))?;
 
         let stderr = child.stderr.take().expect("stderr not captured");
         let thread_name = format!("{prefix}-stderr");
@@ -138,7 +138,7 @@ impl CommandExt for Command {
                     }
                 }
             })
-            .with_context(|| format!("Failed to spawn {thread_name} thread"))?;
+            .with_context(|| format!("failed to spawn {thread_name} thread"))?;
 
         Ok(child)
     }

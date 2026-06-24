@@ -129,7 +129,7 @@ fn prune_no_stopped_pods() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("No stopped pods"),
+        stderr.contains("no stopped pods"),
         "expected 'No stopped pods' message: {}",
         stderr
     );

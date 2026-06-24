@@ -139,7 +139,7 @@ pub fn install(host: &Host) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })?;
 
-    eprintln!("Applied rumpelhub resources in namespace {namespace}");
+    eprintln!("applied rumpelhub resources in namespace {namespace}");
     wait_deployment_ready(host, Duration::from_secs(180))?;
     eprintln!("rumpelhub Deployment is Ready");
     Ok(())
@@ -203,7 +203,7 @@ pub fn delete(host: &Host) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })?;
 
-    eprintln!("Deleted rumpelhub resources in namespace {namespace}");
+    eprintln!("deleted rumpelhub resources in namespace {namespace}");
     Ok(())
 }
 

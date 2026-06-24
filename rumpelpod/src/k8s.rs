@@ -329,7 +329,7 @@ impl K8sClient {
                                     if reason.contains("Err") || reason.contains("BackOff") {
                                         let msg = waiting.message.as_deref().unwrap_or("");
                                         return Err(anyhow::anyhow!(
-                                            "Pod '{}' failed to start: {} {}",
+                                            "pod '{}' failed to start: {} {}",
                                             name,
                                             reason,
                                             msg
@@ -342,7 +342,7 @@ impl K8sClient {
                 }
                 "Failed" | "Succeeded" => {
                     return Err(anyhow::anyhow!(
-                        "Pod '{}' is in terminal phase '{}'",
+                        "pod '{}' is in terminal phase '{}'",
                         name,
                         phase
                     ));

@@ -102,7 +102,7 @@ pub fn db_path() -> Result<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             dirs::home_dir()
-                .expect("Could not determine home directory")
+                .expect("could not determine home directory")
                 .join(".local/state")
         });
 
@@ -164,7 +164,7 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             let parent = parent.display();
-            format!("Failed to create directory {parent}")
+            format!("failed to create directory {parent}")
         })?;
     }
 
@@ -174,12 +174,12 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 
     let conn = Connection::open(path).with_context(|| {
         let path = path.display();
-        format!("Failed to open database at {path}")
+        format!("failed to open database at {path}")
     })?;
 
     // Enable foreign key enforcement
     conn.execute_batch("PRAGMA foreign_keys = ON;")
-        .context("Failed to enable foreign keys")?;
+        .context("failed to enable foreign keys")?;
 
     // Check version
     let current_hash = get_schema_hash();
@@ -194,11 +194,11 @@ pub fn open_db(path: &Path) -> Result<Connection> {
             if hash != current_hash {
                 let path = path.display();
                 return Err(anyhow::anyhow!(
-                    "Database schema mismatch.\n\
-                    Expected hash: {current_hash}\n\
-                    Found hash:    {hash}\n\
+                    "database schema mismatch\n\
+                    expected hash: {current_hash}\n\
+                    found hash:    {hash}\n\
                     \n\
-                    Please delete the database file to start over:\n\
+                    delete the database file to start over:\n\
                     rm {path}"
                 ));
             }
@@ -209,13 +209,13 @@ pub fn open_db(path: &Path) -> Result<Connection> {
             drop(conn);
             std::fs::remove_file(path).with_context(|| {
                 let path = path.display();
-                format!("Failed to remove outdated database at {path}")
+                format!("failed to remove outdated database at {path}")
             })?;
             return create_and_init_db(path);
         }
         Err(e) => {
             // Other errors (e.g. database corruption)
-            return Err(e).context("Failed to read schema version from database");
+            return Err(e).context("failed to read schema version from database");
         }
     }
 
@@ -225,24 +225,24 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 fn create_and_init_db(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path).with_context(|| {
         let path = path.display();
-        format!("Failed to open new database at {path}")
+        format!("failed to open new database at {path}")
     })?;
 
     // Enable foreign key enforcement
     conn.execute_batch("PRAGMA foreign_keys = ON;")
-        .context("Failed to enable foreign keys")?;
+        .context("failed to enable foreign keys")?;
 
     let tx = conn.transaction()?;
 
     tx.execute_batch(SCHEMA_SQL)
-        .context("Failed to initialize database schema")?;
+        .context("failed to initialize database schema")?;
 
     let hash = get_schema_hash();
     tx.execute(
         "INSERT INTO db_meta (key, value) VALUES ('schema_version', ?)",
         [&hash],
     )
-    .context("Failed to insert schema version")?;
+    .context("failed to insert schema version")?;
 
     tx.commit()?;
 
@@ -268,7 +268,7 @@ pub fn create_pod(
 ) -> Result<PodId> {
     let now = Utc::now().to_rfc3339();
     let repo_path_str = repo_path.to_string_lossy();
-    let host_json = serde_json::to_string(host).context("Failed to serialize host")?;
+    let host_json = serde_json::to_string(host).context("failed to serialize host")?;
 
     conn.execute(
         "INSERT INTO pods
@@ -288,7 +288,7 @@ pub fn create_pod(
             now
         ],
     )
-    .context("Failed to insert pod")?;
+    .context("failed to insert pod")?;
 
     Ok(PodId(conn.last_insert_rowid()))
 }
@@ -300,7 +300,7 @@ pub fn update_pod_status(conn: &Connection, id: PodId, status: PodStatus) -> Res
         "UPDATE pods SET status = ?, updated_at = ? WHERE id = ?",
         rusqlite::params![status.as_str(), now, i64::from(id)],
     )
-    .context("Failed to update pod status")?;
+    .context("failed to update pod status")?;
     Ok(())
 }
 
@@ -331,14 +331,14 @@ pub fn get_pod(conn: &Connection, repo_path: &Path, name: &str) -> Result<Option
             "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, local_env, created_at, updated_at
              FROM pods WHERE repo_path = ? AND name = ?",
         )
-        .context("Failed to prepare query")?;
+        .context("failed to prepare query")?;
 
     let mut rows = stmt
         .query_map(rusqlite::params![repo_path_str, name], row_to_pod_record)
-        .context("Failed to query pod")?;
+        .context("failed to query pod")?;
 
     match rows.next() {
-        Some(row) => Ok(Some(row.context("Failed to read pod")?)),
+        Some(row) => Ok(Some(row.context("failed to read pod")?)),
         None => Ok(None),
     }
 }
@@ -351,14 +351,14 @@ pub fn get_pod_by_id(conn: &Connection, id: PodId) -> Result<Option<PodRecord>> 
             "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, local_env, created_at, updated_at
              FROM pods WHERE id = ?",
         )
-        .context("Failed to prepare query")?;
+        .context("failed to prepare query")?;
 
     let mut rows = stmt
         .query_map(rusqlite::params![i64::from(id)], row_to_pod_record)
-        .context("Failed to query pod")?;
+        .context("failed to query pod")?;
 
     match rows.next() {
-        Some(row) => Ok(Some(row.context("Failed to read pod")?)),
+        Some(row) => Ok(Some(row.context("failed to read pod")?)),
         None => Ok(None),
     }
 }
@@ -370,14 +370,14 @@ pub fn get_pod_by_token(conn: &Connection, token: &str) -> Result<Option<PodReco
             "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, local_env, created_at, updated_at
              FROM pods WHERE token = ?",
         )
-        .context("Failed to prepare query")?;
+        .context("failed to prepare query")?;
 
     let mut rows = stmt
         .query_map(rusqlite::params![token], row_to_pod_record)
-        .context("Failed to query pod by token")?;
+        .context("failed to query pod by token")?;
 
     match rows.next() {
-        Some(row) => Ok(Some(row.context("Failed to read pod")?)),
+        Some(row) => Ok(Some(row.context("failed to read pod")?)),
         None => Ok(None),
     }
 }
@@ -390,15 +390,15 @@ pub fn list_pods_by_status(conn: &Connection, status: PodStatus) -> Result<Vec<P
              FROM pods WHERE status = ?
              ORDER BY repo_path ASC, name ASC",
         )
-        .context("Failed to prepare query")?;
+        .context("failed to prepare query")?;
 
     let rows = stmt
         .query_map(rusqlite::params![status.as_str()], row_to_pod_record)
-        .context("Failed to query pods by status")?;
+        .context("failed to query pods by status")?;
 
     let mut result = Vec::new();
     for row in rows {
-        result.push(row.context("Failed to read pod row")?);
+        result.push(row.context("failed to read pod row")?);
     }
 
     Ok(result)
@@ -414,15 +414,15 @@ pub fn list_pods(conn: &Connection, repo_path: &Path) -> Result<Vec<PodRecord>> 
              FROM pods WHERE repo_path = ?
              ORDER BY name ASC",
         )
-        .context("Failed to prepare query")?;
+        .context("failed to prepare query")?;
 
     let rows = stmt
         .query_map(rusqlite::params![repo_path_str], row_to_pod_record)
-        .context("Failed to query pods")?;
+        .context("failed to query pods")?;
 
     let mut result = Vec::new();
     for row in rows {
-        result.push(row.context("Failed to read pod row")?);
+        result.push(row.context("failed to read pod row")?);
     }
 
     Ok(result)
@@ -436,15 +436,15 @@ pub fn list_all_pods(conn: &Connection) -> Result<Vec<PodRecord>> {
              FROM pods
              ORDER BY repo_path ASC, name ASC",
         )
-        .context("Failed to prepare query")?;
+        .context("failed to prepare query")?;
 
     let rows = stmt
         .query_map([], row_to_pod_record)
-        .context("Failed to query all pods")?;
+        .context("failed to query all pods")?;
 
     let mut result = Vec::new();
     for row in rows {
-        result.push(row.context("Failed to read pod row")?);
+        result.push(row.context("failed to read pod row")?);
     }
 
     Ok(result)
@@ -458,7 +458,7 @@ pub fn delete_pod(conn: &Connection, repo_path: &Path, name: &str) -> Result<boo
             "DELETE FROM pods WHERE repo_path = ? AND name = ?",
             rusqlite::params![repo_path_str, name],
         )
-        .context("Failed to delete pod")?;
+        .context("failed to delete pod")?;
     Ok(count > 0)
 }
 
@@ -470,7 +470,7 @@ pub fn has_claude_config_copied(conn: &Connection, id: PodId) -> Result<bool> {
             rusqlite::params![i64::from(id)],
             |row| row.get(0),
         )
-        .context("Failed to query claude_config_copied")?;
+        .context("failed to query claude_config_copied")?;
     Ok(copied)
 }
 
@@ -480,7 +480,7 @@ pub fn mark_claude_config_copied(conn: &Connection, id: PodId) -> Result<()> {
         "UPDATE pods SET claude_config_copied = 1 WHERE id = ?",
         rusqlite::params![i64::from(id)],
     )
-    .context("Failed to mark claude_config_copied")?;
+    .context("failed to mark claude_config_copied")?;
     Ok(())
 }
 
@@ -862,7 +862,7 @@ mod tests {
         let result = open_db(&db_path);
         assert!(result.is_err());
         let err = result.err().unwrap();
-        assert!(err.to_string().contains("Database schema mismatch"));
+        assert!(err.to_string().contains("database schema mismatch"));
         assert!(err.to_string().contains("rm "));
     }
 }

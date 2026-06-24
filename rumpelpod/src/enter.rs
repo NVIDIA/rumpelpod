@@ -31,7 +31,7 @@ fn relative_path<'a>(base: &Path, path: &'a Path) -> Result<&'a Path> {
 
 /// Map the local machine's current directory into the corresponding container path.
 fn container_workdir(container_repo_path: &Path, repo_root: &Path) -> Result<PathBuf> {
-    let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+    let current_dir = std::env::current_dir().context("failed to get current directory")?;
     let relative = relative_path(repo_root, &current_dir)?;
     Ok(container_repo_path.join(relative))
 }
@@ -101,10 +101,10 @@ fn check_host_requirements(requirements: &HostRequirements, docker_host: &Host) 
     // type.
     match docker_host {
         Host::Localhost | Host::Ssh { .. } => {
-            info!("Running on local/remote Docker -- hostRequirements are advisory only");
+            info!("Running on local/remote Docker, hostRequirements are advisory only");
         }
         Host::Kubernetes { .. } => {
-            info!("Running on Kubernetes -- hostRequirements set as pod resource requests");
+            info!("Running on Kubernetes, hostRequirements set as pod resource requests");
         }
     }
 }
@@ -116,7 +116,7 @@ pub fn determine_host(repo_root: &Path, host_override: Option<Host>) -> Result<H
     }
     let json_config = load_json_config(repo_root)?;
     if let Some(ref host_str) = json_config.host {
-        return Host::parse(host_str).context("Invalid host in .rumpelpod.json");
+        return Host::parse(host_str).context("invalid host in .rumpelpod.json");
     }
     if let Some(ref kubernetes) = json_config.kubernetes {
         return Ok(Host::Kubernetes {
@@ -250,7 +250,7 @@ pub fn confirm_pod_creation(pod_name: &str, repo_root: &Path, create: bool) -> R
         ));
     }
 
-    eprint!("Pod '{pod_name}' does not exist. Create it? [Y/n] ");
+    eprint!("pod '{pod_name}' does not exist. Create it? [Y/n] ");
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -389,11 +389,11 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
                     user_root: true,
                 },
             )
-            .context("Failed to create workdir in container")?;
+            .context("failed to create workdir in container")?;
         if !mkdir_status.success() {
             let workdir = workdir.display();
             return Err(anyhow::anyhow!(
-                "Failed to create workdir {workdir} in container"
+                "failed to create workdir {workdir} in container"
             ));
         }
     }

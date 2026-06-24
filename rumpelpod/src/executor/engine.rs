@@ -212,7 +212,7 @@ impl Executor {
         match &self.inner {
             Inner::Docker(d) => docker_stop(&d.docker, id),
             Inner::Kubernetes(_) => {
-                anyhow::bail!("stop not supported on kubernetes; delete the pod instead")
+                anyhow::bail!("stop not supported on kubernetes, delete the pod instead")
             }
         }
     }
@@ -223,7 +223,7 @@ impl Executor {
         match &self.inner {
             Inner::Docker(d) => docker_start(&d.docker, id),
             Inner::Kubernetes(_) => {
-                anyhow::bail!("start not supported on kubernetes; launch a new pod instead")
+                anyhow::bail!("start not supported on kubernetes, launch a new pod instead")
             }
         }
     }
@@ -430,17 +430,17 @@ async fn k8s_exec(backend: &K8sBackend, id: &PodId, req: ExecRequest) -> Result<
 
     if req.workdir.is_some() {
         // kube-rs exec has no workdir parameter.  Callers that need it
-        // today wrap the command in `sh -c "cd … && …"`; spell that
+        // today wrap the command in `sh -c "cd ... && ..."`; spell that
         // out rather than silently ignoring the field.
         anyhow::bail!(
-            "executor::exec workdir is not supported on kubernetes; \
-             wrap the command in `sh -c 'cd … && …'` instead"
+            "executor::exec workdir is not supported on kubernetes, \
+             wrap the command in `sh -c 'cd ... && ...'` instead"
         );
     }
     if !req.env.is_empty() {
         anyhow::bail!(
-            "executor::exec env is not supported on kubernetes; \
-             use `env VAR=val … cmd` or the pod's baked env instead"
+            "executor::exec env is not supported on kubernetes, \
+             use `env VAR=val ... cmd` or the pod's baked env instead"
         );
     }
 
@@ -879,7 +879,7 @@ fn k8s_exec_detached(backend: &K8sBackend, id: &PodId, req: ExecRequest) -> Resu
     // inside the backgrounded command.
     if req.workdir.is_some() || !req.env.is_empty() || req.stdin.is_some() {
         anyhow::bail!(
-            "executor::exec_detached does not support workdir, env, or stdin on kubernetes; \
+            "executor::exec_detached does not support workdir, env, or stdin on kubernetes, \
              inline them into the command itself"
         );
     }

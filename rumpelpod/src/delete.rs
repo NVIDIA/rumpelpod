@@ -51,7 +51,7 @@ pub fn delete(cmd: &DeleteCommand) -> Result<()> {
                     continue;
                 }
             } else {
-                eprintln!("pod '{name}' has unmerged commits ({state}); use --force to delete");
+                eprintln!("pod '{name}' has unmerged commits ({state}), use --force to delete");
                 failed += 1;
                 continue;
             }

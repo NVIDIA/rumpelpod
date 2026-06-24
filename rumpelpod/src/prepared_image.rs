@@ -711,8 +711,8 @@ pub fn build_prepared_image(
 pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
     if crate::which("git").is_none() {
         return Err(anyhow::anyhow!(
-            "the devcontainer image does not have git installed. \
-             Please add it to your Dockerfile (e.g. `apt-get install -y git`)"
+            "the devcontainer image does not have git installed, \
+             add it to your Dockerfile (e.g. `apt-get install -y git`)"
         ));
     }
 

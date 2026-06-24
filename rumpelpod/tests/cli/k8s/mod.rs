@@ -1457,6 +1457,25 @@ fn k8s_gateway_reconnect_push() {
         .success()
         .expect("initial enter of pod A failed");
 
+    let host_head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.path())
+        .success()
+        .expect("rev-parse HEAD on host failed");
+    let host_head = String::from_utf8_lossy(&host_head).trim().to_string();
+    let expected_ref = format!("refs/rumpelpod/{pod_a}@{pod_a}");
+    loop {
+        let out = Command::new("git")
+            .args(["rev-parse", &expected_ref])
+            .current_dir(repo.path())
+            .output()
+            .expect("git rev-parse failed");
+        if out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == host_head {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
     // Find the actual K8s pod name for pod A.
     let kubectl_output = Command::new("kubectl")
         .args(["--context", &executor.context])
@@ -1487,6 +1506,9 @@ fn k8s_gateway_reconnect_push() {
             "exec",
             &k8s_pod_a,
             "--",
+            "env",
+            "GIT_HTTP_LOW_SPEED_LIMIT=1",
+            "GIT_HTTP_LOW_SPEED_TIME=10",
             "git",
             "-C",
             TEST_REPO_PATH,
@@ -1517,7 +1539,6 @@ fn k8s_gateway_reconnect_push() {
     let offline_commit = String::from_utf8_lossy(&rev_output).trim().to_string();
 
     // The host should NOT have pod A's offline commit yet (daemon was down).
-    let expected_ref = format!("refs/rumpelpod/{pod_a}@{pod_a}");
     let host_commit_before = Command::new("git")
         .args(["rev-parse", &expected_ref])
         .current_dir(repo.path())

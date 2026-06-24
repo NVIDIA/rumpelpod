@@ -17,7 +17,7 @@ pub fn build(cmd: &ImageBuildCommand) -> Result<()> {
 
     if devcontainer.build.is_none() {
         return Err(anyhow::anyhow!(
-            "This devcontainer uses 'image', not 'build'.\n\
+            "this devcontainer uses 'image', not 'build'.\n\
              Use 'rumpel image fetch' to pull a pre-built image."
         ));
     }
@@ -52,9 +52,9 @@ pub fn build(cmd: &ImageBuildCommand) -> Result<()> {
 
     let image = &result.image.0;
     if matches!(docker_host, Host::Kubernetes { .. }) {
-        println!("Image built and pushed: {image}");
+        println!("image built and pushed: {image}");
     } else {
-        println!("Image built: {image}");
+        println!("image built: {image}");
     }
 
     Ok(())
@@ -66,7 +66,7 @@ pub fn fetch(cmd: &ImageFetchCommand) -> Result<()> {
 
     if devcontainer.build.is_some() {
         return Err(anyhow::anyhow!(
-            "This devcontainer uses 'build', not 'image'.\n\
+            "this devcontainer uses 'build', not 'image'.\n\
              Use 'rumpel image build' to build from the Dockerfile."
         ));
     }
@@ -84,7 +84,7 @@ pub fn fetch(cmd: &ImageFetchCommand) -> Result<()> {
         .expect("either image or build must be set");
 
     image::pull_image(image_name, &docker_host, None)?;
-    println!("Image pulled: {image_name}");
+    println!("image pulled: {image_name}");
 
     Ok(())
 }

@@ -34,7 +34,7 @@ fn check_dirty_checkout(pod_name: &str) -> Result<()> {
             None,
             Some(30),
         )
-        .context("Failed to check pod working tree status")?;
+        .context("failed to check pod working tree status")?;
 
     if run_result.exit_code != 0 {
         use base64::Engine;
@@ -74,14 +74,14 @@ fn read_file_from_ref(repo_root: &Path, git_ref: &str, path: &str) -> Result<Opt
         .current_dir(repo_root)
         .stderr(Stdio::null())
         .output()
-        .context("Failed to read file from git ref")?;
+        .context("failed to read file from git ref")?;
 
     if !output.status.success() {
         return Ok(None);
     }
 
     let contents =
-        String::from_utf8(output.stdout).context("Description file is not valid UTF-8")?;
+        String::from_utf8(output.stdout).context("description file is not valid UTF-8")?;
     let trimmed = contents.trim_end();
 
     if trimmed.is_empty() {
@@ -99,7 +99,7 @@ fn file_exists_in_ref(repo_root: &Path, git_ref: &str, path: &str) -> Result<boo
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .context("Failed to check file in git ref")?;
+        .context("failed to check file in git ref")?;
     Ok(status.success())
 }
 
@@ -171,7 +171,7 @@ fn remove_description_file(repo_root: &Path, description_path: &str) -> Result<(
         .current_dir(repo_root)
         .stdout(Stdio::null())
         .status()
-        .context("Failed to git rm description file")?;
+        .context("failed to git rm description file")?;
 
     if !rm_status.success() {
         return Err(anyhow::anyhow!("git rm {description_path} failed"));
@@ -181,11 +181,11 @@ fn remove_description_file(repo_root: &Path, description_path: &str) -> Result<(
         .args(["commit", "--amend", "--no-edit"])
         .current_dir(repo_root)
         .status()
-        .context("Failed to amend merge commit")?;
+        .context("failed to amend merge commit")?;
 
     if !amend_status.success() {
         return Err(anyhow::anyhow!(
-            "Failed to amend merge commit to remove {description_path}"
+            "failed to amend merge commit to remove {description_path}"
         ));
     }
 
@@ -214,12 +214,11 @@ pub fn merge(cmd: &MergeCommand) -> Result<()> {
         .args(["rev-parse", "--verify", &pod_ref])
         .current_dir(&repo_root)
         .output()
-        .context("Failed to check pod ref")?;
+        .context("failed to check pod ref")?;
 
     if !ref_check.status.success() {
         return Err(anyhow::anyhow!(
-            "Pod ref '{pod_ref}' not found in host repository.\n\
-             Make sure the pod has made at least one commit."
+            "pod ref '{pod_ref}' not found in host repository (pod has no commits yet)"
         ));
     }
 
@@ -231,11 +230,11 @@ pub fn merge(cmd: &MergeCommand) -> Result<()> {
         .args(["merge-base", "--is-ancestor", &pod_ref, "HEAD"])
         .current_dir(&repo_root)
         .status()
-        .context("Failed to run merge-base --is-ancestor")?;
+        .context("failed to run merge-base --is-ancestor")?;
 
     if ancestor_check.success() {
         let name = &cmd.name;
-        eprintln!("warning: nothing to merge -- host is already up to date with pod '{name}'");
+        eprintln!("warning: nothing to merge, host is up to date with pod '{name}'");
         let pod_name = PodName::new(cmd.name.clone()).map_err(|e| anyhow::anyhow!(e))?;
         client.stop_pod(pod_name, repo_root, false)?;
         return Ok(());
@@ -256,11 +255,11 @@ pub fn merge(cmd: &MergeCommand) -> Result<()> {
         .args(["merge-tree", "HEAD", &pod_ref])
         .current_dir(&repo_root)
         .output()
-        .context("Failed to run git merge-tree")?;
+        .context("failed to run git merge-tree")?;
 
     if !merge_tree.status.success() {
         return Err(anyhow::anyhow!(
-            "merge would produce conflicts -- aborting without changing the working tree"
+            "merge would produce conflicts, aborting without changing the working tree"
         ));
     }
 
@@ -289,7 +288,7 @@ pub fn merge(cmd: &MergeCommand) -> Result<()> {
     merge_cmd.arg(&pod_ref);
     merge_cmd.current_dir(&repo_root);
 
-    let merge_status = merge_cmd.status().context("Failed to run git merge")?;
+    let merge_status = merge_cmd.status().context("failed to run git merge")?;
 
     if !merge_status.success() {
         let code = merge_status.code().unwrap_or(-1);

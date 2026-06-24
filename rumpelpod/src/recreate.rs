@@ -68,7 +68,7 @@ pub fn recreate(cmd: &RecreateCommand) -> Result<()> {
     progress.finish()?;
 
     let name = &cmd.name;
-    println!("Pod '{name}' recreated successfully.");
+    println!("recreated pod '{name}'");
 
     Ok(())
 }

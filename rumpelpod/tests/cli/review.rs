@@ -693,7 +693,7 @@ fn review_defaults_to_vscode_when_no_difftool_configured() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("defaulting to VS Code"),
+        stderr.contains("using VS Code"),
         "stderr should carry the warning, got: {stderr}"
     );
     assert!(
@@ -764,7 +764,7 @@ fn review_errors_when_no_difftool_and_no_vscode() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("No difftool configured") && stderr.contains("code"),
+        stderr.contains("no difftool configured") && stderr.contains("code"),
         "error should mention missing difftool and code, got: {stderr}"
     );
 }

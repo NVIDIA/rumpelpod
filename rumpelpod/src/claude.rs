@@ -181,6 +181,6 @@ pub fn reauth(cmd: &ClaudeCommand) -> Result<()> {
         pod.write_home_files(files, vec![])?;
     }
 
-    eprintln!("Authentication credentials updated.");
+    eprintln!("authentication credentials updated");
     Ok(())
 }

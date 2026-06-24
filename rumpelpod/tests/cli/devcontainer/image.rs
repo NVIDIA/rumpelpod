@@ -669,7 +669,7 @@ fn image_build_builds_and_reports() {
 
     let stdout = String::from_utf8_lossy(&stdout);
     assert!(
-        stdout.contains("Image built:"),
+        stdout.contains("image built:"),
         "expected 'Image built:' in output, got: {stdout}",
     );
 }
@@ -701,7 +701,7 @@ fn image_build_always_rebuilds() {
 
     let stdout = String::from_utf8_lossy(&stdout);
     assert!(
-        stdout.contains("Image built:"),
+        stdout.contains("image built:"),
         "expected 'Image built:' on second run, got: {stdout}",
     );
 }
@@ -741,7 +741,7 @@ fn image_fetch_pulls_image() {
 
     let stdout = String::from_utf8_lossy(&stdout);
     assert!(
-        stdout.contains("Image pulled:"),
+        stdout.contains("image pulled:"),
         "expected 'Image pulled:' in output, got: {stdout}",
     );
 }

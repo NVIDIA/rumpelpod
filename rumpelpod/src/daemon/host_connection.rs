@@ -12,13 +12,16 @@
 //!   clients create their own SSH-backed transports.
 //! * `Kubernetes`: a cached `kube` client.
 //!
-//! The connection establishes itself lazily.  Callers (typically
-//! `Executor::new`) trigger a short liveness probe before using a
-//! remote host.  Kubernetes keeps a background monitor task for
-//! liveness; SSH deliberately does not, because OpenSSH and the
-//! user's SSH config own the transport policy.
+//! Callers (typically `Executor::new`) can trigger a short liveness
+//! probe before using a remote host.  Each remote connection also runs
+//! a single background monitor that owns reconnection and liveness for
+//! that host: one retry loop per host, not one per pod.  The monitor
+//! publishes liveness on a `watch` channel that pod loops wait on, and
+//! `request_probe` lets a waiter ask for an immediate check instead of
+//! waiting out the heartbeat.
 //!
-//! Connections know nothing about pods or executors.  They emit
+//! Connections know nothing about pods or executors.  They publish
+//! liveness on a per-connection `watch` channel and also emit
 //! `HostConnectionEvent`s on a daemon-wide mpsc channel; the daemon
 //! is the single reader and decides what to do per pod on
 //! `Connected`/`Disconnected` transitions.
@@ -33,7 +36,7 @@ use anyhow::{Context, Result};
 use log::debug;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::timeout;
 
 use crate::async_runtime::RUNTIME;
@@ -79,6 +82,16 @@ impl std::fmt::Display for HostKey {
     }
 }
 
+/// Liveness of a host connection, published on a per-connection
+/// `watch` channel.  Pod loops subscribe and wait for `Connected`
+/// before attempting their pod endpoint, so the single per-host
+/// monitor owns reconnection and pods merely follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostStatus {
+    Connected,
+    Disconnected,
+}
+
 /// Events emitted to the daemon when a connection's state flips.
 ///
 /// `GaveUp` is reserved for a future eviction path (no producer
@@ -94,12 +107,14 @@ pub enum HostConnectionEvent {
 pub type HostConnectionEventTx = mpsc::UnboundedSender<HostConnectionEvent>;
 pub type HostConnectionEventRx = mpsc::UnboundedReceiver<HostConnectionEvent>;
 
-/// Daemon-wide registry of host connections, deduplicating by
-/// `HostKey`.  All connections share a single mpsc sender so the
-/// daemon's central reader can match host events to per-pod state.
+/// Daemon-wide registry of host connections, deduplicating live
+/// connections by `HostKey`.  The registry caches weak references so
+/// an idle host does not keep a background monitor alive forever.
+/// All connections share a single mpsc sender so the daemon's central
+/// reader can match host events to per-pod state.
 pub struct HostConnectionRegistry {
     events_tx: HostConnectionEventTx,
-    conns: Mutex<HashMap<HostKey, Arc<HostConnection>>>,
+    conns: Mutex<HashMap<HostKey, Weak<HostConnection>>>,
 }
 
 impl HostConnectionRegistry {
@@ -111,26 +126,31 @@ impl HostConnectionRegistry {
     }
 
     /// Look up an existing connection or build a new one for `host`.
-    /// New connections start out down; the caller drives bring-up
-    /// via `HostConnection::ensure_connected` (or, more commonly,
-    /// `Executor::new`).
+    /// New remote connections start out down; their background monitor
+    /// brings them up, and callers can also force an immediate probe
+    /// via `HostConnection::ensure_connected` (e.g. `Executor::new`).
     pub fn get_or_create(&self, host: &Host) -> Result<Arc<HostConnection>> {
         let key = HostKey::from_host(host);
         let mut conns = self.conns.lock().unwrap();
-        if let Some(c) = conns.get(&key) {
-            return Ok(c.clone());
+        if let Some(conn) = conns.get(&key).and_then(Weak::upgrade) {
+            return Ok(conn);
         }
         let conn = Arc::new(HostConnection::new(host, self.events_tx.clone())?);
-        conns.insert(key, conn.clone());
+        conns.insert(key, Arc::downgrade(&conn));
         Ok(conn)
     }
 
-    /// Return the connection for `host` without creating one.  Used
-    /// by paths like `list_pods` that should not implicitly start
-    /// new remote connections.
+    /// Return a live connection for `host` without creating one.  Used
+    /// by paths like `list_pods` that should not implicitly start new
+    /// remote connections.
     pub fn get(&self, host: &Host) -> Option<Arc<HostConnection>> {
         let key = HostKey::from_host(host);
-        self.conns.lock().unwrap().get(&key).cloned()
+        let mut conns = self.conns.lock().unwrap();
+        let conn = conns.get(&key).and_then(Weak::upgrade);
+        if conn.is_none() {
+            conns.remove(&key);
+        }
+        conn
     }
 
     /// Remove the connection for `host` from the registry.  The
@@ -138,13 +158,22 @@ impl HostConnectionRegistry {
     /// are held; drop happens when the last reference goes away.
     /// Used by the central reader on `GaveUp` events.
     pub fn remove(&self, key: &HostKey) -> Option<Arc<HostConnection>> {
-        self.conns.lock().unwrap().remove(key)
+        self.conns
+            .lock()
+            .unwrap()
+            .remove(key)
+            .and_then(|c| c.upgrade())
     }
 }
 
-/// How often the Kubernetes background monitor verifies liveness
-/// and re-attempts bring-up when down.
+/// How often the background monitors verify liveness and re-attempt
+/// bring-up when down.
 const HEALTH_INTERVAL: Duration = Duration::from_secs(15);
+
+/// SSH monitor reconnect backoff while the host is down.  Capped low so
+/// the user's terminal reconnects promptly once the host is reachable.
+const SSH_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const SSH_MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Per-host connection handle, behind `Arc` in the registry.
 pub enum HostConnection {
@@ -155,8 +184,8 @@ pub enum HostConnection {
 
 impl HostConnection {
     /// Spawn a new connection.  Localhost is trivial and emits a
-    /// single `Connected` event; Kubernetes spawns a monitor task.
-    /// SSH stays idle until a caller asks for a Docker probe.
+    /// single `Connected` event; SSH and Kubernetes each spawn a
+    /// background monitor that owns liveness and reconnection.
     pub fn new(host: &Host, events_tx: HostConnectionEventTx) -> Result<Self> {
         match host {
             Host::Localhost => Ok(HostConnection::Localhost(LocalhostConnection::new(
@@ -187,10 +216,34 @@ impl HostConnection {
     /// Whether the connection currently has a live handle.  Cheap
     /// snapshot; does not attempt to bring the connection up.
     pub fn is_connected(&self) -> bool {
+        self.status() == HostStatus::Connected
+    }
+
+    /// Current liveness snapshot.
+    pub fn status(&self) -> HostStatus {
         match self {
-            HostConnection::Localhost(_) => true,
-            HostConnection::Ssh(c) => c.is_connected(),
-            HostConnection::Kubernetes(c) => c.state.lock().unwrap().client.is_some(),
+            HostConnection::Localhost(_) => HostStatus::Connected,
+            HostConnection::Ssh(c) => c.status(),
+            HostConnection::Kubernetes(c) => c.status(),
+        }
+    }
+
+    /// Subscribe to liveness transitions for this host.
+    pub fn subscribe(&self) -> watch::Receiver<HostStatus> {
+        match self {
+            HostConnection::Localhost(c) => c.subscribe(),
+            HostConnection::Ssh(c) => c.subscribe(),
+            HostConnection::Kubernetes(c) => c.subscribe(),
+        }
+    }
+
+    /// Ask the per-host monitor to probe now instead of waiting out its
+    /// heartbeat.  No-op for localhost.
+    pub fn request_probe(&self) {
+        match self {
+            HostConnection::Localhost(_) => {}
+            HostConnection::Ssh(c) => c.request_probe(),
+            HostConnection::Kubernetes(c) => c.request_probe(),
         }
     }
 
@@ -225,6 +278,8 @@ pub struct LocalhostConnection {
     // needed; today the constructor uses it once and the field
     // exists to mirror the other variants.
     _events_tx: HostConnectionEventTx,
+    /// Permanently `Connected`; lets pod loops subscribe uniformly.
+    status_tx: watch::Sender<HostStatus>,
 }
 
 impl LocalhostConnection {
@@ -232,9 +287,15 @@ impl LocalhostConnection {
         // Emit Connected once so the daemon's reader handles
         // localhost uniformly with the other variants.
         let _ = events_tx.send(HostConnectionEvent::Connected(HostKey::Localhost));
+        let (status_tx, _) = watch::channel(HostStatus::Connected);
         Arc::new(Self {
             _events_tx: events_tx,
+            status_tx,
         })
+    }
+
+    fn subscribe(&self) -> watch::Receiver<HostStatus> {
+        self.status_tx.subscribe()
     }
 }
 
@@ -245,22 +306,31 @@ impl LocalhostConnection {
 pub struct SshConnection {
     destination: String,
     events_tx: HostConnectionEventTx,
-    state: Arc<Mutex<SshState>>,
-    /// Serializes demand-driven probes.
+    /// Single source of truth for liveness; updated by `ensure_connected`
+    /// and observed by pod loops waiting for the host to come back.
+    status_tx: watch::Sender<HostStatus>,
+    /// Wakes the background monitor for an immediate probe.
+    probe: Arc<Notify>,
+    /// Serializes probes so concurrent callers do not dial in parallel.
     bring_up: Mutex<()>,
-}
-
-struct SshState {
-    connected: bool,
+    /// The single per-host retry/liveness loop.  Aborted on drop.
+    _monitor: AbortOnDrop,
 }
 
 impl SshConnection {
     fn new(destination: String, events_tx: HostConnectionEventTx) -> Arc<Self> {
-        Arc::new(SshConnection {
-            destination,
-            events_tx,
-            state: Arc::new(Mutex::new(SshState { connected: false })),
-            bring_up: Mutex::new(()),
+        let (status_tx, _) = watch::channel(HostStatus::Disconnected);
+        let probe = Arc::new(Notify::new());
+        Arc::new_cyclic(|weak: &Weak<SshConnection>| {
+            let task = RUNTIME.spawn(ssh_monitor(weak.clone(), probe.clone()));
+            SshConnection {
+                destination,
+                events_tx,
+                status_tx,
+                probe,
+                bring_up: Mutex::new(()),
+                _monitor: AbortOnDrop(task),
+            }
         })
     }
 
@@ -271,37 +341,58 @@ impl SshConnection {
     }
 
     pub fn is_connected(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        state.connected
+        *self.status_tx.borrow() == HostStatus::Connected
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<HostStatus> {
+        self.status_tx.subscribe()
+    }
+
+    pub fn status(&self) -> HostStatus {
+        *self.status_tx.borrow()
+    }
+
+    pub fn request_probe(&self) {
+        self.probe.notify_one();
     }
 
     pub fn destination(&self) -> &str {
         &self.destination
     }
 
+    /// Update liveness, emitting a host event only on a real transition.
+    fn set_status(&self, status: HostStatus) {
+        let changed = self.status_tx.send_if_modified(|current| {
+            if *current != status {
+                *current = status;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
+            let event = match status {
+                HostStatus::Connected => HostConnectionEvent::Connected(self.key()),
+                HostStatus::Disconnected => HostConnectionEvent::Disconnected(self.key()),
+            };
+            let _ = self.events_tx.send(event);
+        }
+    }
+
     /// Verify that Docker answers through `ssh ... docker system
-    /// dial-stdio`.  There is no long-lived proxy for the SSH case, so
-    /// each call performs a real probe and updates the daemon's host
-    /// connection state from the result.
+    /// dial-stdio` and record the result.  Both the demand-driven
+    /// bring-up (`Executor::new`) and the background monitor go through
+    /// here; `bring_up` serializes them so there is at most one dial in
+    /// flight per host.
     pub fn ensure_connected(&self) -> Result<()> {
         let _guard = self.bring_up.lock().unwrap();
 
         if ping_ssh_docker(&self.destination) {
-            let changed = {
-                let mut state = self.state.lock().unwrap();
-                let changed = !state.connected;
-                state.connected = true;
-                changed
-            };
-            if changed {
-                let _ = self
-                    .events_tx
-                    .send(HostConnectionEvent::Connected(self.key()));
-            }
+            self.set_status(HostStatus::Connected);
             return Ok(());
         }
 
-        mark_disconnected(&self.state, &self.events_tx, &self.key());
+        self.set_status(HostStatus::Disconnected);
         Err(anyhow::anyhow!(
             "SSH Docker transport to {} failed to answer /_ping within {:?}. \
              Check SSH configuration, remote Docker, and Docker socket permissions.",
@@ -311,19 +402,45 @@ impl SshConnection {
     }
 }
 
-fn mark_disconnected(
-    state: &Arc<Mutex<SshState>>,
-    events_tx: &HostConnectionEventTx,
-    key: &HostKey,
-) {
-    let changed = {
-        let mut state = state.lock().unwrap();
-        let changed = state.connected;
-        state.connected = false;
-        changed
-    };
-    if changed {
-        let _ = events_tx.send(HostConnectionEvent::Disconnected(key.clone()));
+/// Background monitor for an SSH connection: the single retry and
+/// liveness loop per host.  Probes immediately, heartbeats while
+/// connected, and backs off while down.  `request_probe` wakes it early
+/// (e.g. when a pod loop sees its endpoint fail).  Holds only a `Weak`
+/// so the connection can drop and abort it.
+async fn ssh_monitor(weak: Weak<SshConnection>, probe: Arc<Notify>) {
+    let mut backoff = SSH_INITIAL_BACKOFF;
+    loop {
+        let Some(conn) = weak.upgrade() else { return };
+        let key = conn.key();
+        let conn_for_probe = conn.clone();
+        let connected =
+            match tokio::task::spawn_blocking(move || conn_for_probe.ensure_connected()).await {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    debug!("{key}: ssh monitor probe failed: {e:#}");
+                    false
+                }
+                Err(e) => {
+                    debug!("{key}: ssh monitor task join error: {e}");
+                    false
+                }
+            };
+        // Release the strong reference before sleeping so the connection
+        // can be dropped (and this task aborted) while the monitor idles.
+        drop(conn);
+
+        let wait = if connected {
+            backoff = SSH_INITIAL_BACKOFF;
+            HEALTH_INTERVAL
+        } else {
+            let current = backoff;
+            backoff = std::cmp::min(backoff.saturating_mul(2), SSH_MAX_BACKOFF);
+            current
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = probe.notified() => {}
+        }
     }
 }
 
@@ -413,6 +530,10 @@ pub struct K8sConnection {
     namespace: String,
     events_tx: HostConnectionEventTx,
     state: Mutex<K8sState>,
+    /// Single source of truth for liveness, mirroring `state.client`.
+    status_tx: watch::Sender<HostStatus>,
+    /// Wakes the background monitor for an immediate probe.
+    probe: Arc<Notify>,
     bring_up: Mutex<()>,
     _monitor: AbortOnDrop,
 }
@@ -423,14 +544,17 @@ struct K8sState {
 
 impl K8sConnection {
     fn new(context: String, namespace: String, events_tx: HostConnectionEventTx) -> Arc<Self> {
+        let (status_tx, _) = watch::channel(HostStatus::Disconnected);
+        let probe = Arc::new(Notify::new());
         Arc::new_cyclic(|weak: &Weak<K8sConnection>| {
-            let weak = weak.clone();
-            let task = RUNTIME.spawn(k8s_monitor(weak));
+            let task = RUNTIME.spawn(k8s_monitor(weak.clone(), probe.clone()));
             K8sConnection {
                 context,
                 namespace,
                 events_tx,
                 state: Mutex::new(K8sState { client: None }),
+                status_tx,
+                probe,
                 bring_up: Mutex::new(()),
                 _monitor: AbortOnDrop(task),
             }
@@ -441,6 +565,37 @@ impl K8sConnection {
         HostKey::Kubernetes {
             context: self.context.clone(),
             namespace: self.namespace.clone(),
+        }
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<HostStatus> {
+        self.status_tx.subscribe()
+    }
+
+    pub fn status(&self) -> HostStatus {
+        *self.status_tx.borrow()
+    }
+
+    pub fn request_probe(&self) {
+        self.probe.notify_one();
+    }
+
+    /// Update liveness, emitting a host event only on a real transition.
+    fn set_status(&self, status: HostStatus) {
+        let changed = self.status_tx.send_if_modified(|current| {
+            if *current != status {
+                *current = status;
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
+            let event = match status {
+                HostStatus::Connected => HostConnectionEvent::Connected(self.key()),
+                HostStatus::Disconnected => HostConnectionEvent::Disconnected(self.key()),
+            };
+            let _ = self.events_tx.send(event);
         }
     }
 
@@ -459,37 +614,45 @@ impl K8sConnection {
 
         if let Some(client) = cached {
             if check_k8s_alive(&client).is_ok() {
+                self.set_status(HostStatus::Connected);
                 return Ok(client);
             }
-            // Stale client: clear and emit Disconnected.
+            // Stale client: clear and mark disconnected.
             self.state.lock().unwrap().client = None;
-            let _ = self
-                .events_tx
-                .send(HostConnectionEvent::Disconnected(self.key()));
+            self.set_status(HostStatus::Disconnected);
         }
 
-        let client =
-            K8sClient::new(&self.context, &self.namespace).context("building kube client")?;
+        let client = match K8sClient::new(&self.context, &self.namespace) {
+            Ok(client) => client,
+            Err(e) => {
+                self.set_status(HostStatus::Disconnected);
+                return Err(e).context("building kube client");
+            }
+        };
         // Cheap probe so we don't cache a client that fails on its
         // first real call.
-        check_k8s_alive(&client)?;
+        if let Err(e) = check_k8s_alive(&client) {
+            self.set_status(HostStatus::Disconnected);
+            return Err(e);
+        }
         {
             let mut state = self.state.lock().unwrap();
             state.client = Some(client.clone());
         }
-        let _ = self
-            .events_tx
-            .send(HostConnectionEvent::Connected(self.key()));
+        self.set_status(HostStatus::Connected);
         Ok(client)
     }
 }
 
 /// Background monitor for a k8s connection: a periodic
 /// `ensure_client` ping that doubles as liveness check and
-/// reconnect attempt.
-async fn k8s_monitor(weak: Weak<K8sConnection>) {
+/// reconnect attempt.  `request_probe` wakes it early.
+async fn k8s_monitor(weak: Weak<K8sConnection>, probe: Arc<Notify>) {
     loop {
-        tokio::time::sleep(HEALTH_INTERVAL).await;
+        tokio::select! {
+            _ = tokio::time::sleep(HEALTH_INTERVAL) => {}
+            _ = probe.notified() => {}
+        }
         let Some(conn) = weak.upgrade() else { return };
         let key = conn.key();
         let conn_clone = conn.clone();
@@ -559,5 +722,25 @@ mod ssh_tests {
         );
         assert_no_rumpelpod_ssh_policy(&args);
         assert!(!args.iter().any(|arg| arg == "-p"));
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn registry_does_not_keep_idle_connection_alive() {
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let registry = HostConnectionRegistry::new(events_tx);
+
+        let conn = registry.get_or_create(&Host::Localhost).unwrap();
+        let same = registry.get_or_create(&Host::Localhost).unwrap();
+        assert!(Arc::ptr_eq(&conn, &same));
+        drop(same);
+
+        assert!(registry.get(&Host::Localhost).is_some());
+        drop(conn);
+        assert!(registry.get(&Host::Localhost).is_none());
     }
 }

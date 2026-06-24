@@ -171,7 +171,7 @@ fn check_description_format(file: &str, content: &str) {
     let trimmed = content.trim_end_matches('\n');
     if trimmed.is_empty() {
         fail_description_check(&format!(
-            "{file} is empty; the first line must be a short commit-message subject."
+            "{file} is empty, the first line must be a short commit-message subject"
         ));
     }
 
@@ -179,18 +179,18 @@ fn check_description_format(file: &str, content: &str) {
     let subject = lines[0];
     if subject.is_empty() {
         fail_description_check(&format!(
-            "{file} first line is empty; it must contain a short commit-message subject."
+            "{file} first line is empty, it must contain a short commit-message subject"
         ));
     }
     let subject_len = subject.chars().count();
     if subject_len > 50 {
         fail_description_check(&format!(
-            "{file} subject line is {subject_len} characters; keep it to 50 or fewer."
+            "{file} subject line is {subject_len} characters, keep it to 50 or fewer"
         ));
     }
     if lines.len() >= 2 && !lines[1].is_empty() {
         fail_description_check(&format!(
-            "{file} line 2 must be blank to separate subject from body."
+            "{file} line 2 must be blank to separate subject from body"
         ));
     }
     for (idx, line) in lines.iter().enumerate().skip(2) {
@@ -198,7 +198,7 @@ fn check_description_format(file: &str, content: &str) {
         if len > 72 {
             let lineno = idx + 1;
             fail_description_check(&format!(
-                "{file} line {lineno} is {len} characters; keep body lines to 72 or fewer."
+                "{file} line {lineno} is {len} characters, keep body lines to 72 or fewer"
             ));
         }
     }
@@ -206,7 +206,7 @@ fn check_description_format(file: &str, content: &str) {
 
 fn fail_description_check(msg: &str) -> ! {
     eprintln!("{msg}");
-    eprintln!("This check can be bypassed with `git commit --no-verify`.");
+    eprintln!("bypass this check with `git commit --no-verify`");
     std::process::exit(1);
 }
 

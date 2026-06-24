@@ -946,10 +946,7 @@ pub fn check_no_unresolved_mount_vars(mounts: &[MountObject]) -> Result<()> {
             .flatten()
         {
             if field.contains("${") {
-                return Err(anyhow::anyhow!(
-                    "unresolved variable in mount: '{field}'. \
-                     Check for typos in variable references."
-                ));
+                return Err(anyhow::anyhow!("unresolved variable in mount: '{field}'"));
             }
         }
     }

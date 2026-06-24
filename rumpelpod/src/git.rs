@@ -24,14 +24,9 @@ pub struct GitIdentity {
 /// Returns the absolute path to the repository root (the directory containing `.git`).
 /// Returns an error if the current directory is not inside a git repository.
 pub fn get_repo_root() -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("Failed to get current directory")?;
-    let repo = Repository::discover(&cwd).with_context(|| {
-        format!(
-            "Not inside a git repository: {}. \
-             Rumpel commands must be run from within a git repository.",
-            cwd.display()
-        )
-    })?;
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let repo = Repository::discover(&cwd)
+        .with_context(|| format!("not inside a git repository: {}", cwd.display()))?;
 
     let workdir = repo.workdir();
     match workdir {
@@ -47,8 +42,7 @@ pub fn get_repo_root() -> Result<PathBuf> {
         None => {
             // Repository is bare (no working directory)
             Err(anyhow::anyhow!(
-                "Cannot use rumpel in a bare git repository. \
-                 Please run from within a repository with a working directory."
+                "cannot use rumpel in a bare git repository (needs a working tree)"
             ))
         }
     }

@@ -57,11 +57,11 @@ fn parse_direction(src: &str, dest: &str) -> Result<CopyDirection> {
             container_path: path.to_string(),
         }),
         (None, None) => Err(anyhow::anyhow!(
-            "Neither src nor dest uses POD:PATH syntax.\n\
+            "neither src nor dest uses POD:PATH syntax.\n\
                  Exactly one of src or dest must specify a pod, e.g. my-pod:/path/in/container"
         )),
         (Some(_), Some(_)) => Err(anyhow::anyhow!(
-            "Both src and dest use POD:PATH syntax.\n\
+            "both src and dest use POD:PATH syntax.\n\
                  Exactly one side must be a local path."
         )),
     }

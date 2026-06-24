@@ -170,7 +170,7 @@ pub fn resolve_image(
     if !dockerfile_path.exists() {
         let path = dockerfile_path.display();
         return Err(anyhow::anyhow!(
-            "Devcontainer Dockerfile '{path}' not found"
+            "devcontainer Dockerfile '{path}' not found"
         ));
     }
 

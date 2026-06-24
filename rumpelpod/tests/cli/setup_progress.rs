@@ -100,9 +100,9 @@ fn setup_progress_visible_in_client_stderr() {
     // no subscribers).  Git setup and lifecycle messages arrive later
     // and should be visible.
     assert!(
-        stderr.contains("Setting up git remotes")
-            || stderr.contains("Running lifecycle commands")
-            || stderr.contains("Resolving environment"),
+        stderr.contains("setting up git remotes")
+            || stderr.contains("running lifecycle commands")
+            || stderr.contains("resolving environment"),
         "client stderr should show at least one setup progress step.\nstderr: {stderr}"
     );
 }

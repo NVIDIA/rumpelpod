@@ -31,11 +31,11 @@ fn check_docker_available() -> Result<()> {
 }
 
 fn resolve_exe_path() -> Result<PathBuf> {
-    let exe_path = std::env::current_exe().context("Could not determine executable path")?;
+    let exe_path = std::env::current_exe().context("could not determine executable path")?;
     let display = exe_path.display();
     exe_path
         .canonicalize()
-        .with_context(|| format!("Could not resolve executable path: {display}"))
+        .with_context(|| format!("could not resolve executable path: {display}"))
 }
 
 pub fn system_install() -> Result<()> {
@@ -63,7 +63,7 @@ pub fn system_uninstall() -> Result<()> {
 const LAUNCHD_LABEL: &str = "com.rumpelpod.daemon";
 
 fn launchd_plist_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let home = dirs::home_dir().context("could not determine home directory")?;
     Ok(home.join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist")))
 }
 
@@ -143,7 +143,7 @@ fn launchd_bootstrap(plist: &str) -> Result<()> {
         let output = Command::new("launchctl")
             .args(["bootstrap", &domain, plist])
             .output()
-            .context("Failed to run launchctl bootstrap")?;
+            .context("failed to run launchctl bootstrap")?;
         if output.status.success() {
             return Ok(());
         }
@@ -166,18 +166,18 @@ fn launchd_install() -> Result<()> {
     let plist_path = launchd_plist_path()?;
     let plist_dir = plist_path
         .parent()
-        .context("Could not determine LaunchAgents directory")?;
+        .context("could not determine LaunchAgents directory")?;
     let plist_dir_display = plist_dir.display();
     fs::create_dir_all(plist_dir)
-        .with_context(|| format!("Failed to create {plist_dir_display}"))?;
+        .with_context(|| format!("failed to create {plist_dir_display}"))?;
 
     let content = launchd_plist_content()?;
     let display = plist_path.display();
-    fs::write(&plist_path, &content).with_context(|| format!("Failed to write {display}"))?;
+    fs::write(&plist_path, &content).with_context(|| format!("failed to write {display}"))?;
 
     launchd_bootstrap(&plist_path.to_string_lossy())?;
 
-    println!("Installed rumpelpod daemon.");
+    println!("installed rumpelpod daemon");
     Ok(())
 }
 
@@ -188,10 +188,10 @@ fn launchd_uninstall() -> Result<()> {
 
     if plist_path.exists() {
         let display = plist_path.display();
-        fs::remove_file(&plist_path).with_context(|| format!("Failed to remove {display}"))?;
+        fs::remove_file(&plist_path).with_context(|| format!("failed to remove {display}"))?;
     }
 
-    println!("Uninstalled rumpelpod daemon.");
+    println!("uninstalled rumpelpod daemon");
     Ok(())
 }
 
@@ -200,7 +200,7 @@ fn launchd_uninstall() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn systemd_user_dir() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir().context("Could not determine config directory")?;
+    let config_dir = dirs::config_dir().context("could not determine config directory")?;
     Ok(config_dir.join("systemd/user"))
 }
 
@@ -253,7 +253,7 @@ fn systemctl(args: &[&str]) -> Result<()> {
         .arg("--user")
         .args(args)
         .status()
-        .context("Failed to run systemctl")?;
+        .context("failed to run systemctl")?;
 
     if !status.success() {
         let args = args.join(" ");
@@ -267,7 +267,7 @@ fn check_systemd_available() -> Result<()> {
         .arg("--user")
         .arg("--version")
         .output()
-        .context("Failed to run systemctl")?;
+        .context("failed to run systemctl")?;
 
     if !output.status.success() {
         return Err(anyhow!(
@@ -286,18 +286,18 @@ fn systemd_install() -> Result<()> {
     let service_path = service_unit_path()?;
 
     let dir = systemd_dir.display();
-    fs::create_dir_all(&systemd_dir).with_context(|| format!("Failed to create {dir}"))?;
+    fs::create_dir_all(&systemd_dir).with_context(|| format!("failed to create {dir}"))?;
 
     let socket_content = socket_unit_content()?;
     let service_content = service_unit_content()?;
 
     let socket_display = socket_path.display();
     fs::write(&socket_path, &socket_content)
-        .with_context(|| format!("Failed to write {socket_display}"))?;
+        .with_context(|| format!("failed to write {socket_display}"))?;
 
     let service_display = service_path.display();
     fs::write(&service_path, &service_content)
-        .with_context(|| format!("Failed to write {service_display}"))?;
+        .with_context(|| format!("failed to write {service_display}"))?;
 
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", &format!("{SERVICE_NAME}.socket")])?;
@@ -306,7 +306,7 @@ fn systemd_install() -> Result<()> {
     // Restarting the socket also stops the service (via Requires= dependency).
     systemctl(&["restart", &format!("{SERVICE_NAME}.socket")])?;
 
-    println!("Installed rumpelpod daemon.");
+    println!("installed rumpelpod daemon");
 
     Ok(())
 }
@@ -323,17 +323,17 @@ fn systemd_uninstall() -> Result<()> {
 
     if socket_path.exists() {
         let path = socket_path.display();
-        fs::remove_file(&socket_path).with_context(|| format!("Failed to remove {path}"))?;
+        fs::remove_file(&socket_path).with_context(|| format!("failed to remove {path}"))?;
     }
 
     if service_path.exists() {
         let path = service_path.display();
-        fs::remove_file(&service_path).with_context(|| format!("Failed to remove {path}"))?;
+        fs::remove_file(&service_path).with_context(|| format!("failed to remove {path}"))?;
     }
 
     systemctl(&["daemon-reload"])?;
 
-    println!("Uninstalled rumpelpod daemon.");
+    println!("uninstalled rumpelpod daemon");
 
     Ok(())
 }

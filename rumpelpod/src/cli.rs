@@ -20,8 +20,7 @@ pub(crate) fn validate_pod_name(name: &str) -> Result<String, String> {
         .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_' && *c != '.')
     {
         return Err(format!(
-            "invalid character '{}' in pod name -- \
-             only ASCII letters, digits, hyphens, underscores, and dots are allowed",
+            "invalid character '{}' in pod name, allowed: ASCII letters, digits, hyphens, underscores, dots",
             bad
         ));
     }

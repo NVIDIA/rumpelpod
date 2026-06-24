@@ -64,7 +64,7 @@ fn get_difftool_name(repo_root: &std::path::Path) -> Result<Option<String>> {
         .args(["config", "--get", "diff.tool"])
         .current_dir(repo_root)
         .output()
-        .context("Failed to query git config for diff.tool")?;
+        .context("failed to query git config for diff.tool")?;
 
     if !output.status.success() {
         return Ok(None);
@@ -90,7 +90,7 @@ fn get_tool_path(repo_root: &std::path::Path, tool: &str) -> Result<String> {
         .args(["config", "--get", &difftool_path_key])
         .current_dir(repo_root)
         .output()
-        .context("Failed to query git config for difftool path")?;
+        .context("failed to query git config for difftool path")?;
 
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -105,7 +105,7 @@ fn get_tool_path(repo_root: &std::path::Path, tool: &str) -> Result<String> {
         .args(["config", "--get", &mergetool_path_key])
         .current_dir(repo_root)
         .output()
-        .context("Failed to query git config for mergetool path")?;
+        .context("failed to query git config for mergetool path")?;
 
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -126,7 +126,7 @@ fn get_difftool_cmd(repo_root: &std::path::Path, tool: &str) -> Result<Option<St
         .args(["config", "--get", &config_key])
         .current_dir(repo_root)
         .output()
-        .context("Failed to query git config for difftool cmd")?;
+        .context("failed to query git config for difftool cmd")?;
 
     if !output.status.success() {
         // No custom command configured - tool is either built-in or will be invoked directly
@@ -158,12 +158,12 @@ fn get_changed_files(
     let output = cmd
         .current_dir(repo_root)
         .output()
-        .context("Failed to get list of changed files")?;
+        .context("failed to get list of changed files")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();
-        return Err(anyhow::anyhow!("Failed to get changed files: {stderr}"));
+        return Err(anyhow::anyhow!("failed to get changed files: {stderr}"));
     }
 
     let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
@@ -186,7 +186,7 @@ fn get_file_at_commit(
         .args(["show", &format!("{commit}:{file_path}")])
         .current_dir(repo_root)
         .output()
-        .context("Failed to get file content from commit")?;
+        .context("failed to get file content from commit")?;
 
     if !output.status.success() {
         // File doesn't exist at this commit (new or deleted file)
@@ -202,13 +202,13 @@ fn write_temp_file(dir: &std::path::Path, name: &str, content: Option<&[u8]>) ->
 
     // Create parent directories if the file path contains subdirectories
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("Failed to create parent directories")?;
+        fs::create_dir_all(parent).context("failed to create parent directories")?;
     }
 
-    let mut file = File::create(&path).context("Failed to create temp file")?;
+    let mut file = File::create(&path).context("failed to create temp file")?;
     if let Some(content) = content {
         file.write_all(content)
-            .context("Failed to write temp file")?;
+            .context("failed to write temp file")?;
     }
 
     Ok(path)
@@ -236,7 +236,7 @@ fn invoke_difftool(
         Command::new("sh")
             .args(["-c", &cmd])
             .status()
-            .context("Failed to run difftool command")?;
+            .context("failed to run difftool command")?;
     } else if is_vimdiff_variant(tool) {
         // vimdiff/nvimdiff/gvimdiff need special handling to enable diff mode.
         // This mirrors git's diff_cmd() in mergetools/vimdiff:
@@ -248,7 +248,7 @@ fn invoke_difftool(
             .arg(local_path)
             .arg(remote_path)
             .status()
-            .context("Failed to run difftool")?;
+            .context("failed to run difftool")?;
     } else if tool == "vscode" {
         // Mirrors git's mergetools/vscode: without --wait --diff, VS Code
         // returns immediately and does not render the two files as a diff.
@@ -257,14 +257,14 @@ fn invoke_difftool(
             .arg(local_path)
             .arg(remote_path)
             .status()
-            .context("Failed to run difftool")?;
+            .context("failed to run difftool")?;
     } else {
         // Other built-in tools - invoke the executable path directly with two file arguments
         Command::new(tool_path)
             .arg(local_path)
             .arg(remote_path)
             .status()
-            .context("Failed to run difftool")?;
+            .context("failed to run difftool")?;
     }
 
     // Note: We don't check the exit status here. Many difftools return
@@ -288,12 +288,12 @@ fn prompt_for_file(
     let display_index = file_index + 1;
     println!("\nViewing ({display_index}/{total_files}): '{file_path}'");
     print!("Launch '{tool}' [Y/n]? ");
-    io::stdout().flush().context("Failed to flush stdout")?;
+    io::stdout().flush().context("failed to flush stdout")?;
 
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)
-        .context("Failed to read user input")?;
+        .context("failed to read user input")?;
 
     let input = input.trim().to_lowercase();
     // Default is Yes (capital Y), so empty input or 'y'/'yes' means proceed
@@ -311,7 +311,7 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
     let pods = client.list_pods(repo_root.clone())?;
     if !pods.iter().any(|s| s.name == cmd.name) {
         let name = &cmd.name;
-        return Err(anyhow::anyhow!("Pod '{name}' does not exist."));
+        return Err(anyhow::anyhow!("pod '{name}' does not exist"));
     }
 
     let name = &cmd.name;
@@ -320,12 +320,11 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
         .args(["rev-parse", "--verify", &pod_ref])
         .current_dir(&repo_root)
         .output()
-        .context("Failed to check pod ref")?;
+        .context("failed to check pod ref")?;
 
     if !ref_check.status.success() {
         return Err(anyhow::anyhow!(
-            "Pod ref '{pod_ref}' not found in host repository.\n\
-             Make sure the pod has made at least one commit."
+            "pod ref '{pod_ref}' not found in host repository (pod has no commits yet)"
         ));
     }
 
@@ -334,12 +333,12 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
         .args(["rev-parse", "HEAD"])
         .current_dir(&repo_root)
         .output()
-        .context("Failed to get HEAD commit")?;
+        .context("failed to get HEAD commit")?;
 
     if !head_output.status.success() {
         let stderr = String::from_utf8_lossy(&head_output.stderr);
         let stderr = stderr.trim();
-        return Err(anyhow::anyhow!("Failed to get HEAD commit: {stderr}"));
+        return Err(anyhow::anyhow!("failed to get HEAD commit: {stderr}"));
     }
 
     let host_head = String::from_utf8_lossy(&head_output.stdout)
@@ -351,13 +350,13 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
         .args(["merge-base", &pod_ref, &host_head])
         .current_dir(&repo_root)
         .output()
-        .context("Failed to compute merge base")?;
+        .context("failed to compute merge base")?;
 
     if !merge_base_output.status.success() {
         let stderr = String::from_utf8_lossy(&merge_base_output.stderr);
         let stderr = stderr.trim();
         return Err(anyhow::anyhow!(
-            "Failed to compute merge base between '{pod_ref}' and HEAD:\n{stderr}"
+            "failed to compute merge base between '{pod_ref}' and HEAD:\n{stderr}"
         ));
     }
 
@@ -373,21 +372,20 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
             (tool, cmd_template, tool_path)
         }
         None => {
-            // No difftool configured -- fall back to VS Code if available,
+            // No difftool configured, fall back to VS Code if available,
             // otherwise fail rather than silently doing nothing.
             let code_path = crate::which("code").ok_or_else(|| {
                 anyhow::anyhow!(indoc::indoc! {"
-                    No difftool configured and 'code' (VS Code CLI) is not on PATH.
-                    Either install VS Code and ensure 'code' is on PATH, or configure
-                    a difftool in your git config, e.g.:
+                    no difftool configured and 'code' (VS Code CLI) not on PATH
+                    install VS Code, or set a difftool in git config:
                         git config --global diff.tool vscode
                 "})
             })?;
             eprintln!(
                 "{}",
                 indoc::indoc! {r#"
-                    warning: no difftool configured; defaulting to VS Code.
-                    To silence this warning, add to your ~/.gitconfig:
+                    warning: no difftool configured, using VS Code
+                    set one in ~/.gitconfig to silence this:
 
                         [diff]
                             tool = vscode
@@ -413,8 +411,8 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
     let temp_dir = TempDir::with_prefix("rumpelpod-review-")?;
     let local_dir = temp_dir.path().join("local");
     let remote_dir = temp_dir.path().join("remote");
-    fs::create_dir_all(&local_dir).context("Failed to create local temp dir")?;
-    fs::create_dir_all(&remote_dir).context("Failed to create remote temp dir")?;
+    fs::create_dir_all(&local_dir).context("failed to create local temp dir")?;
+    fs::create_dir_all(&remote_dir).context("failed to create remote temp dir")?;
 
     // Process each changed file
     let total_files = changed_files.len();

@@ -135,7 +135,7 @@ fn cp_both_pod_syntax_fails() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Both"),
+        stderr.contains("both"),
         "Error should mention both sides: {}",
         stderr
     );

@@ -137,19 +137,19 @@ impl PodClient {
                     }
                     Err(e) => {
                         emit(&format!(
-                            "Waiting for container server (attempt {attempt}: {e})..."
+                            "waiting for container server (attempt {attempt}: {e})..."
                         ));
                     }
                 },
                 Ok(resp) => {
                     let status = resp.status();
                     emit(&format!(
-                        "Waiting for container server (attempt {attempt}, status {status})..."
+                        "waiting for container server (attempt {attempt}, status {status})..."
                     ));
                 }
                 Err(e) => {
                     emit(&format!(
-                        "Waiting for container server (attempt {attempt}: {e})..."
+                        "waiting for container server (attempt {attempt}: {e})..."
                     ));
                 }
             }

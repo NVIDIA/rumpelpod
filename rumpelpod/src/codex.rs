@@ -202,7 +202,7 @@ fn write_codex_credentials(pod: &crate::pod::PodClient) -> Result<()> {
     let auth_path = local_home.join(".codex/auth.json");
     if !auth_path.exists() {
         return Err(anyhow::anyhow!(
-            "No codex credentials found at ~/.codex/auth.json. Run `codex login` first."
+            "no codex credentials found at ~/.codex/auth.json. Run `codex login` first."
         ));
     }
 

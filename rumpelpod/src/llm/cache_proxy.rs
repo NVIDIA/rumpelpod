@@ -429,7 +429,7 @@ pub async fn handle_llm_cache_proxy(
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Cache miss in offline mode. \
+            "cache miss in offline mode. \
              Re-run with RUMPELPOD_TEST_LLM_OFFLINE=0 to populate the cache.",
         )
             .into_response();

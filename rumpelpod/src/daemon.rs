@@ -1479,7 +1479,7 @@ fn copy_claude_config_via_pod(
     permission_hook: bool,
     copy_sessions: bool,
 ) -> Result<()> {
-    let local_home = dirs::home_dir().context("Could not determine home directory")?;
+    let local_home = dirs::home_dir().context("could not determine home directory")?;
     let claude_dir = local_home.join(".claude");
 
     // Materialize all in-memory pieces up-front so the pipe-thread sees
@@ -2601,7 +2601,7 @@ impl DaemonServer {
         .map_err(&mark_error)?;
 
         progress_tx
-            .send(OutputLine::Stderr("Creating container...".into()))
+            .send(OutputLine::Stderr("creating container...".into()))
             .ok();
         executor
             .launch(&exec_pod_id, spec)
@@ -2625,7 +2625,7 @@ impl DaemonServer {
         // repo, sets up git remotes/hooks, and runs lifecycle commands
         // during startup, so it only accepts connections once ready.
         progress_tx
-            .send(OutputLine::Stderr("Starting container server...".into()))
+            .send(OutputLine::Stderr("starting container server...".into()))
             .ok();
         start_container_server(
             &executor,
@@ -2788,7 +2788,7 @@ impl DaemonServer {
                     let existing_host: Host = serde_json::from_str(&existing.host)
                         .context("parsing stored host for existing pod")?;
                     eprintln!(
-                        "Pod '{}' exists on {}, reconnecting there.",
+                        "pod '{}' exists on {}, reconnecting there.",
                         pod_name.0, existing_host,
                     );
                     docker_host = existing_host;
@@ -2856,7 +2856,7 @@ impl DaemonServer {
         gateway::setup_gateway(&repo_path)?;
 
         build_tx
-            .send(OutputLine::Stderr("Resolving image...".into()))
+            .send(OutputLine::Stderr("resolving image...".into()))
             .ok();
         // The default image is staged into a moving tempdir, so its tag
         // must ignore the context path; every real context is at the
@@ -2880,7 +2880,7 @@ impl DaemonServer {
         let host_remotes = crate::git::get_remotes(&repo_path).unwrap_or_default();
         let build_options = devcontainer.build_options();
         build_tx
-            .send(OutputLine::Stderr("Preparing image...".into()))
+            .send(OutputLine::Stderr("preparing image...".into()))
             .ok();
         let container_env_keys = container_env_keys_sorted(&devcontainer);
         let prepared = crate::prepared_image::build_prepared_image(
@@ -3122,7 +3122,7 @@ impl DaemonServer {
         // can retry once on overlay2 filesystem errors (see below).
         let do_create_and_setup = || -> Result<(ContainerId, String)> {
             progress_tx
-                .send(OutputLine::Stderr("Creating container...".into()))
+                .send(OutputLine::Stderr("creating container...".into()))
                 .ok();
             let spec = build_docker_pod_spec(
                 &pod_name,
@@ -3154,7 +3154,7 @@ impl DaemonServer {
             // repo, sets up git remotes/hooks, and runs lifecycle commands
             // during startup, so it only accepts connections once ready.
             progress_tx
-                .send(OutputLine::Stderr("Starting container server...".into()))
+                .send(OutputLine::Stderr("starting container server...".into()))
                 .ok();
             start_container_server(
                 &executor,
@@ -3230,7 +3230,7 @@ impl DaemonServer {
                 Vec::new()
             } else {
                 progress_tx
-                    .send(OutputLine::Stderr("Setting up port forwarding...".into()))
+                    .send(OutputLine::Stderr("setting up port forwarding...".into()))
                     .ok();
                 setup_port_forwarding(
                     &conn,
@@ -3315,7 +3315,7 @@ impl DaemonServer {
         }
         if source_record.status != db::PodStatus::Ready {
             return Err(anyhow::anyhow!(
-                "source pod '{source}' is not running (status: {:?}); start it first",
+                "source pod '{source}' is not running (status: {:?}), start it first",
                 source_record.status
             ));
         }
@@ -3361,11 +3361,11 @@ impl DaemonServer {
 
         // Flush any local-only branches to the host before fetching.
         let _ = build_tx.send(OutputLine::Stderr(
-            "Pushing source pod's branches to the host...".into(),
+            "pushing source pod's branches to the host...".into(),
         ));
         source_pod.git_push().context("git push on source pod")?;
 
-        let _ = build_tx.send(OutputLine::Stderr("Reading source pod state...".into()));
+        let _ = build_tx.send(OutputLine::Stderr("reading source pod state...".into()));
         let state = source_pod.get_state().context("GET /state on source pod")?;
         let source_env = source_pod
             .get_container_env()
@@ -3373,7 +3373,7 @@ impl DaemonServer {
 
         let dirty_patch = if state.dirty {
             let _ = build_tx.send(OutputLine::Stderr(
-                "Capturing source pod's dirty working tree...".into(),
+                "capturing source pod's dirty working tree...".into(),
             ));
             let p = source_pod
                 .git_patch_get()
@@ -4328,7 +4328,7 @@ impl Daemon for DaemonServer {
         let pod_id = {
             let conn = self.db.lock().unwrap();
             let pod_rec = db::get_pod(&conn, &request.repo_path, &request.pod_name.0)?
-                .context("Pod not found")?;
+                .context("pod not found")?;
             if db::has_claude_config_copied(&conn, pod_rec.id)? {
                 return Ok(());
             }
@@ -4531,7 +4531,7 @@ pub fn run_daemon() -> Result<()> {
     let mut listenfd = ListenFd::from_env();
     let listener = if let Some(listener) = listenfd
         .take_unix_listener(0)
-        .context("Failed to take inherited unix listener")?
+        .context("failed to take inherited unix listener")?
     {
         listener.set_nonblocking(true)?;
         UnixListener::from_std(listener)?
@@ -4542,7 +4542,7 @@ pub fn run_daemon() -> Result<()> {
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 let parent = parent.display();
-                format!("Failed to create {parent}")
+                format!("failed to create {parent}")
             })?;
         }
 
@@ -4552,7 +4552,7 @@ pub fn run_daemon() -> Result<()> {
         }
         UnixListener::bind(&socket).with_context(|| {
             let socket = socket.display();
-            format!("Failed to bind to {socket}")
+            format!("failed to bind to {socket}")
         })?
     };
 
