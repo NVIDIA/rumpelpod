@@ -311,7 +311,7 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
     let pods = client.list_pods(repo_root.clone())?;
     if !pods.iter().any(|s| s.name == cmd.name) {
         let name = &cmd.name;
-        return Err(anyhow::anyhow!("pod '{name}' does not exist."));
+        return Err(anyhow::anyhow!("pod '{name}' does not exist"));
     }
 
     let name = &cmd.name;

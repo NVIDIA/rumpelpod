@@ -177,7 +177,7 @@ fn launchd_install() -> Result<()> {
 
     launchd_bootstrap(&plist_path.to_string_lossy())?;
 
-    println!("installed rumpelpod daemon.");
+    println!("installed rumpelpod daemon");
     Ok(())
 }
 
@@ -191,7 +191,7 @@ fn launchd_uninstall() -> Result<()> {
         fs::remove_file(&plist_path).with_context(|| format!("failed to remove {display}"))?;
     }
 
-    println!("uninstalled rumpelpod daemon.");
+    println!("uninstalled rumpelpod daemon");
     Ok(())
 }
 
@@ -306,7 +306,7 @@ fn systemd_install() -> Result<()> {
     // Restarting the socket also stops the service (via Requires= dependency).
     systemctl(&["restart", &format!("{SERVICE_NAME}.socket")])?;
 
-    println!("installed rumpelpod daemon.");
+    println!("installed rumpelpod daemon");
 
     Ok(())
 }
@@ -333,7 +333,7 @@ fn systemd_uninstall() -> Result<()> {
 
     systemctl(&["daemon-reload"])?;
 
-    println!("uninstalled rumpelpod daemon.");
+    println!("uninstalled rumpelpod daemon");
 
     Ok(())
 }

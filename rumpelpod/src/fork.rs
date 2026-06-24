@@ -63,7 +63,7 @@ pub fn fork(cmd: &ForkCommand) -> Result<()> {
 
     let new_name = &cmd.new_name;
     let source = &cmd.source;
-    println!("pod '{new_name}' forked from '{source}'.");
+    println!("pod '{new_name}' forked from '{source}'");
     Ok(())
 }
 
