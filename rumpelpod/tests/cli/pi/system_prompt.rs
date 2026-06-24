@@ -20,7 +20,7 @@ fn pi_system_prompt_describes_remotes() {
         &["--model", "anthropic/claude-haiku-4-5"],
     );
 
-    session.wait_for("workspace");
+    session.wait_until_ready();
     session.send("What git remote has other pods? One word only.");
 
     session.wait_for("rumpelpod");

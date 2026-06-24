@@ -36,7 +36,7 @@ fn pi_read_file() {
         &["--model", "anthropic/claude-haiku-4-5"],
     );
 
-    session.wait_for("workspace");
+    session.wait_until_ready();
     session.send("Read hello.txt. Reply with only the file contents.");
 
     // The file content only appears on screen after pi reads it, not in
@@ -58,7 +58,7 @@ fn pi_write_file() {
         &["--model", "anthropic/claude-haiku-4-5"],
     );
 
-    session.wait_for("workspace");
+    session.wait_until_ready();
     session.send("Write 'rumpelpod-write-ok' to output.txt");
 
     // Poll via `rumpel enter` until the file appears inside the

@@ -234,6 +234,10 @@ impl PiSession {
         }
     }
 
+    pub fn wait_until_ready(&mut self) {
+        self.wait_for("Pi can explain its own features");
+    }
+
     pub fn dump_screen(&self, waiting_for: &str) {
         let screen = self.parser.screen();
         let contents = screen.contents();

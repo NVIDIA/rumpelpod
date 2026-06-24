@@ -22,8 +22,7 @@ fn pi_smoke() {
         &["--model", "anthropic/claude-haiku-4-5"],
     );
 
-    // Wait for pi's TUI to finish loading (it shows the working dir).
-    session.wait_for("workspace");
+    session.wait_until_ready();
 
     session.send("What is the capital of France? Reply with just the city name, nothing else.");
     session.wait_for("Paris");

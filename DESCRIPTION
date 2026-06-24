@@ -5,3 +5,5 @@ the extra cache layer around the pi test Node install is unnecessary.
 The recreate test now checks removed temporary files through a
 successful absence assertion, avoiding a timeout-prone failing
 interactive exec.
+The pi tests wait for the actual TUI readiness text before sending
+prompts, so Docker build output cannot satisfy the readiness check.
