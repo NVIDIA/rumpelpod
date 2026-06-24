@@ -232,7 +232,7 @@ fn rewrite_upstream(
 /// Agents whose home-relative state is transferred between pods.
 /// Mirrors the registry in `pod::server::agent_paths`; kept here as a
 /// flat list because recreate / fork iterate over it.
-pub(crate) const AGENT_NAMES: &[&str] = &["claude", "codex", "pi"];
+pub(crate) const AGENT_NAMES: &[&str] = &["claude", "codex", "grok", "pi"];
 
 /// Buffer the tar body from GET /agent-files/<agent> into memory.
 /// Returns None if the agent has no state to transfer.  Used by
@@ -1793,6 +1793,7 @@ pub(crate) const RUMPEL_CONTAINER_BIN: &str = "/opt/rumpelpod/bin/rumpel";
 pub(crate) const CLAUDE_CONTAINER_BIN: &str = "/opt/rumpelpod/bin/claude";
 pub(crate) const CODEX_CONTAINER_BIN: &str = "/opt/rumpelpod/bin/codex";
 pub(crate) const PI_CONTAINER_BIN: &str = "/opt/rumpelpod/bin/pi";
+pub(crate) const GROK_CONTAINER_BIN: &str = "/opt/rumpelpod/bin/grok";
 
 struct CodexProxyHandle {
     port: u16,
@@ -2736,6 +2737,7 @@ impl DaemonServer {
             claude_cli_path,
             codex_cli_path,
             pi_cli_path,
+            grok_cli_path,
             inject_system_prompt,
             description_file,
             local_env_vars,
@@ -2856,11 +2858,21 @@ impl DaemonServer {
         build_tx
             .send(OutputLine::Stderr("Resolving image...".into()))
             .ok();
+        // The default image is staged into a moving tempdir, so its tag
+        // must ignore the context path; every real context is at the
+        // stable repo root and folds its path into the tag so distinct
+        // repos do not collide on one cached image.
+        let path_tagging = if used_default_image {
+            crate::image::ContextPathTagging::Ignore
+        } else {
+            crate::image::ContextPathTagging::Include
+        };
         let build_result = crate::image::resolve_image(
             &devcontainer,
             &docker_host,
             &repo_path,
             &crate::image::BuildFlags::default(),
+            path_tagging,
             make_build_output(&build_tx),
             docker_socket.as_deref(),
             ssh_auth_sock.as_deref(),
@@ -2882,6 +2894,7 @@ impl DaemonServer {
             claude_cli_path.as_deref(),
             codex_cli_path.as_deref(),
             pi_cli_path.as_deref(),
+            grok_cli_path.as_deref(),
             docker_socket.as_deref(),
             inject_system_prompt,
             description_file.as_deref(),
@@ -3391,6 +3404,13 @@ impl DaemonServer {
                 .context("downloading codex state from source")?
             {
                 agent_buffers.push(("codex", buf));
+            }
+        }
+        if state.has_grok_state {
+            if let Some(buf) = snapshot_agent_files(&source_pod, "grok")
+                .context("downloading grok state from source")?
+            {
+                agent_buffers.push(("grok", buf));
             }
         }
 
@@ -4478,7 +4498,7 @@ pub fn run_daemon() -> Result<()> {
     let llm_cache_proxy = std::env::var("RUMPELPOD_TEST_LLM_OFFLINE").ok().map(|_| {
         let cache_base_dir =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../llm-cache");
-        for subdir in ["claude-cli", "codex"] {
+        for subdir in ["claude-cli", "codex", "grok"] {
             let dir = cache_base_dir.join(subdir);
             std::fs::create_dir_all(dir.join("response")).expect("create llm-cache response dir");
             std::fs::create_dir_all(dir.join("request")).expect("create llm-cache request dir");

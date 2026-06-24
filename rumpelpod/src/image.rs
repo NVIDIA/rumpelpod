@@ -63,6 +63,20 @@ pub struct BuildFlags {
     pub force: bool,
 }
 
+/// Whether the build context's filesystem path participates in the
+/// image tag.
+pub enum ContextPathTagging {
+    /// Fold the context path into the tag.  Two byte-identical contexts
+    /// at different paths then get distinct tags and distinct images
+    /// instead of colliding on one cached image.  This is the normal
+    /// case: real devcontainer contexts live at the stable repo root.
+    Include,
+    /// Leave the context path out of the tag.  The built-in default
+    /// image is staged into a throwaway tempdir whose path changes on
+    /// every invocation, so including it would never let the cache hit.
+    Ignore,
+}
+
 /// Whether the build targets a local Docker daemon or a remote registry.
 pub(crate) enum BuildxMode<'a> {
     /// `--load` into a local (or SSH-forwarded) Docker daemon.
@@ -121,11 +135,13 @@ impl<'a> BuildxMode<'a> {
 ///
 /// The DevContainer's build paths must already be resolved to repo-root-relative
 /// paths (via `resolve_build_paths`) before calling this.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_image(
     devcontainer: &DevContainer,
     docker_host: &Host,
     repo_root: &Path,
     flags: &BuildFlags,
+    path_tagging: ContextPathTagging,
     on_output: Option<BuildOutputFn>,
     docker_socket: Option<&Path>,
     ssh_auth_sock: Option<&Path>,
@@ -164,7 +180,7 @@ pub fn resolve_image(
         .expect("resolved build must have context");
     let context_path = repo_root.join(context);
 
-    let image_name = compute_image_tag(build, &dockerfile_path, &context_path)?;
+    let image_name = compute_image_tag(build, &dockerfile_path, &context_path, path_tagging)?;
     let mode = BuildxMode::from_host(docker_host, docker_socket);
 
     if !flags.force {
@@ -524,15 +540,18 @@ pub(crate) fn image_exists(
 
 /// Compute a deterministic image tag based on the build configuration.
 ///
-/// The `context_path` name and location deliberately do not
-/// participate in the hash: two identical contexts living at
-/// different absolute paths (e.g. the temp dir behind the default
-/// Dockerfile, which moves on every invocation) must produce the
-/// same tag so the cached image is reused.
+/// `path_tagging` decides whether the `context_path` location feeds the
+/// hash.  For the built-in default image (`Ignore`) it must not: that
+/// context is a tempdir that moves on every invocation, so hashing it
+/// would defeat the cache.  For real contexts (`Include`) it does, so
+/// two byte-identical contexts at different paths resolve to distinct
+/// images rather than sharing one cached image -- the only part of the
+/// hash distinguishing them, since `hash_context_dir` skips `.git`.
 fn compute_image_tag(
     build: &BuildOptions,
     dockerfile_path: &Path,
     context_path: &Path,
+    path_tagging: ContextPathTagging,
 ) -> Result<String> {
     let mut f = File::open(dockerfile_path)?;
     let mut content = Vec::new();
@@ -540,6 +559,12 @@ fn compute_image_tag(
 
     let mut hasher = Sha256::new();
     hasher.update(&content);
+    match path_tagging {
+        ContextPathTagging::Include => {
+            hasher.update(context_path.as_os_str().as_encoded_bytes());
+        }
+        ContextPathTagging::Ignore => {}
+    }
     hash_context_dir(&mut hasher, context_path)
         .with_context(|| format!("hashing build context at {}", context_path.display()))?;
 

@@ -22,7 +22,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 
 /// Shared state for the LLM cache proxy routes on the git HTTP server.
 #[derive(Clone)]
@@ -71,6 +70,19 @@ fn provider_config(provider: &str) -> Option<(ProviderConfig, AuthStyle)> {
                 cache_subdir: "codex",
                 upstream_base: "https://api.openai.com",
                 api_key_env: "OPENAI_API_KEY",
+                // `model` is intentionally excluded: Codex picks the
+                // default model from its own version, so keying on it
+                // would invalidate the cache on every Codex upgrade.
+                cache_fields: &["messages", "input", "stream"],
+            },
+            AuthStyle::BearerToken,
+        )),
+        // xAI's API is OpenAI-compatible (chat completions, Bearer auth).
+        "xai" => Some((
+            ProviderConfig {
+                cache_subdir: "grok",
+                upstream_base: "https://api.x.ai",
+                api_key_env: "XAI_API_KEY",
                 cache_fields: &["model", "messages", "input", "stream"],
             },
             AuthStyle::BearerToken,
@@ -87,6 +99,11 @@ static API_FORWARD_LOCK: Mutex<()> = Mutex::new(());
 // Cache key computation
 // ---------------------------------------------------------------------------
 
+/// Reduce Codex's `input` array to the turns that actually determine
+/// the answer: genuine user messages, minus the `<environment_context>`
+/// block Codex injects as a user turn.  That block carries the cwd,
+/// workspace root path, timezone, and date, all of which vary by machine
+/// and by day and would otherwise make the cache non-portable.
 fn strip_openai_non_user_input(value: &mut serde_json::Value) {
     let Some(input) = value
         .get_mut("input")
@@ -95,7 +112,38 @@ fn strip_openai_non_user_input(value: &mut serde_json::Value) {
         return;
     };
 
-    input.retain(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"));
+    input.retain(|item| {
+        item.get("role").and_then(serde_json::Value::as_str) == Some("user")
+            && !is_environment_context(item)
+    });
+}
+
+/// True when a Codex input item is the injected `<environment_context>`
+/// turn, identified by a text part that opens with that tag.
+fn is_environment_context(item: &serde_json::Value) -> bool {
+    let Some(content) = item.get("content").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    content.iter().any(|part| {
+        part.get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.trim_start().starts_with("<environment_context>"))
+    })
+}
+
+/// Drop everything but the user turns from a chat-completions `messages`
+/// array.  grok injects a volatile system prompt (working directory,
+/// date, available tools) that would otherwise make the cache key unique
+/// per run; keying on the user turns alone keeps it stable.
+fn strip_non_user_messages(value: &mut serde_json::Value) {
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    messages.retain(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"));
 }
 
 /// Extract only the fields that determine API response semantics.
@@ -116,6 +164,9 @@ fn extract_cache_fields(provider: &str, body: &[u8], fields: &[&str]) -> Vec<u8>
     let mut key_value = serde_json::Value::Object(key_fields);
     if provider == "openai" {
         strip_openai_non_user_input(&mut key_value);
+    }
+    if provider == "xai" {
+        strip_non_user_messages(&mut key_value);
     }
 
     serde_json::to_vec(&key_value).unwrap_or_else(|_| body.to_vec())
@@ -292,33 +343,6 @@ fn should_forward_response_header(name: &str, status: u16) -> bool {
     true
 }
 
-fn build_openai_upgrade_probe_response(websocket_key: Option<&str>) -> Option<Response> {
-    let key = derive_accept_key(websocket_key?.as_bytes());
-    Response::builder()
-        .status(StatusCode::SWITCHING_PROTOCOLS)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-accept", key)
-        .body(Body::empty())
-        .ok()
-}
-
-fn legacy_openai_response_key(body: &[u8]) -> Option<&'static str> {
-    let body = String::from_utf8_lossy(body);
-    if body.contains("What is the capital of France? Reply with just the city name, nothing else.")
-    {
-        return Some("f02af3fa303a95d222b21bdc14f017b04a78995019a6d5cfc32de06b61c0867b");
-    }
-    if body.contains("What git remote has other pods? One word only.") {
-        return Some("7a67e0bc72e5a93f2cdec482e0fceeed1ec6f03307eb611712e6b0d07bda3bff");
-    }
-    if body.contains("In which file should you put the merge commit message? One word only.") {
-        return Some("48e6e4c74314273513876206d86499609a78f424efbe402a0a201434992e49c5");
-    }
-
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Axum handler (runs on the git HTTP server, host side)
 // ---------------------------------------------------------------------------
@@ -364,11 +388,6 @@ pub async fn handle_llm_cache_proxy(
     // Collect headers for forwarding (skip hop-by-hop, host, auth,
     // and provider-specific auth headers the proxy will replace).
     let is_upgrade = is_websocket_upgrade(req.headers());
-    let websocket_key = req
-        .headers()
-        .get("sec-websocket-key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -395,29 +414,10 @@ pub async fn handle_llm_cache_proxy(
 
     eprintln!("llm-cache-proxy[{provider}]: {method} {path_and_query} -> key {cache_key}");
 
-    if provider == "openai" && path_and_query == "/v1/responses" && is_upgrade {
-        if let Some(response) = build_openai_upgrade_probe_response(websocket_key.as_deref()) {
-            eprintln!("llm-cache-proxy[{provider}]: synthesized websocket upgrade probe");
-            return response;
-        }
-    }
-
     // Lock-free cache lookup (files are immutable once written)
     if let Some((meta, body)) = cache_get(&cache_dir, &cache_key) {
         eprintln!("llm-cache-proxy[{provider}]: cache hit {method} {path_and_query}");
         return build_response(&meta, body);
-    }
-
-    if provider == "openai" && method == "POST" && path_and_query == "/v1/responses" {
-        if let Some(legacy_key) = legacy_openai_response_key(&body_bytes) {
-            if let Some((meta, body)) = cache_get(&cache_dir, legacy_key) {
-                cache_put(&cache_dir, &cache_key, &meta, &body, &body_bytes);
-                eprintln!(
-                    "llm-cache-proxy[{provider}]: legacy cache alias {legacy_key} -> {cache_key}"
-                );
-                return build_response(&meta, body);
-            }
-        }
     }
 
     if is_offline_mode() {

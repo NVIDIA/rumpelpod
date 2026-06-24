@@ -1,9 +1,13 @@
-Revert pi test Node install cache
+Add support for the pi coding agent
+
+Expose `rumpel pi` as a first-class pod agent, including CLI forwarding,
+prepared-image installation, system-prompt injection, and state transfer.
 
 Docker already deduplicates concurrent builds of the same Dockerfile, so
 the extra cache layer around the pi test Node install is unnecessary.
-The recreate test now checks removed temporary files through a
-successful absence assertion, avoiding a timeout-prone failing
-interactive exec.
+
+The recreate test checks removed temporary files through a successful
+absence assertion, avoiding a timeout-prone failing interactive exec.
+
 The pi tests wait for the actual TUI readiness text before sending
 prompts, so Docker build output cannot satisfy the readiness check.

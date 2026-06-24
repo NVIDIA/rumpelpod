@@ -228,6 +228,9 @@ pub struct JsonConfig {
     pub pi: PiConfig,
 
     #[serde(default)]
+    pub grok: GrokConfig,
+
+    #[serde(default)]
     pub merge: MergeConfig,
 
     /// Inject a system prompt describing the rumpelpod environment
@@ -350,6 +353,25 @@ impl Default for PiConfig {
     fn default() -> Self {
         Self {
             trust_workspace: true,
+        }
+    }
+}
+
+/// Configuration for `rumpel grok`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GrokConfig {
+    /// Pass --always-approve to the grok CLI so it auto-approves tool
+    /// executions.  The pod provides the sandbox so grok does not need
+    /// its own approval prompts.  Defaults to true.
+    #[serde(default = "default_true")]
+    pub always_approve: bool,
+}
+
+impl Default for GrokConfig {
+    fn default() -> Self {
+        Self {
+            always_approve: true,
         }
     }
 }

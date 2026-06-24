@@ -211,6 +211,9 @@ pub struct PodLaunchParams {
     /// Absolute path to the pi CLI binary on the local machine,
     /// resolved by the client for the same reason as `claude_cli_path`.
     pub pi_cli_path: Option<PathBuf>,
+    /// Absolute path to the Grok CLI binary on the local machine,
+    /// resolved by the client for the same reason as `claude_cli_path`.
+    pub grok_cli_path: Option<PathBuf>,
     /// Write /etc/claude-code/CLAUDE.md with a rumpelpod environment description
     /// into the prepared image.
     pub inject_system_prompt: bool,

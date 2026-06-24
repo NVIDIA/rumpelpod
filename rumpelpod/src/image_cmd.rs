@@ -41,6 +41,10 @@ pub fn build(cmd: &ImageBuildCommand) -> Result<()> {
         &docker_host,
         &repo_root,
         &flags,
+        // `rumpel image build` only runs for explicit `build`
+        // devcontainers (checked above), never the default image, so
+        // the context path always belongs in the tag.
+        image::ContextPathTagging::Include,
         on_output,
         None,
         None,

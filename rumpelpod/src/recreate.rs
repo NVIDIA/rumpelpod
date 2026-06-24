@@ -11,7 +11,7 @@ use crate::daemon;
 use crate::daemon::protocol::{Daemon, DaemonClient, LaunchProgress, PodLaunchParams, PodName};
 use crate::enter::{
     collect_local_env, determine_host, find_local_claude_cli, find_local_codex_cli,
-    find_local_pi_cli,
+    find_local_grok_cli, find_local_pi_cli,
 };
 use crate::git::{get_current_branch, get_git_user_config, get_repo_root};
 use crate::image::OutputLine;
@@ -35,6 +35,7 @@ pub fn recreate(cmd: &RecreateCommand) -> Result<()> {
     let claude_cli_path = find_local_claude_cli();
     let codex_cli_path = find_local_codex_cli();
     let pi_cli_path = find_local_pi_cli();
+    let grok_cli_path = find_local_grok_cli();
     let json_config = load_json_config(&repo_root)?;
 
     let description_file = json_config
@@ -53,6 +54,7 @@ pub fn recreate(cmd: &RecreateCommand) -> Result<()> {
         codex_cli_path,
         pi_cli_path,
         inject_system_prompt: json_config.inject_system_prompt,
+        grok_cli_path,
         description_file,
         local_env_vars,
         ssh_auth_sock,

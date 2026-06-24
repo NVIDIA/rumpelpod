@@ -22,6 +22,7 @@ mod fork;
 pub mod gateway;
 mod git;
 mod git_http_server;
+mod grok;
 mod hook;
 mod hub;
 pub(crate) mod image;
@@ -204,6 +205,9 @@ pub fn run() -> Result<()> {
         }
         Command::Pi(ref cmd) => {
             pi::pi(cmd)?;
+        }
+        Command::Grok(ref cmd) => {
+            grok::grok(cmd)?;
         }
         Command::SshAdd(ref cmd) => {
             ssh::ssh_add(cmd)?;

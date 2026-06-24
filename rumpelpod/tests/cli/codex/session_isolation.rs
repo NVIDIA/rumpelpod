@@ -17,14 +17,14 @@ fn codex_pty_session_is_scoped_by_repo_and_pod() {
 
     let marker = "repo-one-unsubmitted-codex-marker";
 
-    let mut first = CodexSession::spawn(&repo_one, &daemon, home.path(), &["-m", "o3"]);
+    let mut first = CodexSession::spawn(&repo_one, &daemon, home.path(), &[]);
     first.dismiss_dialogs();
     first.write_raw(marker.as_bytes());
     first.wait_for(marker);
     first.write_raw(&[CTRL_A, b'd']);
     first.wait_for_exit();
 
-    let mut second = CodexSession::spawn(&repo_two, &daemon, home.path(), &["-m", "o3"]);
+    let mut second = CodexSession::spawn(&repo_two, &daemon, home.path(), &[]);
     let contents = second.wait_for("\u{203a}");
 
     assert!(

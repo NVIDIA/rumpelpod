@@ -29,6 +29,8 @@ mod executor;
 mod fork;
 #[path = "cli/gateway/mod.rs"]
 mod gateway;
+#[path = "cli/grok/mod.rs"]
+mod grok;
 #[path = "cli/k8s/mod.rs"]
 mod k8s;
 #[path = "cli/list.rs"]

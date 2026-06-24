@@ -264,6 +264,22 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Pi(PiCommand),
 
+    /// Launch the xAI Grok CLI inside a persistent session in a pod.
+    ///
+    /// On first run, copies your local Grok credentials (~/.grok) and
+    /// forwards XAI_API_KEY into the container.  Then attaches to or
+    /// creates a persistent PTY session running the grok TUI.
+    ///
+    /// Detach with Ctrl-a d to leave grok running in the background.
+    /// Re-run the same command to reattach.  If grok exits, the session
+    /// ends and the next invocation creates a fresh one.
+    ///
+    /// Examples:
+    ///   rumpel grok dev                      # Launch grok in 'dev' pod
+    ///   rumpel grok dev -- --model grok-4    # Pass args to grok CLI
+    #[command(verbatim_doc_comment)]
+    Grok(GrokCommand),
+
     /// Run ssh-add against a pod's ssh-agent.
     ///
     /// An ssh-agent runs on your local machine for each pod. The agent
@@ -676,6 +692,28 @@ pub struct PiCommand {
 }
 
 #[derive(Args)]
+pub struct GrokCommand {
+    /// Name for this pod instance (e.g., 'dev', 'test')
+    #[arg(value_parser = validate_pod_name, add = PodNameCompleter::candidates())]
+    pub name: String,
+
+    #[command(flatten)]
+    pub host_args: HostArgs,
+
+    /// Create the pod without prompting if it doesn't exist
+    #[arg(long)]
+    pub create: bool,
+
+    /// Disable --always-approve (which is on by default)
+    #[arg(long)]
+    pub no_always_approve: bool,
+
+    /// Arguments forwarded to the `grok` CLI
+    #[arg(last = true, value_name = "ARGS")]
+    pub args: Vec<String>,
+}
+
+#[derive(Args)]
 pub struct CpCommand {
     #[command(flatten)]
     pub host_args: HostArgs,
@@ -718,6 +756,10 @@ pub struct PrepareImageCommand {
     /// Install the Codex CLI into the prepared image
     #[arg(long)]
     pub install_codex: bool,
+
+    /// Install the Grok CLI into the prepared image
+    #[arg(long)]
+    pub install_grok: bool,
 
     /// Host git remote to configure (NAME=URL, repeatable)
     #[arg(long = "remote")]

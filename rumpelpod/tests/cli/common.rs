@@ -267,6 +267,14 @@ impl TestDaemon {
         Self::start_inner(home)
     }
 
+    /// Start a daemon whose `$PATH` additionally includes the host
+    /// `grok` binary, so the prepared-image build detects it and bakes
+    /// the Grok CLI into the pod image.  See `start_with_local_llm_clis`.
+    pub fn start_with_local_grok(home: &TestHome) -> Self {
+        home.link_local_bins(&["grok"]);
+        Self::start_inner(home)
+    }
+
     fn start_inner(home: &TestHome) -> Self {
         let home_path = home.path();
         let socket_path = home_path.join("rumpelpod.sock");

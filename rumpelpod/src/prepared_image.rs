@@ -116,6 +116,37 @@ fn container_has_pi() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Whether the Grok CLI on the local machine works.  Mirrors
+/// `local_has_codex`: None means the client could not find grok, so we
+/// should not pre-install it into the prepared image.
+fn local_has_grok(grok_cli_path: Option<&Path>) -> bool {
+    let bin = match grok_cli_path {
+        Some(path) => path,
+        None => return false,
+    };
+    Command::new(bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Whether a Grok CLI is already available inside the build container.
+fn container_has_grok() -> bool {
+    let bin_path = Path::new(crate::daemon::GROK_CONTAINER_BIN);
+    if bin_path.exists() {
+        return true;
+    }
+
+    Command::new("grok")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Build-time version string that changes whenever the source or git
 /// state changes.  Used instead of hashing the (potentially huge)
 /// binary at runtime.
@@ -230,6 +261,7 @@ fn compute_prepared_tag(
     claude_info: Option<&LocalClaudeInfo>,
     pi_info: Option<&LocalPiInfo>,
     install_codex: bool,
+    install_grok: bool,
     host_remotes: &[GitRemote],
     mount_targets: &[String],
     inject_system_prompt: bool,
@@ -249,6 +281,7 @@ fn compute_prepared_tag(
         hasher.update(info.version.as_bytes());
     }
     hasher.update([u8::from(install_codex)]);
+    hasher.update([u8::from(install_grok)]);
     for remote in host_remotes {
         if MANAGED_REMOTES.contains(&remote.name.as_str()) {
             continue;
@@ -298,6 +331,7 @@ fn generate_dockerfile(
     claude_info: Option<&LocalClaudeInfo>,
     pi_info: Option<&LocalPiInfo>,
     install_codex: bool,
+    install_grok: bool,
     host_remotes: &[GitRemote],
     mount_targets: &[String],
     inject_system_prompt: bool,
@@ -318,6 +352,12 @@ fn generate_dockerfile(
 
     let codex_flag = if install_codex {
         " \\\n      --install-codex"
+    } else {
+        ""
+    };
+
+    let grok_flag = if install_grok {
+        " \\\n      --install-grok"
     } else {
         ""
     };
@@ -348,7 +388,7 @@ fn generate_dockerfile(
     // concatenating them keeps the generated RUN line one-flag-per-line.
     // Assembling them here keeps the template below readable.
     let prepare_image_flags = format!(
-        "{claude_flag}{pi_flag}{codex_flag}{remote_flags}\
+        "{claude_flag}{pi_flag}{codex_flag}{grok_flag}{remote_flags}\
          {mount_target_flags}{system_prompt_flag}{description_flag}"
     );
 
@@ -391,6 +431,7 @@ fn assemble_build_context(
     claude_info: Option<&LocalClaudeInfo>,
     pi_info: Option<&LocalPiInfo>,
     install_codex: bool,
+    install_grok: bool,
     host_remotes: &[GitRemote],
     mount_targets: &[String],
     inject_system_prompt: bool,
@@ -405,6 +446,7 @@ fn assemble_build_context(
         claude_info,
         pi_info,
         install_codex,
+        install_grok,
         host_remotes,
         mount_targets,
         inject_system_prompt,
@@ -518,6 +560,7 @@ pub fn build_prepared_image(
     claude_cli_path: Option<&Path>,
     codex_cli_path: Option<&Path>,
     pi_cli_path: Option<&Path>,
+    grok_cli_path: Option<&Path>,
     docker_socket: Option<&Path>,
     inject_system_prompt: bool,
     description_file: Option<&str>,
@@ -530,6 +573,7 @@ pub fn build_prepared_image(
     let claude_info = detect_local_claude(claude_cli_path);
     let pi_info = detect_local_pi(pi_cli_path);
     let install_codex = local_has_codex(codex_cli_path);
+    let install_grok = local_has_grok(grok_cli_path);
 
     let mode = BuildxMode::from_host(docker_host, docker_socket);
 
@@ -570,6 +614,7 @@ pub fn build_prepared_image(
         claude_info.as_ref(),
         pi_info.as_ref(),
         install_codex,
+        install_grok,
         host_remotes,
         mount_targets,
         inject_system_prompt,
@@ -612,6 +657,7 @@ pub fn build_prepared_image(
         claude_info.as_ref(),
         pi_info.as_ref(),
         install_codex,
+        install_grok,
         host_remotes,
         mount_targets,
         inject_system_prompt,
@@ -738,10 +784,14 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
         install_codex_cli()?;
     }
 
+    if cmd.install_grok {
+        install_grok_cli()?;
+    }
+
     if cmd.inject_system_prompt {
         write_system_prompt(cmd.description_file.as_deref())?;
         if container_has_codex() {
-            write_codex_system_prompt(cmd.description_file.as_deref())?;
+            write_codex_system_prompt(&cmd.user, cmd.description_file.as_deref())?;
         }
         if container_has_pi() {
             write_pi_system_prompt(&cmd.user, cmd.description_file.as_deref())?;
@@ -838,24 +888,52 @@ fn write_system_prompt(description_file: Option<&str>) -> Result<()> {
         .context("writing /etc/claude-code/CLAUDE.md")
 }
 
-/// Append the rumpelpod system prompt to /AGENTS.md so Codex understands the
-/// container layout and git remote conventions.  Appends rather than
-/// overwrites so a base image's existing AGENTS.md is preserved.
-fn write_codex_system_prompt(description_file: Option<&str>) -> Result<()> {
-    let path = Path::new("/AGENTS.md");
+/// Append the rumpelpod system prompt to the container user's
+/// `~/.codex/AGENTS.md`.  Codex loads this global instructions file for
+/// every session regardless of cwd; a repo-tree AGENTS.md would only be
+/// read inside the project root, and a filesystem-root `/AGENTS.md` is
+/// above the project root and never read.  Appends rather than
+/// overwrites so a base image's existing file is preserved.
+fn write_codex_system_prompt(user: &str, description_file: Option<&str>) -> Result<()> {
+    let pw = nix::unistd::User::from_name(user)
+        .with_context(|| format!("looking up user '{user}'"))?
+        .with_context(|| format!("user '{user}' not found in /etc/passwd"))?;
+    let codex_dir = pw.dir.join(".codex");
+    fs::create_dir_all(&codex_dir).with_context(|| {
+        let d = codex_dir.display();
+        format!("creating {d}")
+    })?;
+    let path = codex_dir.join("AGENTS.md");
+
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
-        .context("opening /AGENTS.md for append")?;
+        .open(&path)
+        .with_context(|| {
+            let p = path.display();
+            format!("opening {p} for append")
+        })?;
     let prompt = system_prompt(description_file);
     // Separate from any existing content with a blank line.
     if path.metadata().is_ok_and(|m| m.len() > 0) {
         file.write_all(b"\n")
-            .context("writing separator to /AGENTS.md")?;
+            .context("writing AGENTS.md separator")?;
     }
     file.write_all(prompt.as_bytes())
-        .context("writing rumpelpod prompt to /AGENTS.md")
+        .context("writing rumpelpod prompt to AGENTS.md")?;
+    drop(file);
+
+    std::os::unix::fs::chown(&codex_dir, Some(pw.uid.as_raw()), Some(pw.gid.as_raw()))
+        .with_context(|| {
+            let d = codex_dir.display();
+            format!("chowning {d}")
+        })?;
+    std::os::unix::fs::chown(&path, Some(pw.uid.as_raw()), Some(pw.gid.as_raw())).with_context(
+        || {
+            let p = path.display();
+            format!("chowning {p}")
+        },
+    )
 }
 
 /// Write ~/.pi/agent/SYSTEM.md (the container user's home) so pi
@@ -1340,6 +1418,42 @@ fn install_node_standalone() -> Result<PathBuf> {
     }
 
     Ok(bin_dir)
+}
+
+/// Pinned Grok CLI version.  xAI serves a per-(version, platform) static
+/// binary, so pinning keeps prepared images reproducible instead of
+/// tracking whatever `stable` points at on a given day.
+const GROK_VERSION: &str = "0.2.60";
+
+/// Download and install the pinned Grok CLI binary matching the host
+/// architecture.
+///
+/// Skips if a `grok` binary is already present.  xAI publishes a single
+/// statically-linked binary per platform (no archive), so the download
+/// is written straight to the target path.
+fn install_grok_cli() -> Result<()> {
+    if container_has_grok() {
+        return Ok(());
+    }
+    let bin_path = Path::new(crate::daemon::GROK_CONTAINER_BIN);
+
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => return Err(anyhow::anyhow!("unsupported architecture '{other}'")),
+    };
+
+    let url = format!("https://x.ai/cli/grok-{GROK_VERSION}-linux-{arch}");
+    let data = download_cli_asset(&url, "Grok CLI binary")?;
+
+    if let Some(parent) = bin_path.parent() {
+        fs::create_dir_all(parent).context("creating /opt/rumpelpod/bin")?;
+    }
+    fs::write(bin_path, &data).context("writing grok binary")?;
+    fs::set_permissions(bin_path, fs::Permissions::from_mode(0o755))
+        .context("making grok binary executable")?;
+
+    Ok(())
 }
 
 /// Strip host-side hook lines that were baked into the image (e.g. via

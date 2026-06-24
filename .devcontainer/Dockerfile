@@ -197,6 +197,16 @@ RUN ARCH=$(uname -m) && \
     mv "/tmp/codex-$CODEX_ARCH" /usr/local/bin/codex && \
     chmod +x /usr/local/bin/codex
 
+# Install the xAI Grok CLI: a single statically-linked binary served
+# per (version, platform), pinned for reproducibility.
+RUN ARCH=$(uname -m) && \
+    case "$ARCH" in \
+        x86_64) GROK_ARCH="x86_64" ;; \
+        aarch64) GROK_ARCH="aarch64" ;; \
+    esac && \
+    curl -fsSL "https://x.ai/cli/grok-0.2.60-linux-$GROK_ARCH" -o /usr/local/bin/grok && \
+    chmod +x /usr/local/bin/grok
+
 RUN mkdir /workspaces && chown -R ${USER}:${USER} /workspaces
 USER ${USER}
 
