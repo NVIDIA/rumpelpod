@@ -48,23 +48,19 @@ fn recreate_preserves_dirty_files_but_resets_container() {
     assert_eq!(content.trim(), "dirty content");
 
     // 4. Verify /tmp/temp_file.txt is gone (container was reset)
-    let status = pod_command(&repo, &daemon)
+    pod_command(&repo, &daemon)
         .args([
             "enter",
             "--create",
             "test",
             "--",
             "test",
+            "!",
             "-f",
             "/tmp/temp_file.txt",
         ])
-        .status()
-        .expect("pod check failed");
-
-    assert!(
-        !status.success(),
-        "File in /tmp should have been removed after recreate"
-    );
+        .success()
+        .expect("File in /tmp should have been removed after recreate");
 }
 
 #[test]

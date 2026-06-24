@@ -2,3 +2,6 @@ Revert pi test Node install cache
 
 Docker already deduplicates concurrent builds of the same Dockerfile, so
 the extra cache layer around the pi test Node install is unnecessary.
+The recreate test now checks removed temporary files through a
+successful absence assertion, avoiding a timeout-prone failing
+interactive exec.
