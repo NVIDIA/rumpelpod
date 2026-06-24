@@ -2361,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "rumpelpod"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3061,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
