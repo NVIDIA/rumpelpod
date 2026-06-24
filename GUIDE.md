@@ -486,7 +486,7 @@ The `pi` object configures the `rumpel pi` command.
 { "injectSystemPrompt": false }
 ```
 
-Whether to write a rumpelpod-aware system prompt into each installed agent's prompt location (`/etc/claude-code/CLAUDE.md` for Claude, `/AGENTS.md` for codex, `~/.pi/agent/SYSTEM.md` for pi) so the agent knows about the devcontainer layout, git remotes, and the push-on-commit flow.
+Whether to write a rumpelpod-aware system prompt into each installed agent's prompt location (`/etc/claude-code/CLAUDE.md` for Claude, `~/.codex/AGENTS.md` for codex, `~/.pi/agent/SYSTEM.md` for pi) so the agent knows about the devcontainer layout, git remotes, and the push-on-commit flow.
 The description is identical for every agent, so this is a single pod-level switch rather than a per-agent one.
 Defaults to `true`.
 
