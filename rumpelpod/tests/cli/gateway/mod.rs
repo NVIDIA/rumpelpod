@@ -429,6 +429,8 @@ fn gateway_fresh_pod_establishes_ref() {
 
     let expected_ref = format!("refs/rumpelpod/{pod_name}@{pod_name}");
     wait_for_ref_commit(repo.path(), &expected_ref, &host_head);
+    let shortcut_ref = format!("refs/rumpelpod/{pod_name}");
+    wait_for_ref_commit(repo.path(), &shortcut_ref, &host_head);
 }
 
 #[test]
@@ -3342,6 +3344,15 @@ fn gateway_reconnect_push() {
         .success()
         .expect("initial enter failed");
 
+    let host_head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.path())
+        .success()
+        .expect("rev-parse HEAD on host failed");
+    let host_head = String::from_utf8_lossy(&host_head).trim().to_string();
+    let expected_ref = format!("refs/rumpelpod/{pod_name}@{pod_name}");
+    wait_for_ref_commit(repo.path(), &expected_ref, &host_head);
+
     // Find the container ID by the pod-name label rumpelpod sets at
     // creation time.  Robust against container-naming changes.
     let container_id = {
@@ -3354,7 +3365,11 @@ fn gateway_reconnect_push() {
             ])
             .success()
             .expect("docker ps failed");
-        String::from_utf8_lossy(&output).trim().to_string()
+        String::from_utf8_lossy(&output)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
     };
     assert!(
         !container_id.is_empty(),
@@ -3373,6 +3388,9 @@ fn gateway_reconnect_push() {
         .args([
             "exec",
             &container_id,
+            "env",
+            "GIT_HTTP_LOW_SPEED_LIMIT=1",
+            "GIT_HTTP_LOW_SPEED_TIME=10",
             "git",
             "-C",
             TEST_REPO_PATH,
@@ -3400,7 +3418,6 @@ fn gateway_reconnect_push() {
     let offline_commit = String::from_utf8_lossy(&rev_output).trim().to_string();
 
     // The host should NOT have this commit yet (daemon was down).
-    let expected_ref = format!("refs/rumpelpod/{pod_name}@{pod_name}");
     let host_commit_before = get_pod_ref_commit(repo.path(), &expected_ref);
     assert_ne!(
         host_commit_before.as_deref(),
@@ -3444,6 +3461,15 @@ fn gateway_daemon_restart_pushes_without_reenter() {
         .success()
         .expect("initial enter failed");
 
+    let host_head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo.path())
+        .success()
+        .expect("rev-parse HEAD on host failed");
+    let host_head = String::from_utf8_lossy(&host_head).trim().to_string();
+    let expected_ref = format!("refs/rumpelpod/{pod_name}@{pod_name}");
+    wait_for_ref_commit(repo.path(), &expected_ref, &host_head);
+
     // Find the container ID by the pod-name label (see
     // gateway_reconnect_push for why we prefer this over name).
     let container_id = {
@@ -3456,7 +3482,11 @@ fn gateway_daemon_restart_pushes_without_reenter() {
             ])
             .success()
             .expect("docker ps failed");
-        String::from_utf8_lossy(&output).trim().to_string()
+        String::from_utf8_lossy(&output)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
     };
     assert!(
         !container_id.is_empty(),
@@ -3471,6 +3501,9 @@ fn gateway_daemon_restart_pushes_without_reenter() {
         .args([
             "exec",
             &container_id,
+            "env",
+            "GIT_HTTP_LOW_SPEED_LIMIT=1",
+            "GIT_HTTP_LOW_SPEED_TIME=10",
             "git",
             "-C",
             TEST_REPO_PATH,
@@ -3498,7 +3531,6 @@ fn gateway_daemon_restart_pushes_without_reenter() {
     let offline_commit = String::from_utf8_lossy(&rev_output).trim().to_string();
 
     // The host should NOT have this commit yet.
-    let expected_ref = format!("refs/rumpelpod/{pod_name}@{pod_name}");
     let host_commit_before = get_pod_ref_commit(repo.path(), &expected_ref);
     assert_ne!(
         host_commit_before.as_deref(),

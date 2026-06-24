@@ -107,12 +107,14 @@ pub enum HostConnectionEvent {
 pub type HostConnectionEventTx = mpsc::UnboundedSender<HostConnectionEvent>;
 pub type HostConnectionEventRx = mpsc::UnboundedReceiver<HostConnectionEvent>;
 
-/// Daemon-wide registry of host connections, deduplicating by
-/// `HostKey`.  All connections share a single mpsc sender so the
-/// daemon's central reader can match host events to per-pod state.
+/// Daemon-wide registry of host connections, deduplicating live
+/// connections by `HostKey`.  The registry caches weak references so
+/// an idle host does not keep a background monitor alive forever.
+/// All connections share a single mpsc sender so the daemon's central
+/// reader can match host events to per-pod state.
 pub struct HostConnectionRegistry {
     events_tx: HostConnectionEventTx,
-    conns: Mutex<HashMap<HostKey, Arc<HostConnection>>>,
+    conns: Mutex<HashMap<HostKey, Weak<HostConnection>>>,
 }
 
 impl HostConnectionRegistry {
@@ -130,20 +132,25 @@ impl HostConnectionRegistry {
     pub fn get_or_create(&self, host: &Host) -> Result<Arc<HostConnection>> {
         let key = HostKey::from_host(host);
         let mut conns = self.conns.lock().unwrap();
-        if let Some(c) = conns.get(&key) {
-            return Ok(c.clone());
+        if let Some(conn) = conns.get(&key).and_then(Weak::upgrade) {
+            return Ok(conn);
         }
         let conn = Arc::new(HostConnection::new(host, self.events_tx.clone())?);
-        conns.insert(key, conn.clone());
+        conns.insert(key, Arc::downgrade(&conn));
         Ok(conn)
     }
 
-    /// Return the connection for `host` without creating one.  Used
-    /// by paths like `list_pods` that should not implicitly start
-    /// new remote connections.
+    /// Return a live connection for `host` without creating one.  Used
+    /// by paths like `list_pods` that should not implicitly start new
+    /// remote connections.
     pub fn get(&self, host: &Host) -> Option<Arc<HostConnection>> {
         let key = HostKey::from_host(host);
-        self.conns.lock().unwrap().get(&key).cloned()
+        let mut conns = self.conns.lock().unwrap();
+        let conn = conns.get(&key).and_then(Weak::upgrade);
+        if conn.is_none() {
+            conns.remove(&key);
+        }
+        conn
     }
 
     /// Remove the connection for `host` from the registry.  The
@@ -151,7 +158,11 @@ impl HostConnectionRegistry {
     /// are held; drop happens when the last reference goes away.
     /// Used by the central reader on `GaveUp` events.
     pub fn remove(&self, key: &HostKey) -> Option<Arc<HostConnection>> {
-        self.conns.lock().unwrap().remove(key)
+        self.conns
+            .lock()
+            .unwrap()
+            .remove(key)
+            .and_then(|c| c.upgrade())
     }
 }
 
@@ -711,5 +722,25 @@ mod ssh_tests {
         );
         assert_no_rumpelpod_ssh_policy(&args);
         assert!(!args.iter().any(|arg| arg == "-p"));
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn registry_does_not_keep_idle_connection_alive() {
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let registry = HostConnectionRegistry::new(events_tx);
+
+        let conn = registry.get_or_create(&Host::Localhost).unwrap();
+        let same = registry.get_or_create(&Host::Localhost).unwrap();
+        assert!(Arc::ptr_eq(&conn, &same));
+        drop(same);
+
+        assert!(registry.get(&Host::Localhost).is_some());
+        drop(conn);
+        assert!(registry.get(&Host::Localhost).is_none());
     }
 }

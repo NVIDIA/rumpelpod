@@ -90,13 +90,11 @@ pub struct PodServerState {
     pub codex_state: tokio::sync::watch::Sender<Option<super::types::CodexState>>,
     /// Whether the codex state monitor task has been spawned.
     pub codex_monitor_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Single-flights the recovery push triggered on /events connections.
+    /// Serializes recovery pushes triggered on /events connections.
     /// At launch the daemon's listener and a command's readiness probe
-    /// both connect and find the ref unpushed; without this they would
-    /// race two `git push`es on the gateway, one losing the ref lock and
-    /// logging an alarming (though harmless) error.  A one-permit
-    /// semaphore (vs an atomic flag) releases on drop, so a panicking
-    /// push cannot wedge the gate shut.
+    /// can both connect and find the ref unpushed; without this they
+    /// would race two `git push`es on the gateway, one losing the ref
+    /// lock and logging an alarming (though harmless) error.
     pub push_gate: std::sync::Arc<tokio::sync::Semaphore>,
     /// Fully resolved environment: base container env + probed shell env +
     /// resolved remoteEnv.  Used for lifecycle commands, Claude, and Codex.
@@ -627,12 +625,13 @@ fn sse_event(event_type: &str, data: &str) -> String {
 /// pod's current branch state.
 ///
 /// Successful pushes update `refs/remotes/rumpelpod/<branch>@<pod>`
-/// (the `rumpelpod` remote's fetch refspec maps them), and the
-/// reference-transaction hook keeps them current on every commit.  A
-/// hook-push that failed while the gateway was down leaves the
-/// remote-tracking ref behind the branch, which is exactly the
-/// condition this detects.  Reads only local refs; no network call.
+/// and, for the configured primary branch, `refs/remotes/rumpelpod/<pod>`
+/// (the `rumpelpod` remote's fetch refspec maps them).  A hook-push
+/// that failed while the gateway was down leaves a remote-tracking ref
+/// behind the branch, which is exactly the condition this detects.
+/// Reads only local refs; no network call.
 fn needs_push(repo_path: &Path, pod_name: &str) -> Result<bool> {
+    let primary = primary_branch(repo_path)?;
     let output = Command::new("git")
         .args([
             "for-each-ref",
@@ -649,26 +648,63 @@ fn needs_push(repo_path: &Path, pod_name: &str) -> Result<bool> {
     let listing = String::from_utf8(output.stdout).context("branch listing was not UTF-8")?;
     for line in listing.lines() {
         let Some((sha, branch)) = line.split_once(' ') else {
-            continue;
+            return Err(anyhow::anyhow!(
+                "git for-each-ref returned malformed line: {line}"
+            ));
         };
         let tracking = format!("refs/remotes/rumpelpod/{branch}@{pod_name}");
-        let tracked = Command::new("git")
-            .args(["rev-parse", "--verify", "--quiet", &tracking])
-            .current_dir(repo_path)
-            .output()
-            .context("resolving rumpelpod remote-tracking ref")?;
-        // Missing (never pushed) or a different tip means the gateway
-        // is behind this branch, so a push is owed.
-        if !tracked.status.success() {
+        if !ref_matches(repo_path, &tracking, sha)? {
             return Ok(true);
         }
-        let tracked_sha =
-            String::from_utf8(tracked.stdout).context("remote-tracking sha was not UTF-8")?;
-        if tracked_sha.trim() != sha {
-            return Ok(true);
+
+        if branch == primary {
+            let shortcut = format!("refs/remotes/rumpelpod/{pod_name}");
+            if !ref_matches(repo_path, &shortcut, sha)? {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
+}
+
+fn primary_branch(repo_path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["config", "--get", "rumpelpod.pod-name"])
+        .current_dir(repo_path)
+        .output()
+        .context("reading rumpelpod.pod-name")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "git config rumpelpod.pod-name failed: {stderr}"
+        ));
+    }
+    let primary = String::from_utf8(output.stdout).context("primary branch was not UTF-8")?;
+    let primary = primary.trim();
+    if primary.is_empty() {
+        return Err(anyhow::anyhow!("rumpelpod.pod-name is empty"));
+    }
+    Ok(primary.to_string())
+}
+
+fn ref_matches(repo_path: &Path, refname: &str, sha: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", refname])
+        .current_dir(repo_path)
+        .output()
+        .with_context(|| format!("resolving ref {refname}"))?;
+    match output.status.code() {
+        Some(0) => {
+            let tracked =
+                String::from_utf8(output.stdout).context("tracked ref sha was not UTF-8")?;
+            Ok(tracked.trim() == sha)
+        }
+        Some(1) => Ok(false),
+        Some(_) | None => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(anyhow::anyhow!("git rev-parse {refname} failed: {stderr}"))
+        }
+    }
 }
 
 /// Force-push pod branches to the gateway, but only when local refs
@@ -757,15 +793,21 @@ async fn events_handler(State(state): State<PodServerState>) -> Response {
         // background task, so the greeting below never waits on it.
         let repo_path = state_for_task.repo_path.lock().await.clone();
         if let Some(repo_path) = repo_path {
-            // Skip if a push is already in flight; the permit releases
-            // when the task finishes (or panics), reopening the gate.
-            if let Ok(permit) = state_for_task.push_gate.clone().try_acquire_owned() {
-                let pod_name = state_for_task.pod_name.clone();
-                tokio::task::spawn_blocking(move || {
+            let gate = state_for_task.push_gate.clone();
+            let pod_name = state_for_task.pod_name.clone();
+            tokio::spawn(async move {
+                let Ok(permit) = gate.acquire_owned().await else {
+                    return;
+                };
+                let result = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     recover_push(&repo_path, &pod_name);
-                });
-            }
+                })
+                .await;
+                if let Err(e) = result {
+                    eprintln!("events: recovery push task panicked: {e}");
+                }
+            });
         }
 
         // Send state greeting.
@@ -1665,6 +1707,72 @@ fn init_mounts_impl(reader: impl std::io::Read) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn git(repo_path: &Path, args: &[&str]) {
+        Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .success()
+            .unwrap_or_else(|e| panic!("git {args:?} failed: {e:#}"));
+    }
+
+    fn git_stdout(repo_path: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .success()
+            .unwrap_or_else(|e| panic!("git {args:?} failed: {e:#}"));
+        String::from_utf8(output).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn needs_push_detects_stale_primary_shortcut() {
+        let temp_dir = TempDir::with_prefix("rumpelpod-needs-push-").unwrap();
+        let repo_path = temp_dir.path();
+
+        git(repo_path, &["init", "--initial-branch=pod"]);
+        git(repo_path, &["config", "user.email", "test@example.com"]);
+        git(repo_path, &["config", "user.name", "Rumpelpod Test"]);
+        git(repo_path, &["config", "rumpelpod.pod-name", "pod"]);
+
+        std::fs::write(repo_path.join("file.txt"), "one\n").unwrap();
+        git(repo_path, &["add", "file.txt"]);
+        git(repo_path, &["commit", "-m", "initial"]);
+        let initial = git_stdout(repo_path, &["rev-parse", "HEAD"]);
+        git(
+            repo_path,
+            &["update-ref", "refs/remotes/rumpelpod/pod@pod", &initial],
+        );
+        assert!(needs_push(repo_path, "pod").unwrap());
+
+        git(
+            repo_path,
+            &["update-ref", "refs/remotes/rumpelpod/pod", &initial],
+        );
+        assert!(!needs_push(repo_path, "pod").unwrap());
+
+        std::fs::write(repo_path.join("file.txt"), "two\n").unwrap();
+        git(repo_path, &["commit", "-am", "second"]);
+        let second = git_stdout(repo_path, &["rev-parse", "HEAD"]);
+        git(
+            repo_path,
+            &["update-ref", "refs/remotes/rumpelpod/pod@pod", &second],
+        );
+
+        assert!(needs_push(repo_path, "pod").unwrap());
+
+        git(
+            repo_path,
+            &["update-ref", "refs/remotes/rumpelpod/pod", &second],
+        );
+        assert!(!needs_push(repo_path, "pod").unwrap());
+    }
 }
 
 // ---------------------------------------------------------------------------
