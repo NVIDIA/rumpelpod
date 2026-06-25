@@ -1,7 +1,7 @@
 # LLM Response Cache
 
 This directory contains cached LLM API responses used by integration tests for
-`rumpel claude` and `rumpel codex`.
+`rumpel claude`, `rumpel codex`, and `rumpel grok`.
 
 ## Purpose
 
@@ -17,7 +17,7 @@ the stored response is replayed, on miss the request is forwarded upstream and
 the response is stored.
 
 The cache key excludes the API key so cached responses work regardless of
-whether `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is set.
+whether `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `XAI_API_KEY` is set.
 
 ## Workflow for tests
 
@@ -25,6 +25,11 @@ whether `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` is set.
    Cache misses will hit the real API and store responses.
 2. **Check in cache files:** Commit new/modified files in `llm-cache/` to the repo.
 3. **Subsequent runs:** Tests use cached responses. No API key needed.
+
+Do not hand-edit, rename, or synthesize cache response files. If a response is
+wrong or its key changes, regenerate it by running the affected test with
+`RUMPELPOD_TEST_LLM_OFFLINE=0` and a live API key, then commit the cache files
+that the proxy writes.
 
 ## Detecting problems
 
@@ -43,6 +48,9 @@ llm-cache/
     response/     # Binary: metadata JSON + newline + body
     request/      # Pretty-printed request JSON (gitignored)
  codex/            # Cached responses from the Codex CLI proxy
+    response/
+    request/
+ grok/             # Cached responses from the Grok CLI proxy
     response/
     request/
 ```
