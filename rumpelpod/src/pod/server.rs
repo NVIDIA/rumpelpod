@@ -1222,6 +1222,7 @@ fn build_state_response(repo_path: &Path) -> Result<StateResponse> {
         .unwrap_or_else(|| PathBuf::from("/root"));
     let has_claude_state = home.join(".claude").exists() || home.join(".claude.json").exists();
     let has_codex_state = home.join(".codex").exists();
+    let has_pi_state = home.join(".pi").exists();
     let has_grok_state = home.join(".grok").exists();
 
     Ok(StateResponse {
@@ -1229,6 +1230,7 @@ fn build_state_response(repo_path: &Path) -> Result<StateResponse> {
         primary,
         has_claude_state,
         has_codex_state,
+        has_pi_state,
         has_grok_state,
         dirty,
     })

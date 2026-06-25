@@ -18,7 +18,7 @@ use crate::common::{write_test_devcontainer, TestDaemon, TestHome, TestRepo};
 use crate::executor::ExecutorResources;
 
 /// Pinned pi version for deterministic tests.
-const PI_VERSION: &str = "0.79.10";
+pub(super) const PI_VERSION: &str = "0.79.10";
 
 /// Write a devcontainer that installs Node.js and the pinned pi CLI.
 ///

@@ -492,7 +492,7 @@ pub fn has_pi_config_copied(conn: &Connection, id: PodId) -> Result<bool> {
             rusqlite::params![i64::from(id)],
             |row| row.get(0),
         )
-        .context("Failed to query pi_config_copied")?;
+        .context("failed to query pi_config_copied")?;
     Ok(copied)
 }
 
@@ -502,7 +502,7 @@ pub fn mark_pi_config_copied(conn: &Connection, id: PodId) -> Result<()> {
         "UPDATE pods SET pi_config_copied = 1 WHERE id = ?",
         rusqlite::params![i64::from(id)],
     )
-    .context("Failed to mark pi_config_copied")?;
+    .context("failed to mark pi_config_copied")?;
     Ok(())
 }
 

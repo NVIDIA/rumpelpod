@@ -9,6 +9,7 @@
 //! deterministic, offline-reproducible results.
 
 mod common;
+mod install;
 mod smoke;
 mod system_prompt;
 mod tool_use;

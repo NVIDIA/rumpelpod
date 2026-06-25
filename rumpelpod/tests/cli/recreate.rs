@@ -5,7 +5,10 @@
 
 use std::fs;
 
-use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
+use crate::common::{
+    ensure_pi_config_via_daemon, launch_pod_via_daemon, pod_command, write_host_pi_settings,
+    write_test_devcontainer, write_test_devcontainer_with_fake_pi, TestDaemon, TestHome, TestRepo,
+};
 use crate::executor::ExecutorResources;
 use rumpelpod::CommandExt;
 
@@ -89,6 +92,55 @@ fn recreate_preserves_untracked_files() {
         .args(["enter", "--create", "test", "--", "ls", "untracked.txt"])
         .success()
         .expect("untracked file should exist");
+}
+
+#[test]
+fn recreate_preserves_pi_state() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer_with_fake_pi(&repo);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    let launch = launch_pod_via_daemon(&repo, &daemon, "test");
+    write_host_pi_settings(&home, "host-before");
+    ensure_pi_config_via_daemon(&repo, &daemon, "test", &launch);
+
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            r#"mkdir -p "$HOME/.pi/agent" && printf '{"defaultProjectTrust":"always","source":"pod"}' > "$HOME/.pi/agent/settings.json""#,
+        ])
+        .success()
+        .expect("create pi state failed");
+
+    write_host_pi_settings(&home, "host-after");
+
+    pod_command(&repo, &daemon)
+        .args(["recreate", "test"])
+        .success()
+        .expect("pod recreate failed");
+
+    let launch = launch_pod_via_daemon(&repo, &daemon, "test");
+    ensure_pi_config_via_daemon(&repo, &daemon, "test", &launch);
+
+    let stdout = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "test",
+            "--",
+            "cat",
+            "/home/testuser/.pi/agent/settings.json",
+        ])
+        .success()
+        .expect("read recreated pi state failed");
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(stdout.contains(r#""source":"pod""#), "{stdout}");
 }
 
 #[test]

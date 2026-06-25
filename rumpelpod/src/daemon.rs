@@ -234,6 +234,34 @@ fn rewrite_upstream(
 /// flat list because recreate / fork iterate over it.
 pub(crate) const AGENT_NAMES: &[&str] = &["claude", "codex", "grok", "pi"];
 
+#[derive(Clone, Copy, Debug, Default)]
+struct CopiedAgentConfigs {
+    claude: bool,
+    pi: bool,
+}
+
+fn copied_agent_configs(conn: &Connection, pod_id: db::PodId) -> Result<CopiedAgentConfigs> {
+    Ok(CopiedAgentConfigs {
+        claude: db::has_claude_config_copied(conn, pod_id)?,
+        pi: db::has_pi_config_copied(conn, pod_id)?,
+    })
+}
+
+fn mark_restored_agent_configs(
+    conn: &Connection,
+    pod_id: db::PodId,
+    copied: CopiedAgentConfigs,
+    restored_agent_names: &[&'static str],
+) -> Result<()> {
+    if copied.claude && restored_agent_names.contains(&"claude") {
+        db::mark_claude_config_copied(conn, pod_id)?;
+    }
+    if copied.pi && restored_agent_names.contains(&"pi") {
+        db::mark_pi_config_copied(conn, pod_id)?;
+    }
+    Ok(())
+}
+
 /// Buffer the tar body from GET /agent-files/<agent> into memory.
 /// Returns None if the agent has no state to transfer.  Used by
 /// recreate (the old pod is deleted before the new one exists, so
@@ -3284,7 +3312,7 @@ impl DaemonServer {
     ///    hand it plus the source pod's image, raw devcontainer.json,
     ///    and container-env snapshot to `launch_pod_from_source`.
     /// 5. Stream agent files from source to new pod, apply the dirty
-    ///    patch, and inherit `claude_config_copied`.
+    ///    patch, and inherit copied-config flags for restored agents.
     fn fork_pod_impl(
         &self,
         request: ForkPodRequest,
@@ -3406,6 +3434,13 @@ impl DaemonServer {
                 agent_buffers.push(("codex", buf));
             }
         }
+        if state.has_pi_state {
+            if let Some(buf) = snapshot_agent_files(&source_pod, "pi")
+                .context("downloading pi state from source")?
+            {
+                agent_buffers.push(("pi", buf));
+            }
+        }
         if state.has_grok_state {
             if let Some(buf) = snapshot_agent_files(&source_pod, "grok")
                 .context("downloading grok state from source")?
@@ -3473,6 +3508,8 @@ impl DaemonServer {
             RetryPolicy::UserBlocking,
         )?;
 
+        let restored_agent_names: Vec<&'static str> =
+            agent_buffers.iter().map(|(agent, _)| *agent).collect();
         for (agent, buf) in agent_buffers {
             new_pod
                 .put_agent_files(agent, std::io::Cursor::new(buf), None)
@@ -3485,14 +3522,17 @@ impl DaemonServer {
                 .context("applying source's dirty patch to new pod")?;
         }
 
-        // Inherit claude_config_copied so the next `rumpel claude <new>`
-        // does not clobber the freshly-restored claude state by re-running
-        // copy_claude_config_via_pod.
         let conn = self.db.lock().unwrap();
-        if db::has_claude_config_copied(&conn, source_record.id)? {
+        let copied_configs = copied_agent_configs(&conn, source_record.id)?;
+        if !restored_agent_names.is_empty() {
             let new_record = db::get_pod(&conn, &repo_path, &new_name)?
                 .context("new pod row missing right after creation")?;
-            db::mark_claude_config_copied(&conn, new_record.id)?;
+            mark_restored_agent_configs(
+                &conn,
+                new_record.id,
+                copied_configs,
+                &restored_agent_names,
+            )?;
         }
 
         Ok(result)
@@ -3506,17 +3546,24 @@ impl DaemonServer {
         params: PodLaunchParams,
         build_tx: std::sync::mpsc::Sender<crate::image::OutputLine>,
     ) -> Result<LaunchResult> {
-        let pod_name = &params.pod_name;
-        let repo_path = &params.repo_path;
-        let docker_host = &params.host;
+        let pod_name = params.pod_name.clone();
+        let repo_path = params.repo_path.clone();
+        let docker_host = params.host.clone();
 
-        if let Host::Kubernetes { .. } = docker_host {
-            let pod_id = crate::executor::pod_id_for(pod_name, repo_path);
-            let executor = self.host_executor(docker_host)?;
+        if let Host::Kubernetes { .. } = &docker_host {
+            let pod_id = crate::executor::pod_id_for(&pod_name, &repo_path);
+            let executor = self.host_executor(&docker_host)?;
 
             // 1. Snapshot dirty files and per-agent state if the pod is running
             let mut patch: Option<Vec<u8>> = None;
             let mut agent_snapshots: Vec<(&'static str, Vec<u8>)> = Vec::new();
+            let copied_configs = {
+                let conn = self.db.lock().unwrap();
+                match db::get_pod(&conn, &repo_path, &pod_name.0)? {
+                    Some(record) => copied_agent_configs(&conn, record.id)?,
+                    None => CopiedAgentConfigs::default(),
+                }
+            };
 
             let status = executor.status(&pod_id)?;
             if status == PodStatus::Running {
@@ -3528,7 +3575,7 @@ impl DaemonServer {
                     .exec_proxies
                     .lock()
                     .unwrap()
-                    .get(&(repo_path.to_path_buf(), pod_name.0.clone()))
+                    .get(&(repo_path.clone(), pod_name.0.clone()))
                     .map(|h| h.port);
 
                 if let Some(port) = local_port {
@@ -3584,22 +3631,43 @@ impl DaemonServer {
                         .context("applying snapshot patch to new k8s pod")?;
                 }
 
+                let restored_agent_names: Vec<&'static str> =
+                    agent_snapshots.iter().map(|(agent, _)| *agent).collect();
                 for (agent, buf) in agent_snapshots {
                     new_pod
                         .put_agent_files(agent, std::io::Cursor::new(buf), None)
                         .with_context(|| format!("restoring {agent} state to new k8s pod"))?;
+                }
+
+                if !restored_agent_names.is_empty() {
+                    let conn = self.db.lock().unwrap();
+                    let new_record = db::get_pod(&conn, &repo_path, &pod_name.0)?
+                        .context("new k8s pod row missing right after recreate")?;
+                    mark_restored_agent_configs(
+                        &conn,
+                        new_record.id,
+                        copied_configs,
+                        &restored_agent_names,
+                    )?;
                 }
             }
 
             return Ok(launch_result);
         }
 
-        let executor = self.host_executor(docker_host)?;
-        let pod_id = crate::executor::pod_id_for(pod_name, repo_path);
+        let executor = self.host_executor(&docker_host)?;
+        let pod_id = crate::executor::pod_id_for(&pod_name, &repo_path);
 
         // 1. Snapshot dirty files and per-agent state if container exists
         let mut patch: Option<Vec<u8>> = None;
         let mut agent_snapshots: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        let copied_configs = {
+            let conn = self.db.lock().unwrap();
+            match db::get_pod(&conn, &repo_path, &pod_name.0)? {
+                Some(record) => copied_agent_configs(&conn, record.id)?,
+                None => CopiedAgentConfigs::default(),
+            }
+        };
 
         let status = executor.status(&pod_id)?;
         let exists = status != PodStatus::Gone;
@@ -3609,7 +3677,7 @@ impl DaemonServer {
                 // its server for snapshotting.
                 let old_token = {
                     let conn = self.db.lock().unwrap();
-                    db::get_pod(&conn, repo_path, &pod_name.0)
+                    db::get_pod(&conn, &repo_path, &pod_name.0)
                         .ok()
                         .flatten()
                         .map(|r| r.token)
@@ -3665,10 +3733,24 @@ impl DaemonServer {
                     .context("applying snapshot patch")?;
             }
 
+            let restored_agent_names: Vec<&'static str> =
+                agent_snapshots.iter().map(|(agent, _)| *agent).collect();
             for (agent, buf) in agent_snapshots {
                 new_pod
                     .put_agent_files(agent, std::io::Cursor::new(buf), None)
                     .with_context(|| format!("restoring {agent} state"))?;
+            }
+
+            if !restored_agent_names.is_empty() {
+                let conn = self.db.lock().unwrap();
+                let new_record = db::get_pod(&conn, &repo_path, &pod_name.0)?
+                    .context("new pod row missing right after recreate")?;
+                mark_restored_agent_configs(
+                    &conn,
+                    new_record.id,
+                    copied_configs,
+                    &restored_agent_names,
+                )?;
             }
         }
 

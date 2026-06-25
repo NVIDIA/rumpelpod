@@ -214,8 +214,8 @@ pub struct PodLaunchParams {
     /// Absolute path to the Grok CLI binary on the local machine,
     /// resolved by the client for the same reason as `claude_cli_path`.
     pub grok_cli_path: Option<PathBuf>,
-    /// Write /etc/claude-code/CLAUDE.md with a rumpelpod environment description
-    /// into the prepared image.
+    /// Write a rumpelpod environment description into each installed
+    /// agent's system-prompt location in the prepared image.
     pub inject_system_prompt: bool,
     /// Path of the description file for merge commit messages (None = disabled).
     /// Included in the system prompt so the agent knows where to write it.
@@ -856,7 +856,7 @@ impl Daemon for DaemonClient {
             .put(url)
             .json(&request)
             .send()
-            .map_err(|e| anyhow::anyhow!("Failed to send request: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to send request: {e}"))?;
 
         let _: serde_json::Value = read_sse_result(response, "configuring pi")?;
         Ok(())
@@ -1413,7 +1413,7 @@ async fn ensure_pi_config_handler<D: Daemon>(
     State(daemon): State<Arc<D>>,
     Json(request): Json<EnsurePiConfigRequest>,
 ) -> Response {
-    streaming_result_response("Configuring pi...".into(), move || {
+    streaming_result_response("configuring pi...".into(), move || {
         daemon.ensure_pi_config(request)?;
         Ok(serde_json::Value::Null)
     })

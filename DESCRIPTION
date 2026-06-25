@@ -1,7 +1,8 @@
 Add support for the pi coding agent
 
-Expose `rumpel pi` as a first-class pod agent, including CLI forwarding,
-prepared-image installation, system-prompt injection, and state transfer.
+Expose `rumpel pi` as a first-class pod agent, including CLI
+forwarding, prepared-image installation, system-prompt injection, and
+state transfer.
 
 Docker already deduplicates concurrent builds of the same Dockerfile, so
 the extra cache layer around the pi test Node install is unnecessary.

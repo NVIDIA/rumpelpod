@@ -6,11 +6,17 @@
 // Not all test files use all helpers, but we want them available.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use indoc::formatdoc;
-use rumpelpod::daemon::protocol::{Daemon, DaemonClient};
+use indoc::indoc;
+use rumpelpod::config::{load_json_config, Host};
+use rumpelpod::daemon::protocol::{
+    ContainerId, Daemon, DaemonClient, EnsurePiConfigRequest, LaunchProgress, LaunchResult,
+    PodLaunchParams, PodName,
+};
 use rumpelpod::CommandExt;
 use tempfile::TempDir;
 
@@ -534,6 +540,108 @@ pub fn pod_command(repo: &TestRepo, daemon: &TestDaemon) -> Command {
     }
 
     cmd
+}
+
+pub fn launch_pod_via_daemon(repo: &TestRepo, daemon: &TestDaemon, pod_name: &str) -> LaunchResult {
+    let client = DaemonClient::new_unix(&daemon.socket_path);
+    let pod_name = PodName::new(pod_name.to_string()).expect("valid pod name");
+    let mut progress = client
+        .launch_pod(PodLaunchParams {
+            pod_name,
+            repo_path: repo.path().to_path_buf(),
+            host_branch: current_branch(repo.path()),
+            host: resolve_test_host(repo.path()),
+            git_identity: None,
+            claude_cli_path: None,
+            codex_cli_path: None,
+            pi_cli_path: None,
+            grok_cli_path: None,
+            inject_system_prompt: load_json_config(repo.path())
+                .expect("load .rumpelpod.json")
+                .inject_system_prompt,
+            description_file: None,
+            local_env_vars: HashMap::new(),
+            ssh_auth_sock: None,
+        })
+        .expect("launch pod request failed");
+    for _line in &mut progress {}
+    progress.finish().expect("pod launch failed")
+}
+
+pub fn ensure_pi_config_via_daemon(
+    repo: &TestRepo,
+    daemon: &TestDaemon,
+    pod_name: &str,
+    launch: &LaunchResult,
+) {
+    let client = DaemonClient::new_unix(&daemon.socket_path);
+    let pod_name = PodName::new(pod_name.to_string()).expect("valid pod name");
+    client
+        .ensure_pi_config(EnsurePiConfigRequest {
+            pod_name,
+            repo_path: repo.path().to_path_buf(),
+            container_id: ContainerId(launch.container_id.0.clone()),
+            container_url: launch.container_url.clone(),
+            container_token: launch.container_token.clone(),
+            trust_workspace: true,
+        })
+        .expect("ensure pi config failed");
+}
+
+pub fn write_test_devcontainer_with_fake_pi(repo: &TestRepo) {
+    let extra_dockerfile = indoc! {r#"
+        RUN mkdir -p /opt/rumpelpod/bin
+        RUN printf '%s\n' '#!/bin/sh' 'printf "fake pi %s\n" "$*"' > /opt/rumpelpod/bin/pi
+        RUN chmod 755 /opt/rumpelpod/bin/pi
+    "#};
+    write_test_devcontainer(repo, extra_dockerfile, "");
+}
+
+pub fn write_host_pi_settings(home: &TestHome, source: &str) {
+    let agent_dir = home.path().join(".pi/agent");
+    std::fs::create_dir_all(&agent_dir).expect("create host .pi/agent");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        format!(r#"{{"defaultProjectTrust":"ask","source":"{source}"}}"#),
+    )
+    .expect("write host pi settings");
+}
+
+fn current_branch(repo_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(repo_path)
+        .output()
+        .expect("git branch --show-current failed");
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
+fn resolve_test_host(repo_path: &Path) -> Host {
+    let config = load_json_config(repo_path).expect("load .rumpelpod.json");
+    if let Some(host) = config.host {
+        return Host::parse(&host).expect("parse test host");
+    }
+    if let Some(kubernetes) = config.kubernetes {
+        return Host::Kubernetes {
+            context: kubernetes.context,
+            namespace: kubernetes
+                .namespace
+                .unwrap_or_else(|| "default".to_string()),
+            registry: kubernetes.registry,
+            node_selector: kubernetes.node_selector,
+            tolerations: kubernetes.tolerations,
+            builder: kubernetes.builder,
+        };
+    }
+    Host::Localhost
 }
 
 /// Write a standard test devcontainer.json with a Dockerfile build section.

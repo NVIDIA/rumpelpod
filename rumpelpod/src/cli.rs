@@ -772,7 +772,7 @@ pub struct PrepareImageCommand {
     #[arg(long = "mount-target")]
     pub mount_targets: Vec<String>,
 
-    /// Write /etc/claude-code/CLAUDE.md with a rumpelpod environment description
+    /// Write a rumpelpod environment description for installed agents
     #[arg(long)]
     pub inject_system_prompt: bool,
 
