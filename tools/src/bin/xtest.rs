@@ -53,7 +53,7 @@
 //!   --test-threads N   parallel test processes (env: XTEST_JOBS, default: ncpus)
 //!   --timeout SECS     per-test kill deadline  (env: XTEST_TIMEOUT, default: 120)
 //!   --retries N        retry count on failure  (env: XTEST_RETRIES, default: 1)
-//!   --executor NAME    run against a k8s cluster (eks|hetzner|k3d)
+//!   --executor NAME    run against podman or a k8s cluster (podman|eks|hetzner|k3d)
 //! ```
 
 use std::collections::HashSet;
@@ -84,9 +84,10 @@ const LINUX_TARGETS: &[(&str, &str)] = &[
     ("aarch64-unknown-linux-musl", "rumpel-linux-arm64"),
 ];
 
-/// Kubernetes clusters provisioned by our tooling.
+/// Alternate executors supported by the integration test harness.
 #[derive(ValueEnum, Clone)]
 enum Executor {
+    Podman,
     Eks,
     Hetzner,
     K3d,
@@ -132,6 +133,9 @@ struct Cli {
 impl Executor {
     fn cloud_dir(&self, repo_root: &Path) -> PathBuf {
         match self {
+            Executor::Podman => {
+                panic!("podman executor does not have a cloud directory")
+            }
             Executor::Eks => repo_root.join("cloud/eks"),
             Executor::Hetzner => repo_root.join("cloud/hetzner"),
             Executor::K3d => repo_root.join("cloud/k3d"),
@@ -145,6 +149,15 @@ impl Executor {
         env: &mut Vec<(String, String)>,
         runtime: Option<&str>,
     ) -> Result<ExecutorGuard> {
+        if matches!(self, Executor::Podman) {
+            if runtime.is_some() {
+                anyhow::bail!("--runtime requires a Kubernetes executor");
+            }
+            env.push(("RUMPELPOD_TEST_EXECUTOR".into(), "podman".into()));
+            eprintln!("Executor: podman");
+            return Ok(ExecutorGuard::default());
+        }
+
         let repo_root = tools::repo_root()?;
         let dir = self.cloud_dir(&repo_root);
         let dir = dir.canonicalize().with_context(|| {
@@ -185,6 +198,7 @@ impl Executor {
         }
 
         let guard = match self {
+            Executor::Podman => unreachable!("podman returned before k8s setup"),
             Executor::Eks => {
                 self.apply_eks(env)?;
                 ExecutorGuard::default()
@@ -998,6 +1012,10 @@ fn cleanup_containers() {
 /// configured locally (e.g. ambient k3d on a host without k3d
 /// installed) so callers can no-op silently.
 fn k8s_cluster_for_executor(executor: &Executor) -> Option<(PathBuf, String)> {
+    if matches!(executor, Executor::Podman) {
+        return None;
+    }
+
     // Mirror only the fields we actually need.  Avoiding the full
     // `rumpelpod::config::JsonConfig` keeps the tools crate from
     // depending on the rumpelpod lib.
@@ -1199,8 +1217,8 @@ fn run() -> Result<ExitCode> {
 
     let mut env_vars = Vec::new();
     let _guard = if let Some(ref executor) = cli.executor {
-        // Explicit --executor: set RUMPELPOD_EXECUTOR_CONFIG so all
-        // tests run against the specified cluster.
+        // Explicit --executor: redirect executor-agnostic tests to
+        // the requested backend.
         Some(executor.apply(&mut env_vars, cli.runtime.as_deref())?)
     } else {
         if cli.runtime.is_some() {

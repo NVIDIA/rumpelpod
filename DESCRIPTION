@@ -7,3 +7,7 @@ without a Docker buildx builder.
 
 Document the interface and add a Podman test harness mode for
 devcontainer smoke tests.
+
+Add default Podman smoke coverage and expose `cargo xtest --executor
+podman` as the full-suite Podman redirect. The Podman test harness can
+fall back to a sudo/vfs wrapper inside restricted devcontainers.

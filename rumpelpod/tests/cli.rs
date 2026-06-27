@@ -39,6 +39,8 @@ mod list;
 mod merge;
 #[path = "cli/network.rs"]
 mod network;
+#[path = "cli/podman.rs"]
+mod podman;
 #[path = "cli/prune.rs"]
 mod prune;
 #[path = "cli/recreate.rs"]

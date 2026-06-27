@@ -79,6 +79,11 @@ fn make_build_output(
 ) -> Option<crate::image::BuildOutputFn> {
     let tx = tx.clone();
     Some(Box::new(move |line: crate::image::OutputLine| {
+        let line = match line {
+            crate::image::OutputLine::Stdout(s) | crate::image::OutputLine::Stderr(s) => {
+                crate::image::OutputLine::Stderr(s)
+            }
+        };
         // Send failure means the client disconnected mid-build.
         // The caller notices when the progress iterator drains.
         if tx.send(line).is_err() {
