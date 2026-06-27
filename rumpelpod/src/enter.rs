@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use log::{info, trace};
 
 use crate::cli::EnterCommand;
-use crate::config::{load_json_config, Host};
+use crate::config::{load_json_config, ContainerEngine, Host};
 use crate::daemon;
 use crate::daemon::protocol::{
     Daemon, DaemonClient, LaunchProgress, LaunchResult, PodLaunchParams, PodName,
@@ -100,8 +100,8 @@ fn check_host_requirements(requirements: &HostRequirements, docker_host: &Host) 
     // here and use the parsed values to select an appropriate node or instance
     // type.
     match docker_host {
-        Host::Localhost | Host::Ssh { .. } => {
-            info!("Running on local/remote Docker, hostRequirements are advisory only");
+        Host::Localhost { .. } | Host::Ssh { .. } => {
+            info!("Running on local/remote container host, hostRequirements are advisory only");
         }
         Host::Kubernetes { .. } => {
             info!("Running on Kubernetes, hostRequirements set as pod resource requests");
@@ -115,8 +115,13 @@ pub fn determine_host(repo_root: &Path, host_override: Option<Host>) -> Result<H
         return Ok(h);
     }
     let json_config = load_json_config(repo_root)?;
+    let container_engine = json_config
+        .container_engine
+        .unwrap_or(ContainerEngine::Auto);
     if let Some(ref host_str) = json_config.host {
-        return Host::parse(host_str).context("invalid host in .rumpelpod.json");
+        return Host::parse(host_str)
+            .map(|host| host.with_container_engine(container_engine))
+            .context("invalid host in .rumpelpod.json");
     }
     if let Some(ref kubernetes) = json_config.kubernetes {
         return Ok(Host::Kubernetes {
@@ -129,9 +134,12 @@ pub fn determine_host(repo_root: &Path, host_override: Option<Host>) -> Result<H
             node_selector: kubernetes.node_selector.clone(),
             tolerations: kubernetes.tolerations.clone(),
             builder: kubernetes.builder.clone(),
+            image_builder: container_engine,
         });
     }
-    Ok(Host::Localhost)
+    Ok(Host::Localhost {
+        engine: container_engine,
+    })
 }
 
 /// Collect `${localEnv:VAR}` values from the local environment so the
@@ -347,14 +355,24 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
     // entered the test or user runtime environment.  SSH and
     // Kubernetes connect through their native client transports.
     let executor = match &result.host {
-        Host::Localhost => {
+        Host::Localhost {
+            engine: ContainerEngine::Docker,
+        } => {
             let socket = result
                 .docker_socket
                 .as_ref()
                 .context("docker_socket is required for localhost Docker")?;
-            crate::executor::Executor::docker(socket)?
+            crate::executor::Executor::docker(socket, ContainerEngine::Docker)?
         }
-        Host::Ssh { .. } => crate::executor::Executor::docker_host(&result.host)?,
+        Host::Localhost {
+            engine: ContainerEngine::Podman,
+        } => crate::executor::Executor::container_host(&result.host)?,
+        Host::Localhost {
+            engine: ContainerEngine::Auto,
+        } => {
+            panic!("container engine auto remained after launch")
+        }
+        Host::Ssh { .. } => crate::executor::Executor::container_host(&result.host)?,
         Host::Kubernetes {
             context, namespace, ..
         } => crate::executor::Executor::kubernetes(context, namespace)?,
@@ -366,7 +384,9 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
     // on k8s the emptyDir mounts come up owned by the container user so
     // arbitrary mkdir without --user root is ambiguous, and in practice
     // none of the k8s callers hit this path.
-    if matches!(result.host, Host::Localhost | Host::Ssh { .. }) && workdir != container_repo_path {
+    if matches!(result.host, Host::Localhost { .. } | Host::Ssh { .. })
+        && workdir != container_repo_path
+    {
         let mkdir_status = executor
             .exec_interactive(
                 &pod_id,

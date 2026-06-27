@@ -60,7 +60,7 @@ impl Drop for EnvVarGuard {
 fn has_k8s_executor() -> bool {
     match executor_mode() {
         ExecutorMode::K8s => true,
-        ExecutorMode::Docker => {
+        ExecutorMode::Docker | ExecutorMode::Podman => {
             if std::path::Path::new(K3D_DIR)
                 .join("rumpelpod.json")
                 .exists()
@@ -86,7 +86,7 @@ fn k8s_base_config() -> String {
     match executor_mode() {
         ExecutorMode::K8s => std::env::var("RUMPELPOD_EXECUTOR_CONFIG")
             .expect("RUMPELPOD_EXECUTOR_CONFIG must be set in K8s executor mode"),
-        ExecutorMode::Docker | ExecutorMode::Ssh => {
+        ExecutorMode::Docker | ExecutorMode::Podman | ExecutorMode::Ssh => {
             let path = std::path::Path::new(K3D_DIR).join("rumpelpod.json");
             std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
@@ -99,14 +99,14 @@ fn k8s_kubeconfig() -> PathBuf {
         ExecutorMode::K8s => PathBuf::from(
             std::env::var("KUBECONFIG").expect("KUBECONFIG must be set in K8s executor mode"),
         ),
-        ExecutorMode::Docker | ExecutorMode::Ssh => {
+        ExecutorMode::Docker | ExecutorMode::Podman | ExecutorMode::Ssh => {
             std::path::Path::new(K3D_DIR).join("kubeconfig")
         }
     }
 }
 
-/// Set up k8s executor resources for a test: copy kubeconfig, docker
-/// config, and buildx config to the test home, and create a sibling
+/// Set up k8s executor resources for a test: copy kubeconfig, registry
+/// auth, and buildx config to the test home, and create a sibling
 /// namespace owned by this test that is deleted on drop.
 fn k8s_executor(home: &TestHome) -> K8sExecutor {
     let base_config = k8s_base_config();
@@ -123,8 +123,8 @@ fn k8s_executor(home: &TestHome) -> K8sExecutor {
     // regardless of how its HOME is resolved.
     std::env::set_var("KUBECONFIG", &kubeconfig_file);
 
-    // The daemon runs with PATH=home/.local/bin, so it needs kubectl
-    // and docker symlinked before it starts.
+    // The daemon runs with PATH=home/.local/bin, so it needs its
+    // Kubernetes and image-builder CLIs symlinked before it starts.
     home.link_local_bins(&["docker", "kubectl"]);
     crate::executor::link_extra_path_bins(home);
     crate::executor::copy_test_docker_config(home);

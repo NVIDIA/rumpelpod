@@ -5,6 +5,7 @@
 //!
 //! The executor mode is determined by environment variables:
 //!   - (default):                     local Docker daemon
+//!   - RUMPELPOD_TEST_EXECUTOR=podman: local Podman store
 //!   - RUMPELPOD_TEST_EXECUTOR=ssh:   remote Docker via SSH
 //!   - RUMPELPOD_EXECUTOR_CONFIG set: Kubernetes cluster
 //!
@@ -46,6 +47,7 @@ pub const TEST_NAMESPACE_PREFIX: &str = "rumpelhub-test-";
 
 pub enum ExecutorMode {
     Docker,
+    Podman,
     Ssh,
     K8s,
 }
@@ -55,6 +57,7 @@ pub fn executor_mode() -> ExecutorMode {
         return ExecutorMode::K8s;
     }
     match std::env::var("RUMPELPOD_TEST_EXECUTOR").as_deref() {
+        Ok("podman") => ExecutorMode::Podman,
         Ok("ssh") => ExecutorMode::Ssh,
         _ => ExecutorMode::Docker,
     }
@@ -95,6 +98,7 @@ pub struct ExecutorResources {
 
 enum Resources {
     Docker,
+    Podman,
     Ssh { _remote: super::ssh::SshRemoteHost },
     K8s { namespace: K8sTestNamespace },
 }
@@ -110,6 +114,7 @@ impl ExecutorResources {
     pub fn setup(home: &TestHome) -> Self {
         match executor_mode() {
             ExecutorMode::Docker => Self::docker(home),
+            ExecutorMode::Podman => Self::podman(home),
             ExecutorMode::Ssh => Self::ssh(home),
             ExecutorMode::K8s => Self::k8s(home),
         }
@@ -120,6 +125,18 @@ impl ExecutorResources {
         ExecutorResources {
             json: "{}".to_string(),
             _resources: Resources::Docker,
+        }
+    }
+
+    fn podman(home: &TestHome) -> Self {
+        home.link_local_bin("podman");
+        let json = serde_json::to_string_pretty(&json!({
+            "containerEngine": "podman",
+        }))
+        .unwrap();
+        ExecutorResources {
+            json,
+            _resources: Resources::Podman,
         }
     }
 

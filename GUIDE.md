@@ -2,7 +2,7 @@
 
 Rumpelpod runs LLM agents in isolated devcontainers.
 Each pod is a container with its own checkout of the repository, synchronized back to your local machine via git.
-Pods can run on the local Docker daemon, on a remote machine over SSH, or as Kubernetes pods.
+Pods can run on the local Docker or Podman engine, on a remote Docker machine over SSH, or as Kubernetes pods.
 
 ## Table of contents
 
@@ -187,7 +187,7 @@ Rumpelpod ignores them with a warning when they appear.
   The remaining lifecycle commands run once per container start.
 - `userEnvProbe` is supported but behaves differently: the probe runs once when the pod is first created and the result is cached for the container's lifetime.
   Changes to shell init files do not take effect until the pod is recreated.
-- Bind mounts work fully only when Docker runs locally.
+- Bind mounts work fully only when containers run locally.
   On remote machines and Kubernetes, the source is copied into the pod once at creation and never synchronized back.
   Use `rumpel cp` to move files across the boundary manually.
 
@@ -196,7 +196,7 @@ Use bind mounts or environment variables to inject them (see [Secrets and creden
 
 ## Remote hosts and security
 
-Pods run on the local Docker daemon by default, but the recommended setup is a remote machine.
+Pods run on the local container engine by default, but the recommended setup is a remote machine.
 Running pods remotely provides physical separation between the development machine and the agent's environment.
 Agents continue running when you disconnect, so long-running tasks do not depend on a local session staying open.
 A remote machine can also be sized for the workload, which matters when multiple agents compile and run tests concurrently.
@@ -252,7 +252,7 @@ rumpel claude my-pod --host ssh://dev-box
 ### Kubernetes
 
 Pods can also run as Kubernetes pods if you have access to a cluster and can create pods.
-In addition, a container registry is needed that both your local Docker instance can push to and the cluster can pull from.
+In addition, a container registry is needed that your local image builder can push to and the cluster can pull from.
 
 Configure the [`kubernetes`](#kubernetes-1) field:
 
@@ -266,8 +266,8 @@ Configure the [`kubernetes`](#kubernetes-1) field:
 }
 ```
 
-Images are built locally (or on a `buildx` builder if configured) and pushed to the registry.
-The local Docker instance must be authenticated to push to the registry and to read image metadata from it, because rumpelpod queries the registry to decide whether an existing image can be reused or a rebuild is needed.
+Images are built locally with Docker or Podman (or on a Docker `buildx` builder if configured) and pushed to the registry.
+The local image builder must be authenticated to push to the registry and to read image metadata from it, because rumpelpod queries the registry to decide whether an existing image can be reused or a rebuild is needed.
 The cluster must be able to pull from the same registry.
 
 ### Container security
@@ -410,6 +410,19 @@ Accepts `"localhost"` (the default) or `"ssh://[user@]host"`.
 The SSH target is passed to OpenSSH. Configure ports and other SSH-specific settings in `~/.ssh/config`.
 Mutually exclusive with `kubernetes`.
 
+### `containerEngine`
+
+```json
+{ "containerEngine": "podman" }
+```
+
+Selects the local container engine and local image builder.
+Allowed values are `"auto"` (default), `"docker"`, and `"podman"`.
+`"auto"` tries Docker first for existing behavior, then falls back to Podman when Docker is not installed.
+
+For Kubernetes, this controls the local build-and-push path when `kubernetes.builder` is not set.
+If `kubernetes.builder` is set, Docker buildx is required.
+
 ### `kubernetes`
 
 ```json
@@ -437,7 +450,7 @@ Mutually exclusive with `host`.
 | `namespace` | string | `"default"` | |
 | `nodeSelector` | map<string,string> | none | labels that pods must match to be scheduled |
 | `tolerations` | array of toleration | none | see below |
-| `builder` | string | none | name of a pre-existing `docker buildx` builder; without it, images build on the local daemon and are then pushed |
+| `builder` | string | none | name of a pre-existing `docker buildx` builder; without it, images build locally with `containerEngine` and are then pushed |
 
 Each toleration is a [Kubernetes toleration][kubernetes-toleration] with the same field names.
 `key` and `effect` are required; `value` and `operator` are optional.

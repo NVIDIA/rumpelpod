@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 
 use crate::completions::PodNameCompleter;
-use crate::config::Host;
+use crate::config::{ContainerEngine, Host};
 
 /// Validate that a pod name contains only Docker/git-safe characters:
 /// ASCII alphanumeric, hyphens, underscores, and dots.
@@ -50,6 +50,11 @@ pub struct HostArgs {
     /// a prepared image that the cluster must pull from the registry.
     #[arg(long, requires = "kubernetes_context")]
     pub kubernetes_registry: Option<String>,
+
+    /// Container engine for local execution and image builds.
+    /// Defaults to auto: docker first, then podman when Docker is absent.
+    #[arg(long, value_parser = ContainerEngine::parse)]
+    pub container_engine: Option<ContainerEngine>,
 }
 
 impl HostArgs {
@@ -76,9 +81,15 @@ impl HostArgs {
                 node_selector: None,
                 tolerations: None,
                 builder: None,
+                image_builder: self.container_engine.unwrap_or(ContainerEngine::Auto),
             }))
         } else if let Some(ref h) = self.host {
-            Ok(Some(Host::parse(h)?))
+            let host = Host::parse(h)?;
+            Ok(Some(host.with_container_engine(
+                self.container_engine.unwrap_or(ContainerEngine::Auto),
+            )))
+        } else if let Some(engine) = self.container_engine {
+            Ok(Some(Host::Localhost { engine }))
         } else {
             Ok(None)
         }

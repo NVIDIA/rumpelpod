@@ -17,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
 use crate::async_runtime::block_on;
-use crate::config::Host;
+use crate::config::{ContainerEngine, Host};
 use crate::daemon::default_docker_socket;
 use crate::daemon::host_connection::HostConnection;
 use crate::daemon::protocol::PodStatus;
@@ -43,6 +43,7 @@ enum Inner {
 
 #[derive(Clone)]
 struct DockerBackend {
+    engine: ContainerEngine,
     cli_target: DockerCliTarget,
 }
 
@@ -53,26 +54,48 @@ struct K8sBackend {
 
 #[derive(Clone)]
 enum DockerCliTarget {
+    Local,
     UnixSocket(std::path::PathBuf),
     Ssh { uri: String },
 }
 
 impl Executor {
     /// Connect to a docker daemon over a unix socket.
-    pub fn docker(socket: &std::path::Path) -> Result<Self> {
+    pub fn docker(socket: &std::path::Path, engine: ContainerEngine) -> Result<Self> {
+        if engine == ContainerEngine::Auto {
+            panic!("docker() called with unresolved container engine auto");
+        }
         Ok(Self {
             inner: Inner::Docker(DockerBackend {
+                engine,
                 cli_target: DockerCliTarget::UnixSocket(socket.to_path_buf()),
             }),
         })
     }
 
     /// Connect to a docker daemon through Docker's SSH transport.
-    pub fn docker_ssh(ssh_destination: &str) -> Result<Self> {
+    pub fn docker_ssh(ssh_destination: &str, engine: ContainerEngine) -> Result<Self> {
+        if engine != ContainerEngine::Docker {
+            return Err(anyhow::anyhow!(
+                "ssh container hosts require docker; podman remote needs a configured \
+                 service URL or connection"
+            ));
+        }
         let uri = format!("ssh://{ssh_destination}");
         Ok(Self {
             inner: Inner::Docker(DockerBackend {
+                engine,
                 cli_target: DockerCliTarget::Ssh { uri },
+            }),
+        })
+    }
+
+    /// Use the local Podman store directly.
+    pub fn podman() -> Result<Self> {
+        Ok(Self {
+            inner: Inner::Docker(DockerBackend {
+                engine: ContainerEngine::Podman,
+                cli_target: DockerCliTarget::Local,
             }),
         })
     }
@@ -80,12 +103,25 @@ impl Executor {
     /// Connect to a Docker host without going through the daemon's
     /// `HostConnection` registry.  Used by CLI-side interactive exec
     /// after the daemon has already launched or reconnected the pod.
-    pub fn docker_host(host: &Host) -> Result<Self> {
+    pub fn container_host(host: &Host) -> Result<Self> {
         match host {
-            Host::Localhost => Self::docker(&default_docker_socket()),
-            Host::Ssh { ssh_destination } => Self::docker_ssh(ssh_destination),
+            Host::Localhost {
+                engine: ContainerEngine::Docker,
+            } => Self::docker(&default_docker_socket(), ContainerEngine::Docker),
+            Host::Localhost {
+                engine: ContainerEngine::Podman,
+            } => Self::podman(),
+            Host::Localhost {
+                engine: ContainerEngine::Auto,
+            } => {
+                panic!("container_host called with unresolved container engine auto")
+            }
+            Host::Ssh {
+                ssh_destination,
+                engine,
+            } => Self::docker_ssh(ssh_destination, *engine),
             Host::Kubernetes { .. } => {
-                panic!("docker_host called on Kubernetes host")
+                panic!("container_host called on Kubernetes host")
             }
         }
     }
@@ -107,11 +143,19 @@ impl Executor {
     /// directly.
     pub fn new(conn: &HostConnection) -> Result<Self> {
         match conn {
-            HostConnection::Localhost(_) => Self::docker(&default_docker_socket()),
+            HostConnection::Localhost(local) => match local.engine() {
+                ContainerEngine::Docker => {
+                    Self::docker(&default_docker_socket(), ContainerEngine::Docker)
+                }
+                ContainerEngine::Podman => Self::podman(),
+                ContainerEngine::Auto => {
+                    panic!("localhost connection has unresolved container engine auto")
+                }
+            },
             HostConnection::Ssh(ssh) => {
                 ssh.ensure_connected()
                     .context("opening ssh docker transport")?;
-                Self::docker_ssh(ssh.destination())
+                Self::docker_ssh(ssh.destination(), ssh.engine())
             }
             HostConnection::Kubernetes(k) => {
                 let client = k.ensure_client().context("opening k8s connection")?;
@@ -299,37 +343,69 @@ pub struct ExecInteractiveOptions {
 
 impl DockerBackend {
     fn command(&self) -> Command {
-        let mut command = Command::new("docker");
+        let mut command = Command::new(self.engine.binary_name());
         self.apply_target(&mut command);
         command
     }
 
     fn tokio_command(&self) -> TokioCommand {
-        let mut command = TokioCommand::new("docker");
+        let mut command = TokioCommand::new(self.engine.binary_name());
         self.apply_tokio_target(&mut command);
         command
     }
 
     fn apply_target(&self, command: &mut Command) {
-        match &self.cli_target {
-            DockerCliTarget::UnixSocket(socket) => {
-                let socket = socket.display().to_string();
-                command.args(["-H", &format!("unix://{socket}")]);
-            }
-            DockerCliTarget::Ssh { uri } => {
-                command.args(["-H", uri]);
+        match self.engine {
+            ContainerEngine::Docker => match &self.cli_target {
+                DockerCliTarget::Local => {}
+                DockerCliTarget::UnixSocket(socket) => {
+                    let socket = socket.display().to_string();
+                    command.args(["-H", &format!("unix://{socket}")]);
+                }
+                DockerCliTarget::Ssh { uri } => {
+                    command.args(["-H", uri]);
+                }
+            },
+            ContainerEngine::Podman => match &self.cli_target {
+                DockerCliTarget::Local => {}
+                DockerCliTarget::UnixSocket(socket) => {
+                    let socket = socket.display().to_string();
+                    command.args(["--url", &format!("unix://{socket}")]);
+                }
+                DockerCliTarget::Ssh { .. } => {
+                    panic!("podman ssh target should have been rejected")
+                }
+            },
+            ContainerEngine::Auto => {
+                panic!("container engine auto remained after resolve")
             }
         }
     }
 
     fn apply_tokio_target(&self, command: &mut TokioCommand) {
-        match &self.cli_target {
-            DockerCliTarget::UnixSocket(socket) => {
-                let socket = socket.display().to_string();
-                command.args(["-H", &format!("unix://{socket}")]);
-            }
-            DockerCliTarget::Ssh { uri } => {
-                command.args(["-H", uri]);
+        match self.engine {
+            ContainerEngine::Docker => match &self.cli_target {
+                DockerCliTarget::Local => {}
+                DockerCliTarget::UnixSocket(socket) => {
+                    let socket = socket.display().to_string();
+                    command.args(["-H", &format!("unix://{socket}")]);
+                }
+                DockerCliTarget::Ssh { uri } => {
+                    command.args(["-H", uri]);
+                }
+            },
+            ContainerEngine::Podman => match &self.cli_target {
+                DockerCliTarget::Local => {}
+                DockerCliTarget::UnixSocket(socket) => {
+                    let socket = socket.display().to_string();
+                    command.args(["--url", &format!("unix://{socket}")]);
+                }
+                DockerCliTarget::Ssh { .. } => {
+                    panic!("podman ssh target should have been rejected")
+                }
+            },
+            ContainerEngine::Auto => {
+                panic!("container engine auto remained after resolve")
             }
         }
     }
@@ -636,10 +712,11 @@ fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<(
     command.arg("create");
     command.args(["--name", id.as_str()]);
     command.args(["--hostname", hostname.as_str()]);
-    command.args([
-        "--network",
-        docker_only.network.as_deref().unwrap_or("bridge"),
-    ]);
+    if let Some(network) = docker_only.network.as_deref() {
+        command.args(["--network", network]);
+    } else if backend.engine == ContainerEngine::Docker {
+        command.args(["--network", "bridge"]);
+    }
     if let Some(runtime) = runtime {
         command.args(["--runtime", &runtime]);
     }

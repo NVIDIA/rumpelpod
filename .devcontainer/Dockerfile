@@ -33,6 +33,9 @@ RUN export DEBIAN_FRONTEND=noninteractive \
         locales \
         gnupg \
         docker.io \
+        podman \
+        fuse-overlayfs \
+        slirp4netns \
         kubectl \
         screen \
         skopeo \

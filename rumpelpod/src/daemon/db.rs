@@ -555,6 +555,12 @@ mod tests {
         (temp_dir, conn)
     }
 
+    fn localhost() -> Host {
+        Host::Localhost {
+            engine: crate::config::ContainerEngine::Docker,
+        }
+    }
+
     // --- Pod tests ---
 
     #[test]
@@ -567,7 +573,7 @@ mod tests {
             &conn,
             &repo_path,
             "dev",
-            &Host::Localhost,
+            &localhost(),
             "test-token",
             "img:tag",
             "{}",
@@ -579,7 +585,7 @@ mod tests {
         let pod = get_pod(&conn, &repo_path, "dev").unwrap().unwrap();
         assert_eq!(pod.id, id);
         assert_eq!(pod.name, "dev");
-        assert_eq!(pod.host, serde_json::to_string(&Host::Localhost).unwrap());
+        assert_eq!(pod.host, serde_json::to_string(&localhost()).unwrap());
         assert_eq!(pod.status, PodStatus::Initializing);
     }
 
@@ -591,6 +597,7 @@ mod tests {
 
         let ssh_host = Host::Ssh {
             ssh_destination: "user@host".to_string(),
+            engine: crate::config::ContainerEngine::Docker,
         };
         let id = create_pod(
             &conn,
@@ -619,7 +626,7 @@ mod tests {
             &conn,
             &repo_path,
             "dev",
-            &Host::Localhost,
+            &localhost(),
             "test-token",
             "img:tag",
             "{}",
@@ -631,7 +638,7 @@ mod tests {
             &conn,
             &repo_path,
             "dev",
-            &Host::Localhost,
+            &localhost(),
             "test-token",
             "img:tag",
             "{}",
@@ -650,7 +657,7 @@ mod tests {
             &conn,
             &repo_path,
             "dev",
-            &Host::Localhost,
+            &localhost(),
             "test-token",
             "img:tag",
             "{}",
@@ -678,12 +685,13 @@ mod tests {
 
         let ssh_host = Host::Ssh {
             ssh_destination: "remote".to_string(),
+            engine: crate::config::ContainerEngine::Docker,
         };
         create_pod(
             &conn,
             &repo_path,
             "dev",
-            &Host::Localhost,
+            &localhost(),
             "test-token",
             "img:tag",
             "{}",
@@ -720,7 +728,7 @@ mod tests {
             &conn,
             &repo1,
             "dev",
-            &Host::Localhost,
+            &localhost(),
             "test-token",
             "img:tag",
             "{}",
@@ -731,7 +739,7 @@ mod tests {
             &conn,
             &repo2,
             "dev",
-            &Host::Localhost,
+            &localhost(),
             "test-token",
             "img:tag",
             "{}",
@@ -758,7 +766,7 @@ mod tests {
             &conn,
             &repo_path,
             "dev",
-            &Host::Localhost,
+            &localhost(),
             "test-token",
             "img:tag",
             "{}",

@@ -1,11 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Docker image resolution and building.
+//! Container image resolution and building.
 //!
-//! All image builds go through `docker buildx build`.  The only
-//! variation between local Docker and Kubernetes is `--load` (keeps
-//! the image in the local daemon) vs `--push` (pushes to a registry).
+//! Docker builds use `docker buildx build`.  Podman builds use
+//! `podman build` and, for Kubernetes, a separate `podman push`.
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -17,20 +16,65 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
 
-use crate::config::Host;
+use crate::config::{ContainerEngine, Host};
 use crate::devcontainer::{BuildOptions, DevContainer};
+use crate::CommandExt;
 
-/// Set the `-H` (docker host) flag on a docker command.
+/// Set the target flag on a Docker-compatible container command.
 ///
 /// Local Docker may pass an explicit socket so the command uses the
 /// same daemon endpoint rumpelpod resolved earlier.  SSH Docker hosts
 /// use Docker's native `ssh://` transport.
 pub fn apply_docker_host(cmd: &mut Command, docker_host: &Host, docker_socket: Option<&Path>) {
-    if let Some(socket) = docker_socket {
-        let socket = socket.display();
-        cmd.args(["-H", &format!("unix://{socket}")]);
-    } else if let Some(uri) = docker_host.docker_host_uri() {
-        cmd.args(["-H", &uri]);
+    match docker_host {
+        Host::Localhost {
+            engine: ContainerEngine::Docker,
+        } => {
+            if let Some(socket) = docker_socket {
+                let socket = socket.display();
+                cmd.args(["-H", &format!("unix://{socket}")]);
+            }
+        }
+        Host::Localhost {
+            engine: ContainerEngine::Podman,
+        } => {
+            if let Some(socket) = docker_socket {
+                let socket = socket.display();
+                cmd.args(["--url", &format!("unix://{socket}")]);
+            }
+        }
+        Host::Localhost {
+            engine: ContainerEngine::Auto,
+        } => {
+            panic!("container engine auto remained after resolve")
+        }
+        Host::Ssh {
+            engine: ContainerEngine::Docker,
+            ..
+        } => {
+            if let Some(uri) = docker_host.docker_host_uri() {
+                cmd.args(["-H", &uri]);
+            }
+        }
+        Host::Ssh {
+            engine: ContainerEngine::Podman,
+            ..
+        } => {
+            panic!("podman ssh target should have been rejected")
+        }
+        Host::Ssh {
+            engine: ContainerEngine::Auto,
+            ..
+        } => {
+            panic!("container engine auto remained after resolve")
+        }
+        Host::Kubernetes { .. } => {}
+    }
+}
+
+fn apply_ssh_auth_sock(cmd: &mut Command, ssh_auth_sock: Option<&Path>) {
+    if let Some(sock) = ssh_auth_sock {
+        cmd.env("SSH_AUTH_SOCK", sock);
     }
 }
 
@@ -83,11 +127,13 @@ pub(crate) enum BuildxMode<'a> {
     Load {
         docker_host: &'a Host,
         docker_socket: Option<&'a Path>,
+        engine: ContainerEngine,
     },
     /// `--push` to a registry, optionally via a named builder.
     Push {
         registry: &'a str,
         builder: Option<&'a str>,
+        engine: ContainerEngine,
     },
 }
 
@@ -110,14 +156,19 @@ impl<'a> BuildxMode<'a> {
     pub(crate) fn from_host(host: &'a Host, docker_socket: Option<&'a Path>) -> Self {
         match host {
             Host::Kubernetes {
-                registry, builder, ..
+                registry,
+                builder,
+                image_builder,
+                ..
             } => BuildxMode::Push {
                 registry,
                 builder: builder.as_deref(),
+                engine: *image_builder,
             },
-            Host::Localhost | Host::Ssh { .. } => BuildxMode::Load {
+            Host::Localhost { engine } | Host::Ssh { engine, .. } => BuildxMode::Load {
                 docker_host: host,
                 docker_socket,
+                engine: *engine,
             },
         }
     }
@@ -197,6 +248,7 @@ pub fn resolve_image(
             BuildxMode::Load {
                 docker_host,
                 docker_socket,
+                ..
             } => {
                 let local_name = mode.output_tag(&image_name);
                 if image_exists(&local_name, docker_host, *docker_socket) {
@@ -293,15 +345,13 @@ pub(crate) fn run_buildx_build(
     ssh_auth_sock: Option<&Path>,
 ) -> Result<()> {
     let mut cmd = Command::new("docker");
-
-    if let Some(sock) = ssh_auth_sock {
-        cmd.env("SSH_AUTH_SOCK", sock);
-    }
+    apply_ssh_auth_sock(&mut cmd, ssh_auth_sock);
 
     let load_target: Option<(&Host, Option<&Path>, String)> = match mode {
         BuildxMode::Load {
             docker_host,
             docker_socket,
+            engine: ContainerEngine::Docker,
         } => {
             apply_docker_host(&mut cmd, docker_host, *docker_socket);
             cmd.args(["buildx", "build", "--load"]);
@@ -313,7 +363,30 @@ pub(crate) fn run_buildx_build(
             cmd.arg(format!("-t={local_tag}"));
             Some((docker_host, *docker_socket, local_tag))
         }
-        BuildxMode::Push { registry, builder } => {
+        BuildxMode::Load {
+            docker_host,
+            docker_socket,
+            engine: ContainerEngine::Podman,
+        } => {
+            cmd = Command::new("podman");
+            apply_ssh_auth_sock(&mut cmd, ssh_auth_sock);
+            apply_docker_host(&mut cmd, docker_host, *docker_socket);
+            cmd.arg("build");
+            let local_tag = format!("rumpelpod-{tag}");
+            cmd.args(["-t", &local_tag]);
+            Some((docker_host, *docker_socket, local_tag))
+        }
+        BuildxMode::Load {
+            engine: ContainerEngine::Auto,
+            ..
+        } => {
+            panic!("container engine auto remained after resolve")
+        }
+        BuildxMode::Push {
+            registry,
+            builder,
+            engine: ContainerEngine::Docker,
+        } => {
             cmd.args(["buildx", "build"]);
             if let Some(builder) = builder {
                 cmd.args(["--builder", builder]);
@@ -323,6 +396,30 @@ pub(crate) fn run_buildx_build(
             let push_tag = format!("{registry}:{tag}");
             cmd.args(["-t", &push_tag]);
             None
+        }
+        BuildxMode::Push {
+            registry,
+            builder,
+            engine: ContainerEngine::Podman,
+        } => {
+            if builder.is_some() {
+                return Err(anyhow::anyhow!(
+                    "kubernetes.builder requires docker buildx; remove builder or use \
+                     containerEngine docker"
+                ));
+            }
+            cmd = Command::new("podman");
+            apply_ssh_auth_sock(&mut cmd, ssh_auth_sock);
+            cmd.arg("build");
+            let push_tag = format!("{registry}:{tag}");
+            cmd.args(["-t", &push_tag]);
+            None
+        }
+        BuildxMode::Push {
+            engine: ContainerEngine::Auto,
+            ..
+        } => {
+            panic!("container engine auto remained after resolve")
         }
     };
 
@@ -335,7 +432,7 @@ pub(crate) fn run_buildx_build(
         run_and_stream(&mut cmd, on_output)
     } else {
         use crate::CommandExt;
-        cmd.success().context("buildx build failed").map(|_| ())
+        cmd.success().context("image build failed").map(|_| ())
     };
 
     // Tolerate the classic "image already exists" race: two
@@ -356,7 +453,21 @@ pub(crate) fn run_buildx_build(
         }
     }
 
-    build_result
+    build_result?;
+
+    if let BuildxMode::Push {
+        registry,
+        builder: None,
+        engine: ContainerEngine::Podman,
+    } = mode
+    {
+        let push_tag = format!("{registry}:{tag}");
+        let mut push = Command::new("podman");
+        push.args(["push", &push_tag]);
+        push.success().context("podman push failed")?;
+    }
+
+    Ok(())
 }
 
 /// Spawn a docker command and stream its output through a callback.
@@ -412,7 +523,7 @@ fn run_and_stream(cmd: &mut Command, on_output: BuildOutputFn) -> Result<()> {
         let stdout = stdout_buf.lock().unwrap();
         let stderr = stderr_buf.lock().unwrap();
         return Err(anyhow::anyhow!(
-            "buildx build failed:\nSTDOUT: {stdout}\nSTDERR: {stderr}"
+            "image build failed:\nSTDOUT: {stdout}\nSTDERR: {stderr}"
         ));
     }
 
@@ -428,51 +539,34 @@ pub fn pull_image(
     docker_socket: Option<&Path>,
 ) -> Result<()> {
     let mut cmd = Command::new("docker");
+    match docker_host.image_builder() {
+        Some(ContainerEngine::Docker) | Some(ContainerEngine::Auto) | None => {}
+        Some(ContainerEngine::Podman) => {
+            cmd = Command::new("podman");
+        }
+    }
     apply_docker_host(&mut cmd, docker_host, docker_socket);
     cmd.args(["pull", image_name]);
 
     let status = cmd.status()?;
     if !status.success() {
-        return Err(anyhow::anyhow!("docker pull failed with status {status}"));
+        let engine = match docker_host.image_builder() {
+            Some(ContainerEngine::Podman) => "podman",
+            Some(ContainerEngine::Auto) | Some(ContainerEngine::Docker) | None => "docker",
+        };
+        return Err(anyhow::anyhow!("{engine} pull failed with status {status}"));
     }
     Ok(())
 }
 
-/// Check whether a Docker image already exists in a remote registry.
+/// Check whether a container image already exists in a remote registry.
 ///
 /// Returns `Ok(true)` if the manifest exists, `Ok(false)` if the
 /// registry reports "not found".  All other errors (unreachable
 /// registry, auth failures) are propagated.
 ///
-/// `--insecure` is required to reach plain-HTTP registries (k3d's
-/// `registry.localhost` and equivalents); for HTTPS registries it
-/// just relaxes cert verification, which is fine because the only
-/// bit we trust here is the presence/absence signal.
 pub(crate) fn registry_image_exists(registry_tag: &str) -> Result<bool> {
-    let output = Command::new("docker")
-        .args(["manifest", "inspect", "--insecure", registry_tag])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("running docker manifest inspect")?;
-
-    if output.status.success() {
-        return Ok(true);
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr_lower = stderr.to_ascii_lowercase();
-
-    if stderr_lower.contains("no such manifest")
-        || stderr_lower.contains("manifest unknown")
-        || stderr_lower.contains("not found")
-    {
-        return Ok(false);
-    }
-
-    Err(anyhow::anyhow!(
-        "docker manifest inspect failed for '{registry_tag}':\n{stderr}"
-    ))
+    crate::registry::image_manifest_exists(registry_tag)
 }
 
 /// Query the USER directive from a Docker image's configuration.
@@ -493,6 +587,12 @@ pub(crate) fn inspect_image_user(
         && image_exists(image, docker_host, docker_socket)
     {
         let mut cmd = Command::new("docker");
+        match docker_host.image_builder() {
+            Some(ContainerEngine::Docker) | Some(ContainerEngine::Auto) | None => {}
+            Some(ContainerEngine::Podman) => {
+                cmd = Command::new("podman");
+            }
+        }
         apply_docker_host(&mut cmd, docker_host, docker_socket);
         cmd.args(["image", "inspect", "--format", "{{.Config.User}}", image]);
         let output = cmd.output().context("inspecting image for USER")?;
@@ -531,6 +631,12 @@ pub(crate) fn image_exists(
     docker_socket: Option<&Path>,
 ) -> bool {
     let mut cmd = Command::new("docker");
+    match docker_host.image_builder() {
+        Some(ContainerEngine::Docker) | Some(ContainerEngine::Auto) | None => {}
+        Some(ContainerEngine::Podman) => {
+            cmd = Command::new("podman");
+        }
+    }
     apply_docker_host(&mut cmd, docker_host, docker_socket);
     cmd.args(["image", "inspect", image_name]);
     cmd.stdout(std::process::Stdio::null());

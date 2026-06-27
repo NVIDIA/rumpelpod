@@ -18,7 +18,7 @@ use indoc::{formatdoc, indoc};
 use sha2::{Digest, Sha256};
 
 use crate::cli::PrepareImageCommand;
-use crate::config::Host;
+use crate::config::{ContainerEngine, Host};
 use crate::git::GitRemote;
 use crate::image::{BuildOutputFn, BuildResult, BuildxMode, Image};
 
@@ -431,6 +431,12 @@ fn ensure_buildable_tag(
     }
     let friendly = format!("rumpelpod-base-{}", &image[7..23]);
     let mut cmd = Command::new("docker");
+    match docker_host.image_builder() {
+        Some(ContainerEngine::Docker) | Some(ContainerEngine::Auto) | None => {}
+        Some(ContainerEngine::Podman) => {
+            cmd = Command::new("podman");
+        }
+    }
     crate::image::apply_docker_host(&mut cmd, docker_host, docker_socket);
     cmd.args(["tag", image, &friendly]);
     let status = cmd
@@ -499,6 +505,7 @@ pub fn build_prepared_image(
         BuildxMode::Load {
             docker_host,
             docker_socket,
+            ..
         } => ensure_buildable_tag(&base_image.0, docker_host, *docker_socket)?,
         BuildxMode::Push { .. } => base_image.0.clone(),
     };
@@ -554,6 +561,7 @@ pub fn build_prepared_image(
         BuildxMode::Load {
             docker_host,
             docker_socket,
+            ..
         } => {
             let local_tag = mode.output_tag(&tag);
             if crate::image::image_exists(&local_tag, docker_host, *docker_socket) {

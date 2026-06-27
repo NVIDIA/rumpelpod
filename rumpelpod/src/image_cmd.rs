@@ -21,6 +21,7 @@ pub fn build(cmd: &ImageBuildCommand) -> Result<()> {
              Use 'rumpel image fetch' to pull a pre-built image."
         ));
     }
+    let docker_host = docker_host.resolve_container_tools()?;
 
     let on_output: Option<image::BuildOutputFn> =
         Some(Box::new(|line: image::OutputLine| match line {
@@ -77,6 +78,7 @@ pub fn fetch(cmd: &ImageFetchCommand) -> Result<()> {
              Images are pulled directly by the cluster."
         ));
     }
+    let docker_host = docker_host.resolve_container_tools()?;
 
     let image_name = devcontainer
         .image

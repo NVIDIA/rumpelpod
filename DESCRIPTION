@@ -1,0 +1,9 @@
+Add Podman container engine support
+
+Add a containerEngine preference for local execution and image builds.
+Auto resolves Docker first and Podman as a fallback. Support local
+Podman execution and Podman build/push for Kubernetes configurations
+without a Docker buildx builder.
+
+Document the interface and add a Podman test harness mode for
+devcontainer smoke tests.

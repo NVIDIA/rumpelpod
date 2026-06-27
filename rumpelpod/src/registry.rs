@@ -8,6 +8,7 @@
 //! without downloading the full image.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -26,11 +27,11 @@ pub(crate) struct ImageRef {
 }
 
 impl ImageRef {
-    /// The registry hostname used as key in ~/.docker/config.json.
+    /// The registry hostname used as key in container auth files.
     ///
     /// Docker Hub stores credentials under "https://index.docker.io/v1/"
     /// regardless of which hostname the user specified.
-    fn docker_config_key(&self) -> &str {
+    fn auth_config_key(&self) -> &str {
         if self.registry == "registry-1.docker.io" {
             "https://index.docker.io/v1/"
         } else {
@@ -182,7 +183,7 @@ fn authenticate(client: &Client, image_ref: &ImageRef, scheme: &str) -> Result<O
                 .get(&realm)
                 .query(&[("scope", scope.as_str()), ("service", service.as_str())]);
 
-            if let Some((user, pass)) = docker_credentials(image_ref.docker_config_key()) {
+            if let Some((user, pass)) = registry_credentials(image_ref.auth_config_key()) {
                 req = req.basic_auth(&user, Some(&pass));
             }
 
@@ -204,11 +205,11 @@ fn authenticate(client: &Client, image_ref: &ImageRef, scheme: &str) -> Result<O
         }
         AuthChallenge::Basic => {
             let (user, pass) =
-                docker_credentials(image_ref.docker_config_key()).with_context(|| {
-                    let key = image_ref.docker_config_key();
+                registry_credentials(image_ref.auth_config_key()).with_context(|| {
+                    let key = image_ref.auth_config_key();
                     format!(
                         "registry {} requires Basic auth but no credentials \
-                         are configured for it in ~/.docker/config.json \
+                         are configured for it in container auth files \
                          (checked auths, credHelpers, credsStore for key {key:?})",
                         image_ref.registry,
                     )
@@ -266,13 +267,39 @@ fn parse_www_authenticate(header: &str) -> Result<AuthChallenge> {
     }
 }
 
-// ---- Docker credential lookup ----------------------------------------------
+// ---- Container credential lookup -------------------------------------------
 
-/// Read Docker credentials for a registry from ~/.docker/config.json.
+/// Read credentials for a registry from Docker and Podman auth files.
 ///
 /// Checks `credHelpers`, `credsStore`, and direct `auths` entries.
-fn docker_credentials(registry: &str) -> Option<(String, String)> {
-    let config_path = dirs::home_dir()?.join(".docker/config.json");
+fn registry_credentials(registry: &str) -> Option<(String, String)> {
+    for config_path in auth_config_paths() {
+        let Some(creds) = credentials_from_config(&config_path, registry) else {
+            continue;
+        };
+        return Some(creds);
+    }
+    None
+}
+
+fn auth_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = std::env::var("REGISTRY_AUTH_FILE") {
+        paths.push(PathBuf::from(path));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".docker/config.json"));
+    }
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        paths.push(PathBuf::from(runtime_dir).join("containers/auth.json"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".config/containers/auth.json"));
+    }
+    paths
+}
+
+fn credentials_from_config(config_path: &PathBuf, registry: &str) -> Option<(String, String)> {
     let content = std::fs::read_to_string(config_path).ok()?;
     let config: serde_json::Value = serde_json::from_str(&content).ok()?;
 
@@ -400,6 +427,45 @@ fn fetch_manifest(
         .with_context(|| format!("fetching manifest for {}", image_ref.repository))?
         .json()
         .context("parsing manifest JSON")
+}
+
+/// Check whether an image manifest exists in a registry.
+pub(crate) fn image_manifest_exists(image: &str) -> Result<bool> {
+    let image_ref = parse_image_ref(image);
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("building HTTP client")?;
+
+    let scheme = registry_scheme(&image_ref.registry);
+    let cred = authenticate(&client, &image_ref, scheme)?;
+    let url = format!(
+        "{scheme}://{}/v2/{}/manifests/{}",
+        image_ref.registry, image_ref.repository, image_ref.reference
+    );
+
+    let resp = authed_get(&client, &url, cred.as_ref())
+        .header("Accept", MANIFEST_ACCEPT)
+        .send()
+        .with_context(|| format!("fetching manifest for {image}"))?;
+
+    if resp.status().is_success() {
+        return Ok(true);
+    }
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    let text_lower = text.to_ascii_lowercase();
+    if text_lower.contains("manifest unknown") || text_lower.contains("not found") {
+        return Ok(false);
+    }
+
+    Err(anyhow::anyhow!(
+        "registry manifest lookup failed for '{image}' with status {status}: {text}"
+    ))
 }
 
 /// Extract the config digest, following through manifest lists if
