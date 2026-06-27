@@ -79,7 +79,13 @@ fn read_ref_updates() -> Result<Vec<(String, String, String)>> {
 
 /// Run a git command, logging failures to stderr.
 fn run_git(args: &[&str]) {
-    if let Err(e) = Command::new("git").args(args).success() {
+    // Pod sync should not fail because old LFS payloads were already
+    // absent from both sides; present local LFS objects are still uploaded.
+    if let Err(e) = Command::new("git")
+        .args(["-c", "lfs.allowincompletepush=true"])
+        .args(args)
+        .success()
+    {
         eprintln!("rumpelpod hook: {e:#}");
     }
 }

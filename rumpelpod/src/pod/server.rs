@@ -722,7 +722,14 @@ fn recover_push(repo_path: &Path, pod_name: &str) {
         }
     }
     match Command::new("git")
-        .args(["push", "rumpelpod", "--force", "--quiet"])
+        .args([
+            "-c",
+            "lfs.allowincompletepush=true",
+            "push",
+            "rumpelpod",
+            "--force",
+            "--quiet",
+        ])
         .current_dir(repo_path)
         .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
         .env("GIT_HTTP_LOW_SPEED_TIME", "10")
@@ -1251,7 +1258,14 @@ async fn git_push_handler(
 
     tokio::task::spawn_blocking(move || {
         let output = Command::new("git")
-            .args(["push", "rumpelpod", "--force", "--quiet"])
+            .args([
+                "-c",
+                "lfs.allowincompletepush=true",
+                "push",
+                "rumpelpod",
+                "--force",
+                "--quiet",
+            ])
             .current_dir(&repo_path)
             .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
             .env("GIT_HTTP_LOW_SPEED_TIME", "10")
