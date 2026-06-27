@@ -3161,6 +3161,84 @@ fn gateway_lfs_missing_historical_object_does_not_block_pod_push() {
 }
 
 #[test]
+fn gateway_lfs_missing_new_object_blocks_pod_push() {
+    let repo = TestRepo::new();
+
+    Command::new("git")
+        .args(["lfs", "install", "--local"])
+        .current_dir(repo.path())
+        .success()
+        .expect("git lfs install failed");
+
+    Command::new("git")
+        .args(["lfs", "track", "*.bin"])
+        .current_dir(repo.path())
+        .success()
+        .expect("git lfs track failed");
+
+    Command::new("git")
+        .args(["add", ".gitattributes"])
+        .current_dir(repo.path())
+        .success()
+        .expect("git add failed");
+    create_commit(repo.path(), "track bin files with LFS");
+
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, LFS_DOCKERFILE, "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let pod_name = "lfs-missing-new";
+
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", pod_name, "--", "echo", "setup"])
+        .success()
+        .expect("pod enter failed");
+
+    let script = formatdoc! {r#"
+        set -eu
+        printf 'new pod lfs content\n' > broken.bin
+        git add broken.bin
+        oid=$(sha256sum broken.bin | awk '{{print $1}}')
+        dir=".git/lfs/objects/$(printf '%s' "$oid" | cut -c1-2)/$(printf '%s' "$oid" | cut -c3-4)"
+        rm "$dir/$oid"
+        printf 'different worktree content\n' > broken.bin
+        git commit --no-verify -m 'add broken LFS pointer'
+    "#};
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", pod_name, "--", "sh", "-c", &script])
+        .success()
+        .expect("pod commit failed");
+
+    let pod_commit_output = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            pod_name,
+            "--",
+            "git",
+            "rev-parse",
+            "HEAD",
+        ])
+        .success()
+        .expect("Failed to get pod commit");
+    let pod_commit = String::from_utf8_lossy(&pod_commit_output)
+        .trim()
+        .to_string();
+
+    let expected_ref = format!("refs/rumpelpod/{pod_name}@{pod_name}");
+    assert!(
+        !wait_for_ref_commit_until(
+            repo.path(),
+            &expected_ref,
+            &pod_commit,
+            std::time::Duration::from_secs(8),
+        ),
+        "pod push should fail when a new LFS payload is missing locally"
+    );
+}
+
+#[test]
 fn gateway_lfs_download_from_host() {
     // Verify that an LFS file committed on the host is available in the
     // pod with full content (not a pointer).

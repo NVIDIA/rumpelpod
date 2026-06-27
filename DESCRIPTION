@@ -4,5 +4,8 @@ Allow automatic pod-to-host pushes to continue when Git LFS cannot
 find old objects that were already absent from both the pod and host.
 
 This keeps pod branches syncing while still uploading LFS objects that
-are present locally, and adds a regression for a non-LFS pod commit on
-top of history with a missing old LFS payload.
+are introduced by the pod before the Git ref moves, then skips Git LFS'
+whole-branch pre-push scan for that internal ref push. It adds
+regressions for a non-LFS pod commit on top of history with a missing
+old LFS payload, and for a new pod-created LFS pointer whose payload is
+missing locally.

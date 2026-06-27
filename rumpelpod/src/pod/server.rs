@@ -721,16 +721,14 @@ fn recover_push(repo_path: &Path, pod_name: &str) {
             return;
         }
     }
+    if let Err(e) = crate::git::upload_lfs_objects_for_rumpelpod_push(repo_path, pod_name) {
+        eprintln!("events: git lfs push failed: {e:#}");
+        return;
+    }
     match Command::new("git")
-        .args([
-            "-c",
-            "lfs.allowincompletepush=true",
-            "push",
-            "rumpelpod",
-            "--force",
-            "--quiet",
-        ])
+        .args(["push", "rumpelpod", "--force", "--quiet"])
         .current_dir(repo_path)
+        .env("GIT_LFS_SKIP_PUSH", "1")
         .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
         .env("GIT_HTTP_LOW_SPEED_TIME", "10")
         .stdout(Stdio::null())
@@ -1255,18 +1253,15 @@ async fn git_push_handler(
         .await
         .clone()
         .ok_or_else(|| err_json(anyhow::anyhow!("repo_path not set yet")))?;
+    let pod_name = state.pod_name.clone();
 
     tokio::task::spawn_blocking(move || {
+        crate::git::upload_lfs_objects_for_rumpelpod_push(&repo_path, &pod_name)
+            .context("git lfs push before ref push")?;
         let output = Command::new("git")
-            .args([
-                "-c",
-                "lfs.allowincompletepush=true",
-                "push",
-                "rumpelpod",
-                "--force",
-                "--quiet",
-            ])
+            .args(["push", "rumpelpod", "--force", "--quiet"])
             .current_dir(&repo_path)
+            .env("GIT_LFS_SKIP_PUSH", "1")
             .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
             .env("GIT_HTTP_LOW_SPEED_TIME", "10")
             .output()

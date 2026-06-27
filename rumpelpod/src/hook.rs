@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io::BufRead;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -79,11 +80,11 @@ fn read_ref_updates() -> Result<Vec<(String, String, String)>> {
 
 /// Run a git command, logging failures to stderr.
 fn run_git(args: &[&str]) {
-    // Pod sync should not fail because old LFS payloads were already
-    // absent from both sides; present local LFS objects are still uploaded.
+    // The LFS payloads introduced by this update are uploaded before
+    // the ref push; skip Git LFS' whole-branch pre-push scan.
     if let Err(e) = Command::new("git")
-        .args(["-c", "lfs.allowincompletepush=true"])
         .args(args)
+        .env("GIT_LFS_SKIP_PUSH", "1")
         .success()
     {
         eprintln!("rumpelpod hook: {e:#}");
@@ -106,7 +107,7 @@ pub fn reference_transaction(cmd: &ReferenceTransactionCommand) -> Result<()> {
         .ok()
         .map(|out| String::from_utf8_lossy(&out).trim().to_string());
 
-    for (_oldvalue, newvalue, refname) in read_ref_updates()? {
+    for (oldvalue, newvalue, refname) in read_ref_updates()? {
         let branch = match refname.strip_prefix("refs/heads/") {
             Some(b) => b,
             None => continue,
@@ -115,6 +116,17 @@ pub fn reference_transaction(cmd: &ReferenceTransactionCommand) -> Result<()> {
         if newvalue == ZERO_OID {
             run_git(&["push", "rumpelpod", "--delete", branch, "--quiet"]);
         } else {
+            if oldvalue != ZERO_OID {
+                if let Err(e) = crate::git::upload_lfs_objects_for_ref_update(
+                    Path::new("."),
+                    "rumpelpod",
+                    Some(&oldvalue),
+                    &newvalue,
+                ) {
+                    eprintln!("rumpelpod hook: git lfs push failed: {e:#}");
+                    continue;
+                }
+            }
             run_git(&["push", "rumpelpod", branch, "--force", "--quiet"]);
         }
 
