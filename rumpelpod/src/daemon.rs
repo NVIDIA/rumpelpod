@@ -2561,21 +2561,12 @@ impl DaemonServer {
             local_env_vars,
             ssh_auth_sock,
         } = params;
+        let requested_host = docker_host;
 
         let (mut devcontainer, used_default_image) =
             load_and_resolve_devcontainer(&repo_path, &pod_name.0, &local_env_vars)?;
         let raw_devcontainer_json =
             DevContainer::find_raw(&repo_path)?.unwrap_or_else(|| "{}".to_string());
-
-        if docker_host.is_remote() {
-            validate_bind_mount_ownership(&devcontainer)?;
-        }
-
-        if let Some(ref requirements) = devcontainer.host_requirements {
-            if let Some(msg) = host_requirements_message(requirements, &docker_host) {
-                build_tx.send(OutputLine::Stderr(msg)).ok();
-            }
-        }
 
         // When re-entering an existing pod, use the host it was created on
         // rather than whatever the current config resolves to.  The pod is
@@ -2585,7 +2576,6 @@ impl DaemonServer {
         // reconnect.  If the pod turns out to be gone (k8s eviction,
         // Docker removal), clean up the stale DB record and fall through
         // to a fresh create.
-        let mut docker_host = docker_host.resolve_container_tools()?;
         // Wait for any in-progress background stop to finish before
         // checking the DB for reentry or creating a new pod.
         for _ in 0..50 {
@@ -2601,21 +2591,13 @@ impl DaemonServer {
         {
             let conn = self.db.lock().unwrap();
             if let Some(existing) = db::get_pod(&conn, &repo_path, &pod_name.0)? {
-                let host_spec = serde_json::to_string(&docker_host)?;
-                if existing.host != host_spec {
-                    let existing_host: Host = serde_json::from_str(&existing.host)
-                        .context("parsing stored host for existing pod")?;
-                    eprintln!(
-                        "pod '{}' exists on {}, reconnecting there.",
-                        pod_name.0, existing_host,
-                    );
-                    docker_host = existing_host;
-                }
+                let existing_host: Host = serde_json::from_str(&existing.host)
+                    .context("parsing stored host for existing pod")?;
                 drop(conn);
                 match self.reconnect_pod(
                     &pod_name,
                     &repo_path,
-                    &docker_host,
+                    &existing_host,
                     &devcontainer,
                     &local_env_vars,
                     &existing,
@@ -2634,6 +2616,17 @@ impl DaemonServer {
                         )));
                     }
                 }
+            }
+        }
+
+        let docker_host = requested_host.resolve_container_tools()?;
+        if docker_host.is_remote() {
+            validate_bind_mount_ownership(&devcontainer)?;
+        }
+
+        if let Some(ref requirements) = devcontainer.host_requirements {
+            if let Some(msg) = host_requirements_message(requirements, &docker_host) {
+                build_tx.send(OutputLine::Stderr(msg)).ok();
             }
         }
 

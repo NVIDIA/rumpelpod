@@ -153,6 +153,7 @@ impl Executor {
             if runtime.is_some() {
                 anyhow::bail!("--runtime requires a Kubernetes executor");
             }
+            require_podman_overlay_storage()?;
             env.push(("RUMPELPOD_TEST_EXECUTOR".into(), "podman".into()));
             eprintln!("Executor: podman");
             return Ok(ExecutorGuard::default());
@@ -311,6 +312,34 @@ impl Executor {
         eprintln!("k3d: {dir_display}");
 
         Ok(Some(ExecutorGuard::default()))
+    }
+}
+
+fn require_podman_overlay_storage() -> Result<()> {
+    let driver = tools::output(Command::new("podman").args([
+        "info",
+        "--format",
+        "{{.Store.GraphDriverName}}",
+    ]))
+    .context("checking Podman storage driver")?;
+    validate_podman_storage_driver(&driver)?;
+    eprintln!("Podman storage driver: {driver}");
+    Ok(())
+}
+
+fn validate_podman_storage_driver(driver: &str) -> Result<()> {
+    match driver {
+        "overlay" => Ok(()),
+        "vfs" => Err(anyhow::anyhow!(
+            "Podman is using the vfs storage driver; configure overlay storage before running \
+             --executor podman"
+        )),
+        "" => Err(anyhow::anyhow!(
+            "Podman did not report a storage driver; refusing to run --executor podman"
+        )),
+        other => Err(anyhow::anyhow!(
+            "Podman is using unsupported storage driver '{other}'; expected overlay"
+        )),
     }
 }
 
@@ -972,14 +1001,26 @@ fn run_tests(cases: Vec<TestCase>, config: &RunConfig) -> Vec<TestResult> {
     })
 }
 
-/// Remove leftover test containers so the pipeline's pre-flight
-/// check stays green.  The pipeline asserts no non-k3d containers
-/// exist before starting, so anything left after tests must be ours.
-fn cleanup_containers() {
-    let output = match Command::new("docker")
-        .args(["ps", "-a", "--format", "{{.Names}}"])
-        .output()
-    {
+/// Remove leftover test containers so failed tests do not poison the next run.
+fn cleanup_containers(executor: &Executor) {
+    let engine = match executor {
+        Executor::Podman => "podman",
+        Executor::Eks | Executor::Hetzner | Executor::K3d => "docker",
+    };
+    let args: &[&str] = match executor {
+        Executor::Podman => &[
+            "ps",
+            "-a",
+            "--filter",
+            "label=dev.rumpelpod.repo_path",
+            "--format",
+            "{{.Names}}",
+        ],
+        Executor::Eks | Executor::Hetzner | Executor::K3d => {
+            &["ps", "-a", "--format", "{{.Names}}"]
+        }
+    };
+    let output = match Command::new(engine).args(args).output() {
         Ok(out) if out.status.success() => out,
         _ => return,
     };
@@ -995,10 +1036,10 @@ fn cleanup_containers() {
         return;
     }
     eprintln!(
-        "warning: {} leftover Docker containers (per-test cleanup missed them)",
-        to_remove.len(),
+        "warning: {} leftover {engine} containers (per-test cleanup missed them)",
+        to_remove.len()
     );
-    let _ = Command::new("docker")
+    let _ = Command::new(engine)
         .arg("rm")
         .arg("-f")
         .args(&to_remove)
@@ -1293,7 +1334,7 @@ fn run() -> Result<ExitCode> {
     );
 
     let results = run_tests(cases, &config);
-    cleanup_containers();
+    cleanup_containers(&cleanup_executor);
     cleanup_k8s_namespaces(&cleanup_executor);
     let any_failed = results
         .iter()
@@ -1304,4 +1345,22 @@ fn run() -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_podman_storage_driver;
+
+    #[test]
+    fn podman_executor_preflight_rejects_vfs_storage() {
+        // The integration suite builds many images, so vfs turns a
+        // signal test run into a storage benchmark.
+        let err = validate_podman_storage_driver("vfs").unwrap_err();
+        assert!(err.to_string().contains("vfs storage driver"));
+    }
+
+    #[test]
+    fn podman_executor_preflight_accepts_overlay_storage() {
+        validate_podman_storage_driver("overlay").unwrap();
+    }
 }

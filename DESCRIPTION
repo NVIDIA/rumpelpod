@@ -1,0 +1,9 @@
+Verify Podman executor
+
+Fix the devcontainer Podman socket permissions so the non-root test user
+can reach the rootful API service, and make podman executor test runs
+refuse the slow vfs storage backend before starting the suite.
+
+Fix re-entry so an existing pod uses its stored host before resolving
+the current repo config, normalize Podman's default runc runtime flag,
+and clean up leftover Podman test containers after failed xtest cases.

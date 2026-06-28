@@ -718,7 +718,19 @@ fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<(
         command.args(["--network", "bridge"]);
     }
     if let Some(runtime) = runtime {
-        command.args(["--runtime", &runtime]);
+        match backend.engine {
+            ContainerEngine::Docker => {
+                command.args(["--runtime", &runtime]);
+            }
+            ContainerEngine::Podman => {
+                if runtime != "runc" {
+                    command.args(["--runtime", &runtime]);
+                }
+            }
+            ContainerEngine::Auto => {
+                panic!("container engine auto remained after resolve")
+            }
+        }
     }
     if privileged {
         command.arg("--privileged");

@@ -63,6 +63,7 @@ RUN mkdir -p \
         '[Socket]' \
         'SocketGroup=docker' \
         'SocketMode=0660' \
+        'DirectoryMode=0755' \
         > /etc/systemd/system/podman.socket.d/rumpelpod.conf \
     && systemctl enable podman.socket
 
