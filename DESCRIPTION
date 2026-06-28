@@ -12,3 +12,6 @@ absence assertion, avoiding a timeout-prone failing interactive exec.
 
 The pi tests wait for the actual TUI readiness text before sending
 prompts, so Docker build output cannot satisfy the readiness check.
+
+A TODO records that agent harness config-copy state should converge on
+the Claude database-backed model.

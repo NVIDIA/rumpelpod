@@ -236,6 +236,10 @@ pub(crate) const AGENT_NAMES: &[&str] = &["claude", "codex", "grok", "pi"];
 
 #[derive(Clone, Copy, Debug, Default)]
 struct CopiedAgentConfigs {
+    // TODO: Move codex, grok, and pi config-copy idempotence onto the
+    // same database-backed model as Claude. Keeping this split across
+    // harnesses makes fork/recreate behavior depend on agent-specific
+    // copy semantics instead of one shared policy.
     claude: bool,
 }
 
