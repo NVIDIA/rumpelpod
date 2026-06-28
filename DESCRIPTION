@@ -4,5 +4,5 @@ Fix the devcontainer Podman socket permissions so the non-root test user
 can reach the rootful API service.
 
 Fix re-entry so an existing pod uses its stored host before resolving
-the current repo config, normalize Podman's default runc runtime flag,
-and clean up leftover Podman test containers after failed xtest cases.
+the current repo config, warn and ignore Podman runtime runArgs, and
+clean up leftover Podman test containers after failed xtest cases.

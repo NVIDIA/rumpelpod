@@ -33,9 +33,9 @@ pub struct PodSpec {
     pub seccomp_unconfined: bool,
     pub apparmor_unconfined: bool,
     pub resources: Option<Resources>,
-    /// Runtime name.  `None` means the backend default (runc); callers
-    /// should pass `None` rather than `Some("runc")`.  Translates to
-    /// docker's `--runtime` and k8s's `runtimeClassName`.
+    /// Runtime name.  `None` means the backend default.  Translates to
+    /// docker's `--runtime` and k8s's `runtimeClassName`.  Podman uses
+    /// containers.conf for runtime selection instead of this field.
     pub runtime: Option<String>,
     pub docker_only: DockerOnly,
     pub k8s_only: K8sOnly,

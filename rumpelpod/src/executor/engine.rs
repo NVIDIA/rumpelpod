@@ -722,11 +722,7 @@ fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<(
             ContainerEngine::Docker => {
                 command.args(["--runtime", &runtime]);
             }
-            ContainerEngine::Podman => {
-                if runtime != "runc" {
-                    command.args(["--runtime", &runtime]);
-                }
-            }
+            ContainerEngine::Podman => {}
             ContainerEngine::Auto => {
                 panic!("container engine auto remained after resolve")
             }

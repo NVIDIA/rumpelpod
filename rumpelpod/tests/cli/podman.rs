@@ -59,4 +59,28 @@ fn podman_auto_fallback_and_explicit_engine_smoke() {
         .success()
         .expect("rumpel enter with explicit Podman engine failed");
     assert_eq!(last_stdout_line(&stdout), "explicit");
+
+    write_test_devcontainer(&repo, "", r#","runArgs": ["--runtime=runc"]"#);
+    let output = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "podman-runtime",
+            "--",
+            "echo",
+            "runtime",
+        ])
+        .output()
+        .expect("failed to run rumpel enter");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rumpel enter should ignore Podman's unsupported --runtime runArg.\nstderr: {stderr}"
+    );
+    assert_eq!(last_stdout_line(&output.stdout), "runtime");
+    assert!(
+        stderr.contains("warning: --runtime in runArgs is ignored by Podman"),
+        "client stderr should warn that Podman ignores --runtime.\nstderr: {stderr}"
+    );
 }

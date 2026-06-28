@@ -1108,9 +1108,11 @@ fn build_docker_pod_spec(
     image: &Image,
     repo_path: &Path,
     container_repo_path: &Path,
+    container_engine: ContainerEngine,
     dc: &DevContainer,
     mounts: &[devcontainer::MountObject],
     publish_ports: &HashMap<u16, u16>,
+    progress_tx: &std::sync::mpsc::Sender<OutputLine>,
 ) -> Result<crate::executor::PodSpec> {
     use crate::executor::{DockerOnly, K8sOnly, Mount, PodSpec};
 
@@ -1164,6 +1166,25 @@ fn build_docker_pod_spec(
 
     let init = dc.init == Some(true) || run_args_config.init;
 
+    let runtime = match container_engine {
+        ContainerEngine::Docker => run_args_config.runtime,
+        ContainerEngine::Podman => {
+            if run_args_config.runtime.is_some() {
+                progress_tx
+                    .send(OutputLine::Stderr(
+                        "warning: --runtime in runArgs is ignored by Podman; \
+                         configure the OCI runtime in containers.conf instead"
+                            .into(),
+                    ))
+                    .ok();
+            }
+            None
+        }
+        ContainerEngine::Auto => {
+            panic!("container engine auto remained after resolve")
+        }
+    };
+
     Ok(PodSpec {
         image: image.0.clone(),
         hostname: crate::executor::Hostname::new(sanitize_hostname(&pod_name.0))
@@ -1182,7 +1203,7 @@ fn build_docker_pod_spec(
         seccomp_unconfined: false,
         apparmor_unconfined: false,
         resources: None,
-        runtime: run_args_config.runtime,
+        runtime,
         docker_only: DockerOnly {
             init,
             devices: run_args_config.devices,
@@ -2960,9 +2981,13 @@ impl DaemonServer {
                 &image,
                 &repo_path,
                 &container_repo_path,
+                docker_host
+                    .container_engine()
+                    .expect("kubernetes hosts are handled before docker launch"),
                 &devcontainer,
                 &mounts,
                 &publish_ports,
+                &progress_tx,
             )?;
             executor.launch(&exec_pod_id, spec)?;
             let container_id = ContainerId(exec_pod_id.as_str().to_string());
