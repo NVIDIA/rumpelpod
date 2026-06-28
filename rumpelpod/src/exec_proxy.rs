@@ -36,8 +36,8 @@ impl ExecProxyHandle {
 /// Start a local TCP listener that proxies each accepted connection
 /// through an exec of `rumpel tcp-proxy` inside the pod.
 ///
-/// Works on both backends: the `Executor` picks between bollard exec
-/// (docker) and a kubectl subprocess (k8s).
+/// Works on both backends: the `Executor` picks between docker and
+/// kubectl subprocesses.
 pub async fn start_exec_proxy(
     executor: Executor,
     pod_id: PodId,

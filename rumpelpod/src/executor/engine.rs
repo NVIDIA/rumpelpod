@@ -9,9 +9,12 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::{Context, Result};
-use bollard::Docker;
+use serde::Deserialize;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command as TokioCommand;
 
 use crate::async_runtime::block_on;
 use crate::config::Host;
@@ -19,6 +22,7 @@ use crate::daemon::default_docker_socket;
 use crate::daemon::host_connection::HostConnection;
 use crate::daemon::protocol::PodStatus;
 use crate::k8s::K8sClient;
+use crate::CommandExt;
 
 use super::spec::MountType;
 use super::{
@@ -39,9 +43,6 @@ enum Inner {
 
 #[derive(Clone)]
 struct DockerBackend {
-    docker: Docker,
-    /// Docker CLI target used for interactive TTY attach, where the
-    /// native CLI handles terminal wiring more reliably than bollard.
     cli_target: DockerCliTarget,
 }
 
@@ -61,7 +62,6 @@ impl Executor {
     pub fn docker(socket: &std::path::Path) -> Result<Self> {
         Ok(Self {
             inner: Inner::Docker(DockerBackend {
-                docker: open_docker(socket)?,
                 cli_target: DockerCliTarget::UnixSocket(socket.to_path_buf()),
             }),
         })
@@ -72,7 +72,6 @@ impl Executor {
         let uri = format!("ssh://{ssh_destination}");
         Ok(Self {
             inner: Inner::Docker(DockerBackend {
-                docker: open_docker_ssh(&uri)?,
                 cli_target: DockerCliTarget::Ssh { uri },
             }),
         })
@@ -127,7 +126,7 @@ impl Executor {
     ///
     /// On kubernetes this polls for the `Running` phase, surfacing
     /// container-level errors (e.g. ImagePullBackOff).  On docker,
-    /// `start_container` is synchronous and no wait is needed.
+    /// `docker start` is synchronous and no wait is needed.
     pub fn launch(&self, id: &PodId, spec: PodSpec) -> Result<()> {
         match &self.inner {
             Inner::Docker(d) => {
@@ -136,7 +135,7 @@ impl Executor {
                         "k8s-only spec fields (node_selector/tolerations) set on a docker launch"
                     );
                 }
-                docker_launch(&d.docker, id, spec)
+                docker_launch(d, id, spec)
             }
             Inner::Kubernetes(k) => {
                 if !spec.docker_only.is_empty() {
@@ -153,7 +152,7 @@ impl Executor {
     /// Remove a pod.  Idempotent: succeeds if the pod is already gone.
     pub fn delete(&self, id: &PodId) -> Result<()> {
         match &self.inner {
-            Inner::Docker(d) => docker_delete(&d.docker, id),
+            Inner::Docker(d) => docker_delete(d, id),
             Inner::Kubernetes(k) => k.client.delete_pod(id.as_str()),
         }
     }
@@ -162,7 +161,7 @@ impl Executor {
     /// exists on the backend.
     pub fn status(&self, id: &PodId) -> Result<PodStatus> {
         match &self.inner {
-            Inner::Docker(d) => docker_status(&d.docker, id),
+            Inner::Docker(d) => docker_status(d, id),
             Inner::Kubernetes(k) => k.client.get_pod_status(id.as_str()),
         }
     }
@@ -178,7 +177,7 @@ impl Executor {
     /// so the call doesn't re-enter the shared runtime.
     pub async fn exec_async(&self, id: &PodId, req: ExecRequest) -> Result<ExecOutput> {
         match &self.inner {
-            Inner::Docker(d) => docker_exec(&d.docker, id, req).await,
+            Inner::Docker(d) => docker_exec(d, id, req).await,
             Inner::Kubernetes(k) => k8s_exec(k, id, req).await,
         }
     }
@@ -190,7 +189,7 @@ impl Executor {
     /// means stdin/stdout/stderr are all discarded.
     pub fn exec_detached(&self, id: &PodId, req: ExecRequest) -> Result<()> {
         match &self.inner {
-            Inner::Docker(d) => docker_exec_detached(&d.docker, id, req),
+            Inner::Docker(d) => docker_exec_detached(d, id, req),
             Inner::Kubernetes(k) => k8s_exec_detached(k, id, req),
         }
     }
@@ -200,7 +199,7 @@ impl Executor {
     /// is dropped.
     pub async fn exec_streaming(&self, id: &PodId, cmd: Vec<String>) -> Result<ExecStreams> {
         match &self.inner {
-            Inner::Docker(d) => docker_exec_streaming(&d.docker, id, cmd).await,
+            Inner::Docker(d) => docker_exec_streaming(d, id, cmd).await,
             Inner::Kubernetes(k) => k8s_exec_streaming(k, id, cmd).await,
         }
     }
@@ -210,7 +209,7 @@ impl Executor {
     /// a k8s pod is to delete it.
     pub fn stop(&self, id: &PodId) -> Result<()> {
         match &self.inner {
-            Inner::Docker(d) => docker_stop(&d.docker, id),
+            Inner::Docker(d) => docker_stop(d, id),
             Inner::Kubernetes(_) => {
                 anyhow::bail!("stop not supported on kubernetes, delete the pod instead")
             }
@@ -221,7 +220,7 @@ impl Executor {
     /// reason as `stop`.
     pub fn start(&self, id: &PodId) -> Result<()> {
         match &self.inner {
-            Inner::Docker(d) => docker_start(&d.docker, id),
+            Inner::Docker(d) => docker_start(d, id),
             Inner::Kubernetes(_) => {
                 anyhow::bail!("start not supported on kubernetes, launch a new pod instead")
             }
@@ -237,17 +236,15 @@ impl Executor {
     /// pod start.
     pub fn image_present(&self, image: &str) -> Result<bool> {
         match &self.inner {
-            Inner::Docker(d) => docker_image_present(&d.docker, image),
+            Inner::Docker(d) => docker_image_present(d, image),
             Inner::Kubernetes(_) => Ok(true),
         }
     }
 
     /// Interactive exec that inherits the caller's stdio.
     ///
-    /// Shells out to `docker` or `kubectl` rather than going through
-    /// bollard/kube-rs: attaching a TTY from a library requires wiring
-    /// up PTY handling for stdin/stdout, which the native CLIs do for
-    /// us.  Blocks until the remote process exits.
+    /// Shells out to `docker` or `kubectl` because native CLIs handle
+    /// TTY wiring for stdin/stdout.  Blocks until the remote process exits.
     ///
     /// `opts.user_root` is docker-only; kubernetes has no analogue and
     /// silently ignores it (matching how `Executor::exec` handles
@@ -273,7 +270,7 @@ impl Executor {
     /// skipped rather than reported as unnamed.
     pub fn list_by_repo(&self, repo_path: &Path) -> Result<HashMap<String, PodBackendInfo>> {
         match &self.inner {
-            Inner::Docker(d) => docker_list_by_repo(&d.docker, repo_path),
+            Inner::Docker(d) => docker_list_by_repo(d, repo_path),
             Inner::Kubernetes(k) => k8s_list_by_repo(k, repo_path),
         }
     }
@@ -285,7 +282,7 @@ pub struct PodBackendInfo {
     pub status: PodStatus,
     /// Backend's identifier for the pod: docker container id on docker,
     /// pod name on kubernetes.  Used when callers shell out to
-    /// `docker`/`kubectl` (e.g. interactive `docker exec`/`kubectl exec`).
+    /// `docker`/`kubectl` (e.g. interactive exec).
     pub container_id: String,
 }
 
@@ -300,126 +297,181 @@ pub struct ExecInteractiveOptions {
     pub user_root: bool,
 }
 
-fn open_docker(socket: &std::path::Path) -> Result<Docker> {
-    Docker::connect_with_socket(
-        socket.to_string_lossy().as_ref(),
-        120,
-        bollard::API_DEFAULT_VERSION,
-    )
-    .context("connecting to docker daemon")
-}
+impl DockerBackend {
+    fn command(&self) -> Command {
+        let mut command = Command::new("docker");
+        self.apply_target(&mut command);
+        command
+    }
 
-fn open_docker_ssh(uri: &str) -> Result<Docker> {
-    Docker::connect_with_ssh(uri, 120, bollard::API_DEFAULT_VERSION, None)
-        .context("connecting to docker daemon over ssh")
-}
+    fn tokio_command(&self) -> TokioCommand {
+        let mut command = TokioCommand::new("docker");
+        self.apply_tokio_target(&mut command);
+        command
+    }
 
-fn docker_delete(docker: &Docker, id: &PodId) -> Result<()> {
-    use bollard::errors::Error as BollardError;
-    use bollard::query_parameters::{RemoveContainerOptions, StopContainerOptions};
+    fn apply_target(&self, command: &mut Command) {
+        match &self.cli_target {
+            DockerCliTarget::UnixSocket(socket) => {
+                let socket = socket.display().to_string();
+                command.args(["-H", &format!("unix://{socket}")]);
+            }
+            DockerCliTarget::Ssh { uri } => {
+                command.args(["-H", uri]);
+            }
+        }
+    }
 
-    // Containers typically run `sleep infinity` which won't handle
-    // SIGTERM gracefully, so SIGKILL immediately (`t: 0`).  Errors
-    // from stop are ignored -- the following remove(force=true) will
-    // kill the container if it's still running.
-    let stop_options = StopContainerOptions {
-        t: Some(0),
-        ..Default::default()
-    };
-    let _ = block_on(docker.stop_container(id.as_str(), Some(stop_options)));
-
-    let remove_options = RemoveContainerOptions {
-        force: true,
-        ..Default::default()
-    };
-    match block_on(docker.remove_container(id.as_str(), Some(remove_options))) {
-        Ok(()) => Ok(()),
-        Err(BollardError::DockerResponseServerError {
-            status_code: 404, ..
-        }) => Ok(()),
-        Err(e) => Err(anyhow::anyhow!("docker rm failed: {e}")),
+    fn apply_tokio_target(&self, command: &mut TokioCommand) {
+        match &self.cli_target {
+            DockerCliTarget::UnixSocket(socket) => {
+                let socket = socket.display().to_string();
+                command.args(["-H", &format!("unix://{socket}")]);
+            }
+            DockerCliTarget::Ssh { uri } => {
+                command.args(["-H", uri]);
+            }
+        }
     }
 }
 
-fn docker_status(docker: &Docker, id: &PodId) -> Result<PodStatus> {
-    use bollard::errors::Error as BollardError;
+#[derive(Deserialize)]
+struct DockerContainerInspect {
+    #[serde(rename = "Id")]
+    id: Option<String>,
+    #[serde(rename = "Config")]
+    config: Option<DockerContainerConfig>,
+    #[serde(rename = "State")]
+    state: Option<DockerContainerState>,
+}
 
-    match block_on(docker.inspect_container(id.as_str(), None)) {
-        Ok(response) => {
-            let state = response.state.context("missing container state")?;
-            let running = state.running.unwrap_or(false);
-            Ok(if running {
-                PodStatus::Running
-            } else {
-                PodStatus::Stopped
-            })
+#[derive(Deserialize)]
+struct DockerContainerConfig {
+    #[serde(rename = "Labels")]
+    labels: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+struct DockerContainerState {
+    #[serde(rename = "Running")]
+    running: Option<bool>,
+}
+
+fn docker_not_found(output: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    stderr.contains("no such container")
+        || stderr.contains("no such image")
+        || stderr.contains("no such object")
+        || stderr.contains("not found")
+}
+
+fn docker_stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).trim().to_string()
+}
+
+fn docker_inspect_container(
+    backend: &DockerBackend,
+    id: &PodId,
+) -> Result<Option<DockerContainerInspect>> {
+    let mut command = backend.command();
+    let output = command
+        .args(["container", "inspect", id.as_str()])
+        .output()
+        .context("running docker container inspect")?;
+    if !output.status.success() {
+        if docker_not_found(&output) {
+            return Ok(None);
         }
-        Err(BollardError::DockerResponseServerError {
-            status_code: 404, ..
-        }) => Ok(PodStatus::Gone),
-        Err(e) => Err(anyhow::anyhow!("docker inspect failed: {e}")),
+        let stderr = docker_stderr(&output);
+        return Err(anyhow::anyhow!("docker container inspect failed: {stderr}"));
+    }
+
+    let mut containers: Vec<DockerContainerInspect> =
+        serde_json::from_slice(&output.stdout).context("parsing docker container inspect")?;
+    if containers.is_empty() {
+        return Err(anyhow::anyhow!(
+            "docker container inspect succeeded without returning a container"
+        ));
+    }
+    Ok(Some(containers.remove(0)))
+}
+
+fn docker_exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+fn docker_delete(backend: &DockerBackend, id: &PodId) -> Result<()> {
+    let mut command = backend.command();
+    let output = command
+        .args(["rm", "-f", id.as_str()])
+        .output()
+        .context("running docker rm")?;
+    if output.status.success() || docker_not_found(&output) {
+        return Ok(());
+    }
+    let stderr = docker_stderr(&output);
+    Err(anyhow::anyhow!("docker rm failed: {stderr}"))
+}
+
+fn docker_status(backend: &DockerBackend, id: &PodId) -> Result<PodStatus> {
+    let Some(container) = docker_inspect_container(backend, id)? else {
+        return Ok(PodStatus::Gone);
+    };
+    let state = container
+        .state
+        .context("docker container inspect response missing State")?;
+    let running = state.running.unwrap_or(false);
+    if running {
+        Ok(PodStatus::Running)
+    } else {
+        Ok(PodStatus::Stopped)
     }
 }
 
-async fn docker_exec(docker: &Docker, id: &PodId, req: ExecRequest) -> Result<ExecOutput> {
-    use bollard::container::LogOutput;
-    use bollard::exec::StartExecResults;
-    use bollard::models::ExecConfig;
-    use tokio::io::AsyncWriteExt;
-    use tokio_stream::StreamExt;
+async fn docker_exec(backend: &DockerBackend, id: &PodId, req: ExecRequest) -> Result<ExecOutput> {
+    let mut command = backend.tokio_command();
+    command.arg("exec");
+    if req.stdin.is_some() {
+        command.arg("-i");
+    }
+    if let Some(workdir) = req.workdir.as_ref() {
+        command.args(["--workdir", workdir]);
+    }
+    for (key, value) in &req.env {
+        command.arg("--env");
+        command.arg(format!("{key}={value}"));
+    }
+    command.arg(id.as_str());
+    command.args(&req.cmd);
+    if req.stdin.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
 
-    let env: Vec<String> = req.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let config = ExecConfig {
-        attach_stdin: Some(req.stdin.is_some()),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        cmd: Some(req.cmd),
-        working_dir: req.workdir,
-        env: if env.is_empty() { None } else { Some(env) },
-        ..Default::default()
-    };
+    let mut child = command.spawn().context("spawning docker exec")?;
+    if let Some(data) = req.stdin {
+        let mut stdin = child.stdin.take().context("docker exec stdin missing")?;
+        stdin
+            .write_all(&data)
+            .await
+            .context("writing docker exec stdin")?;
+        stdin
+            .shutdown()
+            .await
+            .context("closing docker exec stdin")?;
+    }
 
-    let exec = docker
-        .create_exec(id.as_str(), config)
+    let output = child
+        .wait_with_output()
         .await
-        .context("creating exec")?;
-
-    let start_result = docker
-        .start_exec(&exec.id, None)
-        .await
-        .context("starting exec")?;
-    let (stdout, stderr) = match start_result {
-        StartExecResults::Attached { mut output, input } => {
-            if let Some(data) = req.stdin.as_ref() {
-                let mut input = input;
-                input.write_all(data).await.context("writing exec stdin")?;
-                input.shutdown().await.context("closing exec stdin")?;
-            }
-            let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            while let Some(chunk) = output.next().await {
-                match chunk.context("reading exec output")? {
-                    LogOutput::StdOut { message } => stdout.extend_from_slice(&message),
-                    LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
-                    LogOutput::Console { message } => stdout.extend_from_slice(&message),
-                    LogOutput::StdIn { .. } => {}
-                }
-            }
-            (stdout, stderr)
-        }
-        StartExecResults::Detached => (Vec::new(), Vec::new()),
-    };
-
-    let inspect = docker
-        .inspect_exec(&exec.id)
-        .await
-        .context("inspecting exec")?;
-    let exit_code = inspect.exit_code.unwrap_or(0) as i32;
-
+        .context("waiting for docker exec")?;
     Ok(ExecOutput {
-        stdout,
-        stderr,
-        exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: docker_exit_code(output.status),
     })
 }
 
@@ -491,80 +543,30 @@ async fn k8s_exec(backend: &K8sBackend, id: &PodId, req: ExecRequest) -> Result<
 }
 
 async fn docker_exec_streaming(
-    docker: &Docker,
+    backend: &DockerBackend,
     id: &PodId,
     cmd: Vec<String>,
 ) -> Result<ExecStreams> {
-    use bollard::container::LogOutput;
-    use bollard::exec::StartExecResults;
-    use bollard::models::ExecConfig;
-    use tokio::io::AsyncWriteExt;
-    use tokio_stream::StreamExt;
+    let mut command = backend.tokio_command();
+    command.arg("exec");
+    command.arg("-i");
+    command.arg(id.as_str());
+    command.args(cmd);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
 
-    let config = ExecConfig {
-        attach_stdin: Some(true),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        cmd: Some(cmd),
-        ..Default::default()
-    };
-
-    let exec = docker
-        .create_exec(id.as_str(), config)
-        .await
-        .context("creating streaming exec")?;
-    let (output, input) = match docker
-        .start_exec(&exec.id, None)
-        .await
-        .context("starting streaming exec")?
-    {
-        StartExecResults::Attached { output, input } => (output, input),
-        StartExecResults::Detached => {
-            return Err(anyhow::anyhow!("streaming exec started in detached mode"))
-        }
-    };
-
-    // Docker's exec output is multiplexed: a single stream carries
-    // interleaved StdOut/StdErr chunks.  Split it into two independent
-    // AsyncReads via duplex pipes so callers can treat stdout and
-    // stderr like they would on a normal subprocess.
-    let (stdout_tx, stdout_rx) = tokio::io::duplex(64 * 1024);
-    let (stderr_tx, stderr_rx) = tokio::io::duplex(64 * 1024);
-
-    let demux_handle = tokio::spawn(async move {
-        let mut output = output;
-        let mut stdout_tx = stdout_tx;
-        let mut stderr_tx = stderr_tx;
-        while let Some(chunk) = output.next().await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    log::debug!("exec_streaming demux: output error: {e}");
-                    break;
-                }
-            };
-            let res = match chunk {
-                LogOutput::StdOut { message } | LogOutput::Console { message } => {
-                    stdout_tx.write_all(&message).await
-                }
-                LogOutput::StdErr { message } => stderr_tx.write_all(&message).await,
-                LogOutput::StdIn { .. } => Ok(()),
-            };
-            if res.is_err() {
-                break;
-            }
-        }
-    });
+    let mut child = command.spawn().context("spawning streaming docker exec")?;
+    let stdin = child.stdin.take().context("taking docker exec stdin")?;
+    let stdout = child.stdout.take().context("taking docker exec stdout")?;
+    let stderr = child.stderr.take().context("taking docker exec stderr")?;
 
     Ok(ExecStreams {
-        stdin: Box::new(input),
-        stdout: Box::new(stdout_rx),
-        stderr: Box::new(stderr_rx),
-        // Holding the JoinHandle is enough: the demux task stays
-        // scheduled until bollard's output stream ends (which happens
-        // when the remote process exits, typically triggered by the
-        // caller dropping stdin).
-        keepalive: Box::new(demux_handle),
+        stdin: Box::new(stdin),
+        stdout: Box::new(stdout),
+        stderr: Box::new(stderr),
+        keepalive: Box::new(child),
     })
 }
 
@@ -603,13 +605,7 @@ async fn k8s_exec_streaming(
     })
 }
 
-fn docker_launch(docker: &Docker, id: &PodId, spec: PodSpec) -> Result<()> {
-    use bollard::models::{
-        ContainerCreateBody, HostConfig, Mount as BollardMount, MountType as BollardMountType,
-        PortBinding,
-    };
-    use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
-
+fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<()> {
     let PodSpec {
         image,
         hostname,
@@ -628,44 +624,7 @@ fn docker_launch(docker: &Docker, id: &PodId, spec: PodSpec) -> Result<()> {
         k8s_only: _,
     } = spec;
 
-    let env_list: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-
-    let bollard_mounts: Vec<BollardMount> = mounts
-        .into_iter()
-        .map(|m| {
-            let typ = match m.mount_type {
-                MountType::Bind => BollardMountType::BIND,
-                MountType::Volume => BollardMountType::VOLUME,
-                MountType::Tmpfs => BollardMountType::TMPFS,
-            };
-            BollardMount {
-                target: Some(m.target),
-                source: m.source,
-                typ: Some(typ),
-                read_only: Some(m.read_only),
-                ..Default::default()
-            }
-        })
-        .collect();
-
-    let devices = if docker_only.devices.is_empty() {
-        None
-    } else {
-        Some(
-            docker_only
-                .devices
-                .iter()
-                .map(|d| parse_device_mapping(d))
-                .collect(),
-        )
-    };
-
     let mut security_opt = docker_only.security_opt.clone();
-    // `seccomp_unconfined` / `apparmor_unconfined` are the semantic
-    // form.  Docker's API takes raw --security-opt strings, so
-    // re-materialize them here for the docker path.  Callers
-    // wanting raw opts not captured by the semantic booleans put
-    // them on docker_only.security_opt and they flow through.
     if seccomp_unconfined {
         security_opt.push("seccomp=unconfined".into());
     }
@@ -673,105 +632,77 @@ fn docker_launch(docker: &Docker, id: &PodId, spec: PodSpec) -> Result<()> {
         security_opt.push("apparmor=unconfined".into());
     }
 
-    let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = docker_only
-        .port_bindings
-        .iter()
-        .map(|(&container_port, &host_port)| {
-            let key = format!("{container_port}/tcp");
-            let binding = PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some(host_port.to_string()),
-            };
-            (key, Some(vec![binding]))
-        })
-        .collect();
+    let mut command = backend.command();
+    command.arg("create");
+    command.args(["--name", id.as_str()]);
+    command.args(["--hostname", hostname.as_str()]);
+    command.args([
+        "--network",
+        docker_only.network.as_deref().unwrap_or("bridge"),
+    ]);
+    if let Some(runtime) = runtime {
+        command.args(["--runtime", &runtime]);
+    }
+    if privileged {
+        command.arg("--privileged");
+    }
+    if docker_only.init {
+        command.arg("--init");
+    }
+    for cap in cap_add {
+        command.arg("--cap-add");
+        command.arg(cap);
+    }
+    for security_opt in security_opt {
+        command.arg("--security-opt");
+        command.arg(security_opt);
+    }
+    for device in docker_only.devices {
+        command.arg("--device");
+        command.arg(device);
+    }
+    for (container_port, host_port) in docker_only.port_bindings {
+        command.arg("--publish");
+        command.arg(format!("127.0.0.1:{host_port}:{container_port}/tcp"));
+    }
+    for mount in mounts {
+        command.arg("--mount");
+        command.arg(docker_mount_arg(mount));
+    }
+    for (key, value) in labels {
+        command.arg("--label");
+        command.arg(format!("{key}={value}"));
+    }
+    for (key, value) in env {
+        command.arg("--env");
+        command.arg(format!("{key}={value}"));
+    }
+    command.arg(image);
+    if let Some(cmd) = cmd {
+        command.args(cmd);
+    }
 
-    let cap_add = if cap_add.is_empty() {
-        None
-    } else {
-        Some(cap_add)
-    };
-    let security_opt = if security_opt.is_empty() {
-        None
-    } else {
-        Some(security_opt)
-    };
-
-    let host_config = HostConfig {
-        runtime,
-        network_mode: Some(docker_only.network.unwrap_or_else(|| "bridge".to_string())),
-        privileged: if privileged { Some(true) } else { None },
-        init: if docker_only.init { Some(true) } else { None },
-        cap_add,
-        security_opt,
-        devices,
-        mounts: if bollard_mounts.is_empty() {
-            None
-        } else {
-            Some(bollard_mounts)
-        },
-        port_bindings: if port_bindings.is_empty() {
-            None
-        } else {
-            Some(port_bindings)
-        },
-        ..Default::default()
-    };
-
-    let exposed_ports: Option<Vec<String>> = if docker_only.port_bindings.is_empty() {
-        None
-    } else {
-        Some(
-            docker_only
-                .port_bindings
-                .keys()
-                .map(|port| format!("{port}/tcp"))
-                .collect(),
-        )
-    };
-
-    let config = ContainerCreateBody {
-        image: Some(image),
-        hostname: Some(hostname.as_str().to_string()),
-        labels: Some(labels.into_iter().collect()),
-        env: if env_list.is_empty() {
-            None
-        } else {
-            Some(env_list)
-        },
-        cmd,
-        host_config: Some(host_config),
-        exposed_ports,
-        ..Default::default()
-    };
-
-    let options = CreateContainerOptions {
-        name: Some(id.as_str().to_string()),
-        ..Default::default()
-    };
-
-    let response =
-        block_on(docker.create_container(Some(options), config)).context("creating container")?;
-    block_on(docker.start_container(&response.id, None::<StartContainerOptions>))
-        .context("starting container")?;
+    command.success().context("creating container")?;
+    docker_start(backend, id).context("starting container")?;
     Ok(())
 }
 
-fn parse_device_mapping(s: &str) -> bollard::models::DeviceMapping {
-    // Formats: host (implies container=host, perms=rwm),
-    // host:container, host:container:cgroup_permissions.
-    let parts: Vec<&str> = s.split(':').collect();
-    let (host, container, perms) = match parts.as_slice() {
-        [h] => (*h, *h, "rwm"),
-        [h, c] => (*h, *c, "rwm"),
-        [h, c, p] => (*h, *c, *p),
-        _ => (parts[0], parts[1], parts[2]),
+fn docker_mount_arg(mount: super::Mount) -> String {
+    let typ = match mount.mount_type {
+        MountType::Bind => "bind",
+        MountType::Volume => "volume",
+        MountType::Tmpfs => "tmpfs",
     };
-    bollard::models::DeviceMapping {
-        path_on_host: Some(host.to_string()),
-        path_in_container: Some(container.to_string()),
-        cgroup_permissions: Some(perms.to_string()),
+
+    let mut parts = vec![format!("type={typ}")];
+    if let Some(source) = mount.source {
+        parts.push(format!("source={source}"));
     }
+    parts.push(format!("target={}", mount.target));
+    if mount.read_only {
+        parts.push("readonly".to_string());
+    }
+    parts.join(",")
 }
 
 fn k8s_launch(backend: &K8sBackend, id: &PodId, spec: PodSpec) -> Result<()> {
@@ -846,28 +777,25 @@ fn k8s_launch(backend: &K8sBackend, id: &PodId, spec: PodSpec) -> Result<()> {
     Ok(())
 }
 
-fn docker_exec_detached(docker: &Docker, id: &PodId, req: ExecRequest) -> Result<()> {
-    use bollard::exec::StartExecOptions;
-    use bollard::models::ExecConfig;
+fn docker_exec_detached(backend: &DockerBackend, id: &PodId, req: ExecRequest) -> Result<()> {
+    if req.stdin.is_some() {
+        return Err(anyhow::anyhow!(
+            "executor::exec_detached does not support stdin on docker"
+        ));
+    }
 
-    let env: Vec<String> = req.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let config = ExecConfig {
-        cmd: Some(req.cmd),
-        working_dir: req.workdir,
-        env: if env.is_empty() { None } else { Some(env) },
-        ..Default::default()
-    };
-
-    let exec =
-        block_on(docker.create_exec(id.as_str(), config)).context("creating detached exec")?;
-    block_on(docker.start_exec(
-        &exec.id,
-        Some(StartExecOptions {
-            detach: true,
-            ..Default::default()
-        }),
-    ))
-    .context("starting detached exec")?;
+    let mut command = backend.command();
+    command.args(["exec", "-d"]);
+    if let Some(workdir) = req.workdir.as_ref() {
+        command.args(["--workdir", workdir]);
+    }
+    for (key, value) in &req.env {
+        command.arg("--env");
+        command.arg(format!("{key}={value}"));
+    }
+    command.arg(id.as_str());
+    command.args(req.cmd);
+    command.success().context("starting detached docker exec")?;
     Ok(())
 }
 
@@ -907,32 +835,24 @@ fn k8s_exec_detached(backend: &K8sBackend, id: &PodId, req: ExecRequest) -> Resu
     Ok(())
 }
 
-fn docker_stop(docker: &Docker, id: &PodId) -> Result<()> {
-    use bollard::errors::Error as BollardError;
-    use bollard::query_parameters::StopContainerOptions;
-
-    let stop_options = StopContainerOptions {
-        t: Some(0),
-        ..Default::default()
-    };
-    match block_on(docker.stop_container(id.as_str(), Some(stop_options))) {
-        Ok(()) => Ok(()),
-        // 304: already stopped.  404: already gone.  Both are
-        // success from the caller's perspective.
-        Err(BollardError::DockerResponseServerError {
-            status_code: 304, ..
-        })
-        | Err(BollardError::DockerResponseServerError {
-            status_code: 404, ..
-        }) => Ok(()),
-        Err(e) => Err(anyhow::anyhow!("docker stop failed: {e}")),
+fn docker_stop(backend: &DockerBackend, id: &PodId) -> Result<()> {
+    let mut command = backend.command();
+    let output = command
+        .args(["stop", "--time", "0", id.as_str()])
+        .output()
+        .context("running docker stop")?;
+    if output.status.success() || docker_not_found(&output) {
+        return Ok(());
     }
+    let stderr = docker_stderr(&output);
+    Err(anyhow::anyhow!("docker stop failed: {stderr}"))
 }
 
-fn docker_start(docker: &Docker, id: &PodId) -> Result<()> {
-    use bollard::query_parameters::StartContainerOptions;
-
-    block_on(docker.start_container(id.as_str(), None::<StartContainerOptions>))
+fn docker_start(backend: &DockerBackend, id: &PodId) -> Result<()> {
+    let mut command = backend.command();
+    command
+        .args(["start", id.as_str()])
+        .success()
         .context("starting container")?;
     Ok(())
 }
@@ -943,21 +863,9 @@ fn docker_exec_interactive(
     cmd: &[String],
     opts: ExecInteractiveOptions,
 ) -> Result<std::process::ExitStatus> {
-    use std::process::Command;
-
     // `docker exec` treats `--` as a literal argument, so the command
     // follows the container id directly, unlike kubectl.
-    let mut c = Command::new("docker");
-    match &backend.cli_target {
-        DockerCliTarget::UnixSocket(socket) => {
-            let socket = socket.display().to_string();
-            let docker_host_arg = format!("unix://{socket}");
-            c.args(["-H", &docker_host_arg]);
-        }
-        DockerCliTarget::Ssh { uri } => {
-            c.args(["-H", uri]);
-        }
-    }
+    let mut c = backend.command();
     c.arg("exec");
     if opts.user_root {
         c.args(["--user", "root"]);
@@ -977,8 +885,6 @@ fn k8s_exec_interactive(
     cmd: &[String],
     opts: ExecInteractiveOptions,
 ) -> Result<std::process::ExitStatus> {
-    use std::process::Command;
-
     // user_root is ignored: kubectl exec has no --user override, so
     // the session always enters as the image USER.
     let _ = opts.user_root;
@@ -998,49 +904,73 @@ fn k8s_exec_interactive(
     c.status().context("spawning kubectl exec")
 }
 
-fn docker_image_present(docker: &Docker, image: &str) -> Result<bool> {
-    use bollard::errors::Error as BollardError;
-    match block_on(docker.inspect_image(image)) {
-        Ok(_) => Ok(true),
-        Err(BollardError::DockerResponseServerError {
-            status_code: 404, ..
-        }) => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("docker inspect image failed: {e}")),
+fn docker_image_present(backend: &DockerBackend, image: &str) -> Result<bool> {
+    let mut command = backend.command();
+    let output = command
+        .args(["image", "inspect", image])
+        .output()
+        .context("running docker image inspect")?;
+    if output.status.success() {
+        Ok(true)
+    } else if docker_not_found(&output) {
+        Ok(false)
+    } else {
+        let stderr = docker_stderr(&output);
+        Err(anyhow::anyhow!("docker image inspect failed: {stderr}"))
     }
 }
 
 fn docker_list_by_repo(
-    docker: &Docker,
+    backend: &DockerBackend,
     repo_path: &Path,
 ) -> Result<HashMap<String, PodBackendInfo>> {
-    use bollard::models::ContainerSummaryStateEnum;
-    use bollard::query_parameters::ListContainersOptions;
+    let label_filter = format!("{LABEL_DOCKER_REPO_PATH}={}", repo_path.display());
+    let mut list = backend.command();
+    let stdout = list
+        .args(["container", "ls", "--all", "--quiet", "--filter"])
+        .arg(format!("label={label_filter}"))
+        .success()
+        .context("listing containers")?;
 
-    let mut filters = HashMap::new();
-    filters.insert(
-        "label".to_string(),
-        vec![format!("{LABEL_DOCKER_REPO_PATH}={}", repo_path.display())],
-    );
-    let options = ListContainersOptions {
-        all: true,
-        filters: Some(filters),
-        ..Default::default()
-    };
-    let containers =
-        block_on(docker.list_containers(Some(options))).context("listing containers")?;
+    let ids: Vec<String> = String::from_utf8_lossy(&stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut inspect = backend.command();
+    let stdout = inspect
+        .args(["container", "inspect"])
+        .args(&ids)
+        .success()
+        .context("inspecting listed containers")?;
+    let containers: Vec<DockerContainerInspect> =
+        serde_json::from_slice(&stdout).context("parsing docker container inspect")?;
 
     let mut out = HashMap::new();
     for container in containers {
-        let labels = container.labels.unwrap_or_default();
+        let labels = container
+            .config
+            .and_then(|config| config.labels)
+            .unwrap_or_default();
         let pod_name = match labels.get(LABEL_DOCKER_POD_NAME) {
             Some(n) => n.clone(),
             None => continue,
         };
-        let status = match container.state {
-            Some(ContainerSummaryStateEnum::RUNNING) => PodStatus::Running,
-            _ => PodStatus::Stopped,
+        let state = container
+            .state
+            .context("docker container inspect response missing State")?;
+        let status = if state.running.unwrap_or(false) {
+            PodStatus::Running
+        } else {
+            PodStatus::Stopped
         };
-        let container_id = container.id.unwrap_or_default();
+        let container_id = container
+            .id
+            .context("docker container inspect response missing Id")?;
         out.insert(
             pod_name,
             PodBackendInfo {

@@ -5,8 +5,8 @@
 //!
 //! Hides whether pods run on Docker or Kubernetes behind a single
 //! `Executor` value.  Callers deal with logical names and a
-//! backend-agnostic launch spec; the executor owns the translation
-//! to bollard and kube-rs calls.
+//! backend-agnostic launch spec; the executor owns the backend
+//! translation.
 //!
 //! The name-mangling helpers live in this module (alongside the
 //! `PodId`/`Hostname` validity rules) rather than on `Executor`

@@ -55,7 +55,6 @@ cgi-service = ">= 0"
 rusqlite = { version = ">= 0", features = ["bundled", "chrono"] }
 socket2 = ">= 0"
 tower-service = ">= 0"
-bollard = { version = ">= 0", features = ["ssh"] }
 futures-core = ">= 0"
 futures-util = ">= 0"
 tokio-stream = ">= 0"

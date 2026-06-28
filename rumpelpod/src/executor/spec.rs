@@ -16,7 +16,7 @@ use crate::config::KubernetesToleration;
 use super::Hostname;
 
 /// Everything needed to create a pod.  The `Executor` decides how
-/// these fields map to bollard `ContainerCreateBody` / kube-rs `Pod`.
+/// these fields map to docker CLI arguments / kube-rs `Pod`.
 pub struct PodSpec {
     pub image: String,
     pub hostname: Hostname,
