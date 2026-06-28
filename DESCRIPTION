@@ -3,9 +3,14 @@ Fix pod sync with missing historical LFS
 Allow automatic pod-to-host pushes to continue when Git LFS cannot
 find old objects that were already absent from both the pod and host.
 
-This keeps pod branches syncing while still uploading LFS objects that
-are introduced by the pod before the Git ref moves, then skips Git LFS'
-whole-branch pre-push scan for that internal ref push. It adds
-regressions for a non-LFS pod commit on top of history with a missing
-old LFS payload, and for a new pod-created LFS pointer whose payload is
-missing locally.
+The workaround is limited to new destination refs. Git LFS sees those
+as an all-zero old value and scans the whole branch, even when the new
+pod ref is just another name for history already fetched from host/main
+or another pod. For that case, upload only LFS payloads outside fetched
+remote-tracking ancestors and skip the full-history pre-push scan for
+the ref update. Existing ref updates keep the normal Git LFS pre-push
+behavior.
+
+Add regressions for a non-LFS pod commit on top of history with a
+missing old LFS payload, and for a pod-created LFS pointer whose
+payload is missing locally.
