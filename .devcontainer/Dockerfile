@@ -41,11 +41,11 @@ RUN export DEBIAN_FRONTEND=noninteractive \
         unzip
 
 # Rootless Podman cannot create its user namespace under this outer sandbox.
-# Use Podman's rootful API service. The devcontainer mounts a dedicated
-# host-backed volume at /var/lib/containers; without it, Podman's rootful
-# storage stays on the outer overlay root and falls back to fuse-overlayfs,
-# which cannot run without /dev/fuse. Host networking avoids /dev/net/tun
-# during Dockerfile RUN steps.
+# Use Podman's rootful API service. The devcontainer runtime creates a
+# dedicated volume at /var/lib/containers; without it, Podman's rootful storage
+# stays on the outer overlay root and falls back to fuse-overlayfs, which cannot
+# run without /dev/fuse. Host networking avoids /dev/net/tun during Dockerfile
+# RUN steps.
 RUN mkdir -p \
         /etc/containers \
         /etc/systemd/system/podman.socket.d \
