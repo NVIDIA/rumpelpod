@@ -7,7 +7,7 @@ use anyhow::Result;
 
 use crate::cli::PruneCommand;
 use crate::daemon;
-use crate::daemon::protocol::{Daemon, DaemonClient, PodName, PodStatus};
+use crate::daemon::protocol::{Daemon, DaemonClient, ListPodsRequest, PodName, PodStatus};
 use crate::git::get_repo_root;
 
 /// Returns true if a pod in this status should be removed by `prune`.
@@ -38,7 +38,11 @@ pub fn prune(cmd: &PruneCommand) -> Result<()> {
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
 
-    let pods = client.list_pods(repo_path.clone())?;
+    let list_request = match cmd.force {
+        true => ListPodsRequest::cached(repo_path.clone()),
+        false => ListPodsRequest::synchronized(repo_path.clone()),
+    };
+    let pods = client.list_pods(list_request)?;
 
     let prunable: Vec<_> = pods.iter().filter(|p| is_prunable(&p.status)).collect();
 

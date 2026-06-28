@@ -7,6 +7,11 @@ state transfer.
 Install the pi CLI in the project devcontainer so dogfooding uses the
 same host-side version detection path as the other bundled agents.
 
+Make `rumpel list` use cached daemon state by default.  Callers now ask
+for either a cached or synchronized pod list; synchronized listing
+refreshes both live backend state and pod git refs because users do not
+need two subtly different sync modes.
+
 Docker already deduplicates concurrent builds of the same Dockerfile, so
 the extra cache layer around the pi test Node install is unnecessary.
 

@@ -14,7 +14,9 @@ use anyhow::{Context, Result};
 
 use crate::cli::ForkCommand;
 use crate::daemon;
-use crate::daemon::protocol::{Daemon, DaemonClient, ForkPodRequest, LaunchProgress};
+use crate::daemon::protocol::{
+    Daemon, DaemonClient, ForkPodRequest, LaunchProgress, ListPodsRequest,
+};
 use crate::git::get_repo_root;
 use crate::image::OutputLine;
 
@@ -27,7 +29,7 @@ pub fn fork(cmd: &ForkCommand) -> Result<()> {
     // Sanity-check names against the pod list before we ship the
     // request, so common mistakes (typo'd source, name collision)
     // surface as plain CLI errors instead of via the SSE stream.
-    let pods = client.list_pods(repo_root.clone())?;
+    let pods = client.list_pods(ListPodsRequest::cached(repo_root.clone()))?;
     if !pods.iter().any(|p| p.name == cmd.source) {
         let source = &cmd.source;
         return Err(anyhow::anyhow!("source pod '{source}' does not exist"));

@@ -12,7 +12,7 @@ use clap_complete::env::{Bash, Elvish, EnvCompleter, Fish, Powershell, Shells, Z
 
 use crate::cli::Cli;
 use crate::daemon;
-use crate::daemon::protocol::{Daemon, DaemonClient};
+use crate::daemon::protocol::{Daemon, DaemonClient, ListPodsRequest};
 use crate::git::get_repo_root;
 
 /// Completer that queries the daemon for pod names in the current repo.
@@ -144,7 +144,7 @@ fn pod_names() -> Option<Vec<String>> {
         .unwrap_or(DEFAULT_TIMEOUT_MS);
     let client =
         DaemonClient::new_unix_with_timeout(&socket_path, Some(Duration::from_millis(timeout_ms)));
-    let pods = client.list_pods(repo_path).ok()?;
+    let pods = client.list_pods(ListPodsRequest::cached(repo_path)).ok()?;
     Some(pods.into_iter().map(|p| p.name).collect())
 }
 

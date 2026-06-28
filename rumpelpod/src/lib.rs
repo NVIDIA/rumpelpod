@@ -155,8 +155,8 @@ pub fn run() -> Result<()> {
         Command::Enter(ref cmd) => {
             enter::enter(cmd)?;
         }
-        Command::List => {
-            list::list()?;
+        Command::List(ref cmd) => {
+            list::list(cmd)?;
         }
         Command::Stop(ref cmd) => {
             stop::stop(cmd)?;

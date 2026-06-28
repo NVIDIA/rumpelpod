@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use crate::cli::MergeCommand;
 use crate::config::{load_json_config, DescriptionMode};
 use crate::daemon;
-use crate::daemon::protocol::{Daemon, DaemonClient, PodName};
+use crate::daemon::protocol::{Daemon, DaemonClient, ListPodsRequest, PodName};
 use crate::enter;
 use crate::git::get_repo_root;
 
@@ -201,7 +201,7 @@ pub fn merge(cmd: &MergeCommand) -> Result<()> {
     let client = DaemonClient::new_unix(&socket_path);
 
     // 1. Verify the pod exists in the daemon
-    let pods = client.list_pods(repo_root.clone())?;
+    let pods = client.list_pods(ListPodsRequest::synchronized(repo_root.clone()))?;
     if !pods.iter().any(|p| p.name == cmd.name) {
         let name = &cmd.name;
         return Err(anyhow::anyhow!("pod '{name}' not found"));

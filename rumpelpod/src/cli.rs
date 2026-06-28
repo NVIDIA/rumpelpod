@@ -114,6 +114,13 @@ pub struct Cli {
     pub command: Command,
 }
 
+#[derive(Args, Debug)]
+pub struct ListCommand {
+    /// Refresh live pod state before printing.
+    #[arg(long)]
+    pub sync: bool,
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Run a command or interactive shell in a pod.
@@ -132,7 +139,7 @@ pub enum Command {
     ///
     /// Shows pod name, status (running/stopped), and creation time.
     #[command(verbatim_doc_comment)]
-    List,
+    List(ListCommand),
 
     /// Stop one or more pod containers without removing them.
     ///

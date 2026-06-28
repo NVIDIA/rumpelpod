@@ -8,7 +8,9 @@ use anyhow::Result;
 use crate::cli::RecreateCommand;
 use crate::config::load_json_config;
 use crate::daemon;
-use crate::daemon::protocol::{Daemon, DaemonClient, LaunchProgress, PodLaunchParams, PodName};
+use crate::daemon::protocol::{
+    Daemon, DaemonClient, LaunchProgress, ListPodsRequest, PodLaunchParams, PodName,
+};
 use crate::enter::{
     collect_local_env, determine_host, find_local_claude_cli, find_local_codex_cli,
     find_local_grok_cli, find_local_pi_cli,
@@ -21,7 +23,7 @@ pub fn recreate(cmd: &RecreateCommand) -> Result<()> {
 
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
-    let pods = client.list_pods(repo_root.clone())?;
+    let pods = client.list_pods(ListPodsRequest::cached(repo_root.clone()))?;
     if !pods.iter().any(|p| p.name == cmd.name) {
         let name = &cmd.name;
         return Err(anyhow::anyhow!("pod '{name}' does not exist"));

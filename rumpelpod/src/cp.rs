@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::CpCommand;
 use crate::daemon;
-use crate::daemon::protocol::{Daemon, DaemonClient};
+use crate::daemon::protocol::{Daemon, DaemonClient, ListPodsRequest};
 use crate::enter;
 use crate::git::get_repo_root;
 use crate::pod::PodClient;
@@ -197,7 +197,7 @@ pub fn cp(cmd: &CpCommand) -> Result<()> {
     let repo_root = get_repo_root()?;
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
-    let pods = client.list_pods(repo_root)?;
+    let pods = client.list_pods(ListPodsRequest::cached(repo_root))?;
     if !pods.iter().any(|p| p.name == pod_name) {
         return Err(anyhow::anyhow!("pod '{pod_name}' does not exist"));
     }

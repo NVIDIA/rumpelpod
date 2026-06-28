@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 use crate::cli::ReviewCommand;
 use crate::daemon;
-use crate::daemon::protocol::{Daemon, DaemonClient};
+use crate::daemon::protocol::{Daemon, DaemonClient, ListPodsRequest};
 use crate::git::get_repo_root;
 
 /// Translate a difftool name to its executable path.
@@ -308,7 +308,7 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
     // "ref not found" message for typos or deleted pods.
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
-    let pods = client.list_pods(repo_root.clone())?;
+    let pods = client.list_pods(ListPodsRequest::synchronized(repo_root.clone()))?;
     if !pods.iter().any(|s| s.name == cmd.name) {
         let name = &cmd.name;
         return Err(anyhow::anyhow!("pod '{name}' does not exist"));
