@@ -42,6 +42,8 @@ RUN export DEBIAN_FRONTEND=noninteractive \
         procps \
         unzip
 
+COPY --chmod=755 podman /usr/local/bin/podman
+
 # Docker daemon config for the nested k3d setup:
 # - insecure-registries: the k3d built-in registry speaks HTTP. The
 #   .localhost suffix resolves to ::1 (IPv6), which falls outside
@@ -159,6 +161,10 @@ RUN if ! getent group ${USER} > /dev/null 2>&1; then \
     if ! id -u ${USER} > /dev/null 2>&1; then \
         useradd -m -u ${USER_ID} -g ${USER} ${USER}; \
     fi && \
+    subid_start=$((USER_ID + 1)) && \
+    subid_count=$((65536 - subid_start)) && \
+    printf '%s:%s:%s\n' "${USER}" "$subid_start" "$subid_count" > /etc/subuid && \
+    printf '%s:%s:%s\n' "${USER}" "$subid_start" "$subid_count" > /etc/subgid && \
     echo "${USER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
     usermod -aG docker -s /bin/bash ${USER}
 

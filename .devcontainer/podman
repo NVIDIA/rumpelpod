@@ -1,0 +1,43 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+real_podman=/usr/bin/podman
+root="${RUMPELPOD_PODMAN_ROOT:-/var/lib/rumpelpod-podman/storage}"
+runroot="${RUMPELPOD_PODMAN_RUNROOT:-/run/rumpelpod-podman}"
+driver="${RUMPELPOD_PODMAN_STORAGE_DRIVER:-vfs}"
+
+if [ "$(id -u)" -ne 0 ]; then
+    exec /usr/bin/sudo env \
+        "RUMPELPOD_PODMAN_ROOT=$root" \
+        "RUMPELPOD_PODMAN_RUNROOT=$runroot" \
+        "RUMPELPOD_PODMAN_STORAGE_DRIVER=$driver" \
+        "BUILDAH_ISOLATION=${BUILDAH_ISOLATION:-chroot}" \
+        "REGISTRY_AUTH_FILE=${REGISTRY_AUTH_FILE:-}" \
+        "DOCKER_CONFIG=${DOCKER_CONFIG:-}" \
+        "SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-}" \
+        /usr/local/bin/podman "$@"
+fi
+
+if [ -z "${REGISTRY_AUTH_FILE:-}" ] && [ -n "${DOCKER_CONFIG:-}" ] \
+    && [ -f "${DOCKER_CONFIG}/config.json" ]; then
+    export REGISTRY_AUTH_FILE="${DOCKER_CONFIG}/config.json"
+fi
+
+if [ -z "${REGISTRY_AUTH_FILE:-}" ] && [ -n "${SUDO_USER:-}" ]; then
+    user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    if [ -f "${user_home}/.docker/config.json" ]; then
+        export REGISTRY_AUTH_FILE="${user_home}/.docker/config.json"
+    fi
+fi
+
+mkdir -p "$root" "$runroot"
+export BUILDAH_ISOLATION="${BUILDAH_ISOLATION:-chroot}"
+
+exec "$real_podman" \
+    --root "$root" \
+    --runroot "$runroot" \
+    --storage-driver "$driver" \
+    "$@"
