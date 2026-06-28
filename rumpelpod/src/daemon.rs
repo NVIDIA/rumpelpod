@@ -24,7 +24,7 @@ use tokio::net::UnixListener;
 use sha2::{Digest, Sha256};
 
 use crate::async_runtime::block_on;
-use crate::config::Host;
+use crate::config::{ContainerEngine, Host};
 use crate::devcontainer::{
     self, check_no_unresolved_mount_vars, compute_devcontainer_id, substitute_vars, BuildOptions,
     DevContainer, GpuRequirement, HostRequirements, MountType, Port, PortAttributes,
@@ -79,6 +79,11 @@ fn make_build_output(
 ) -> Option<crate::image::BuildOutputFn> {
     let tx = tx.clone();
     Some(Box::new(move |line: crate::image::OutputLine| {
+        let line = match line {
+            crate::image::OutputLine::Stdout(s) | crate::image::OutputLine::Stderr(s) => {
+                crate::image::OutputLine::Stderr(s)
+            }
+        };
         // Send failure means the client disconnected mid-build.
         // The caller notices when the progress iterator drains.
         if tx.send(line).is_err() {
@@ -475,7 +480,9 @@ fn host_requirements_message(
     }
     let joined = parts.join(", ");
     let note = match docker_host {
-        Host::Localhost | Host::Ssh { .. } => "advisory only on local/remote Docker",
+        Host::Localhost { .. } | Host::Ssh { .. } => {
+            "advisory only on local/remote container hosts"
+        }
         Host::Kubernetes { .. } => "mapped to pod resource requests on Kubernetes",
     };
     Some(format!("hostRequirements: {joined} ({note})"))
@@ -1930,10 +1937,20 @@ impl DaemonServer {
                 );
                 ReconnectPodResult::Connected(Box::new(result))
             }
-            Host::Localhost | Host::Ssh { .. } => {
+            Host::Localhost { .. } | Host::Ssh { .. } => {
                 let docker_socket = match docker_host {
                     Host::Ssh { .. } => None,
-                    Host::Localhost => Some(default_docker_socket()),
+                    Host::Localhost {
+                        engine: ContainerEngine::Docker,
+                    } => Some(default_docker_socket()),
+                    Host::Localhost {
+                        engine: ContainerEngine::Podman,
+                    } => None,
+                    Host::Localhost {
+                        engine: ContainerEngine::Auto,
+                    } => {
+                        panic!("container engine auto remained after resolve")
+                    }
                     Host::Kubernetes { .. } => unreachable!(),
                 };
                 let executor = match self.host_executor(docker_host) {
@@ -2138,7 +2155,7 @@ impl DaemonServer {
                     namespace: n,
                     ..
                 } if c == context && n == namespace => {}
-                Host::Kubernetes { .. } | Host::Localhost | Host::Ssh { .. } => continue,
+                Host::Kubernetes { .. } | Host::Localhost { .. } | Host::Ssh { .. } => continue,
             }
 
             let already_live = self
@@ -2568,7 +2585,7 @@ impl DaemonServer {
         // reconnect.  If the pod turns out to be gone (k8s eviction,
         // Docker removal), clean up the stale DB record and fall through
         // to a fresh create.
-        let mut docker_host = docker_host;
+        let mut docker_host = docker_host.resolve_container_tools()?;
         // Wait for any in-progress background stop to finish before
         // checking the DB for reentry or creating a new pod.
         for _ in 0..50 {
@@ -2649,7 +2666,17 @@ impl DaemonServer {
 
         let docker_socket: Option<PathBuf> = match &docker_host {
             Host::Ssh { .. } => None,
-            Host::Localhost => Some(default_docker_socket()),
+            Host::Localhost {
+                engine: ContainerEngine::Docker,
+            } => Some(default_docker_socket()),
+            Host::Localhost {
+                engine: ContainerEngine::Podman,
+            } => None,
+            Host::Localhost {
+                engine: ContainerEngine::Auto,
+            } => {
+                panic!("container engine auto remained after resolve")
+            }
             Host::Kubernetes { .. } => None,
         };
         let executor = self.host_executor(&docker_host)?;
@@ -2793,7 +2820,17 @@ impl DaemonServer {
 
         let docker_socket: Option<PathBuf> = match &docker_host {
             Host::Ssh { .. } => None,
-            Host::Localhost => Some(default_docker_socket()),
+            Host::Localhost {
+                engine: ContainerEngine::Docker,
+            } => Some(default_docker_socket()),
+            Host::Localhost {
+                engine: ContainerEngine::Podman,
+            } => None,
+            Host::Localhost {
+                engine: ContainerEngine::Auto,
+            } => {
+                panic!("container engine auto remained after resolve")
+            }
             Host::Kubernetes { .. } => None,
         };
         let executor = self.host_executor(&docker_host)?;
@@ -3286,9 +3323,10 @@ impl DaemonServer {
     /// Calls `launch_pod_impl` directly to avoid spawning a nested thread.
     fn recreate_pod_impl(
         &self,
-        params: PodLaunchParams,
+        mut params: PodLaunchParams,
         build_tx: std::sync::mpsc::Sender<crate::image::OutputLine>,
     ) -> Result<LaunchResult> {
+        params.host = params.host.resolve_container_tools()?;
         let pod_name = &params.pod_name;
         let repo_path = &params.repo_path;
         let docker_host = &params.host;
@@ -3495,14 +3533,14 @@ impl DaemonServer {
             }
 
             match host {
-                Host::Localhost => {}
+                Host::Localhost { .. } => {}
                 // Remote pods wait for a later re-entry to rebuild
                 // pod-server and tunnel handles.
                 Host::Ssh { .. } => continue,
                 Host::Kubernetes { .. } => continue,
             }
 
-            if let Err(e) = self.restore_one_pod(&pod) {
+            if let Err(e) = self.restore_one_pod(&pod, &host) {
                 eprintln!(
                     "restore_running_pods: failed to restore {}: {e:#}",
                     pod.name
@@ -3511,11 +3549,11 @@ impl DaemonServer {
         }
     }
 
-    fn restore_one_pod(&self, pod: &db::PodRecord) -> Result<()> {
+    fn restore_one_pod(&self, pod: &db::PodRecord, host: &Host) -> Result<()> {
         let repo_path = PathBuf::from(&pod.repo_path);
         let pod_name = PodName(pod.name.clone());
 
-        let executor = self.host_executor(&Host::Localhost)?;
+        let executor = self.host_executor(host)?;
         let pod_id = crate::executor::pod_id_for(&pod_name, &repo_path);
         if executor.status(&pod_id)? != PodStatus::Running {
             return Ok(());
@@ -3526,7 +3564,7 @@ impl DaemonServer {
         let pod_connection = self.pod_connections.get_or_create(
             &repo_path,
             &pod_name.0,
-            Host::Localhost,
+            host.clone(),
             pod.token.clone(),
         )?;
         let tunnel = block_on(crate::tunnel::start_tunnel(
@@ -3543,7 +3581,7 @@ impl DaemonServer {
             serve_port,
         ))
         .context("starting exec proxy")?;
-        pod_connection.set_pod_server(Host::Localhost, pod.token.clone(), proxy)?;
+        pod_connection.set_pod_server(host.clone(), pod.token.clone(), proxy)?;
         pod_connection.ensure_event_loop();
 
         Ok(())
@@ -3651,7 +3689,10 @@ impl Daemon for DaemonServer {
         // supported on kubernetes".
         let host = match pod_record.as_ref() {
             Some(record) => serde_json::from_str::<Host>(&record.host)?,
-            None => Host::Localhost,
+            None => Host::Localhost {
+                engine: ContainerEngine::Auto,
+            }
+            .resolve_container_tools()?,
         };
         if let Host::Kubernetes { .. } = &host {
             return Err(anyhow::anyhow!(
@@ -3705,7 +3746,10 @@ impl Daemon for DaemonServer {
         }
         let host = match pod_record.as_ref() {
             Some(record) => serde_json::from_str::<Host>(&record.host)?,
-            None => Host::Localhost,
+            None => Host::Localhost {
+                engine: ContainerEngine::Auto,
+            }
+            .resolve_container_tools()?,
         };
         drop(conn);
 
@@ -3790,49 +3834,49 @@ impl Daemon for DaemonServer {
         let db_pods = db::list_pods(&conn, &repo_path)?;
         drop(conn); // Release lock before calling Docker API
 
-        // Get container status from local Docker.  Ignore connect
-        // failures here: a running daemon with no local docker still
-        // wants to report on its remote pods.
-        let local_container_status: HashMap<String, PodBackendInfo> = self
-            .host_executor(&Host::Localhost)
-            .and_then(|e| e.list_by_repo(&repo_path))
-            .unwrap_or_default();
-
-        // Collect unique remote hosts and check for existing connections
-        let mut remote_status_maps: HashMap<String, Option<HashMap<String, PodBackendInfo>>> =
+        // Collect unique hosts and check backend status once per host.
+        // Local Docker and local Podman have separate stores, so the
+        // stored host JSON is part of the key.
+        let mut status_maps: HashMap<String, Option<HashMap<String, PodBackendInfo>>> =
             HashMap::new();
         for pod in &db_pods {
             let host = serde_json::from_str::<Host>(&pod.host).ok();
             match &host {
-                Some(h @ Host::Kubernetes { .. }) => {
+                Some(h @ Host::Localhost { .. }) if !status_maps.contains_key(&pod.host) => {
+                    let status_map = self
+                        .host_executor(h)
+                        .and_then(|e| e.list_by_repo(&repo_path))
+                        .ok();
+                    status_maps.insert(pod.host.clone(), status_map);
+                }
+                Some(h @ Host::Kubernetes { .. }) if !status_maps.contains_key(&pod.host) => {
                     // Cache per kubernetes host to avoid N API calls
                     // when many pods share a cluster/namespace.
-                    if !remote_status_maps.contains_key(&pod.host) {
-                        let status_map = self
-                            .host_executor(h)
-                            .and_then(|e| e.list_by_repo(&repo_path))
-                            .ok();
-                        remote_status_maps.insert(pod.host.clone(), status_map);
-                    }
+                    let status_map = self
+                        .host_executor(h)
+                        .and_then(|e| e.list_by_repo(&repo_path))
+                        .ok();
+                    status_maps.insert(pod.host.clone(), status_map);
                 }
-                Some(h @ Host::Ssh { .. }) => {
-                    if !remote_status_maps.contains_key(&pod.host) {
-                        // Only probe if a connection already exists
-                        // and is currently up; do not implicitly
-                        // open a fresh SSH connection from `list`.
-                        let status_map = self
-                            .host_connections
-                            .get(h)
-                            .filter(|c| c.is_connected())
-                            .and_then(|_| {
-                                self.host_executor(h)
-                                    .and_then(|e| e.list_by_repo(&repo_path))
-                                    .ok()
-                            });
-                        remote_status_maps.insert(pod.host.clone(), status_map);
-                    }
+                Some(h @ Host::Ssh { .. }) if !status_maps.contains_key(&pod.host) => {
+                    // Only probe if a connection already exists
+                    // and is currently up; do not implicitly
+                    // open a fresh SSH connection from `list`.
+                    let status_map = self
+                        .host_connections
+                        .get(h)
+                        .filter(|c| c.is_connected())
+                        .and_then(|_| {
+                            self.host_executor(h)
+                                .and_then(|e| e.list_by_repo(&repo_path))
+                                .ok()
+                        });
+                    status_maps.insert(pod.host.clone(), status_map);
                 }
-                Some(Host::Localhost) | None => {}
+                Some(Host::Localhost { .. }) => {}
+                Some(Host::Kubernetes { .. }) => {}
+                Some(Host::Ssh { .. }) => {}
+                None => {}
             }
         }
 
@@ -3841,19 +3885,11 @@ impl Daemon for DaemonServer {
         for pod in db_pods {
             let host = serde_json::from_str::<Host>(&pod.host).ok();
             let is_remote = host.as_ref().is_some_and(|h| h.is_remote());
-            let is_k8s = host
-                .as_ref()
-                .is_some_and(|h| matches!(h, Host::Kubernetes { .. }));
-
             let (status, container_id) = {
-                let container_info = if is_remote || is_k8s {
-                    remote_status_maps
-                        .get(&pod.host)
-                        .and_then(|m| m.as_ref())
-                        .and_then(|status_map| status_map.get(&pod.name))
-                } else {
-                    local_container_status.get(&pod.name)
-                };
+                let container_info = status_maps
+                    .get(&pod.host)
+                    .and_then(|m| m.as_ref())
+                    .and_then(|status_map| status_map.get(&pod.name));
 
                 let status = match pod.status {
                     db::PodStatus::Stopping => PodStatus::Stopping,
@@ -3862,11 +3898,7 @@ impl Daemon for DaemonServer {
                     _ => match container_info {
                         Some(info) => info.status.clone(),
                         None => {
-                            if is_remote
-                                && remote_status_maps
-                                    .get(&pod.host)
-                                    .is_none_or(|m| m.is_none())
-                            {
+                            if is_remote && status_maps.get(&pod.host).is_none_or(|m| m.is_none()) {
                                 PodStatus::Disconnected
                             } else {
                                 match pod.status {

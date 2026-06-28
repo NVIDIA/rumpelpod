@@ -62,11 +62,14 @@ fn compute_hub_tag() -> String {
 
 /// Build the hub image and return its registry-qualified tag.
 pub fn build_hub_image(host: &Host) -> Result<String> {
-    let (registry, builder) = match host {
+    let (registry, builder, engine) = match host {
         Host::Kubernetes {
-            registry, builder, ..
-        } => (registry.to_string(), builder.clone()),
-        Host::Localhost | Host::Ssh { .. } => {
+            registry,
+            builder,
+            image_builder,
+            ..
+        } => (registry.to_string(), builder.clone(), *image_builder),
+        Host::Localhost { .. } | Host::Ssh { .. } => {
             return Err(anyhow::anyhow!(
                 "rumpel hub install only runs against Kubernetes hosts"
             ));
@@ -80,6 +83,7 @@ pub fn build_hub_image(host: &Host) -> Result<String> {
     let mode = BuildxMode::Push {
         registry: registry.as_str(),
         builder: builder.as_deref(),
+        engine,
     };
     let dockerfile = staging.path().join("Dockerfile");
     let context = staging.path();

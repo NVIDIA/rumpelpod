@@ -22,7 +22,7 @@ use super::image::build_hub_image;
 use super::manifests::HubInstallSpec;
 use super::{HUB_NAME, HUB_PORT, HUB_SELECTOR};
 use crate::async_runtime::block_on;
-use crate::config::Host;
+use crate::config::{ContainerEngine, Host};
 
 /// Resolve a `Host::Kubernetes` from CLI flags or the `.rumpelpod.json`
 /// config in the current directory.
@@ -38,14 +38,16 @@ pub fn resolve_kubernetes_host(
         let registry = cli_registry
             .expect("clap `requires = kubernetes_registry` ensures this is set")
             .to_string();
-        return Ok(Host::Kubernetes {
+        let host = Host::Kubernetes {
             context: context.to_string(),
             namespace,
             registry,
             node_selector: None,
             tolerations: None,
             builder: None,
-        });
+            image_builder: ContainerEngine::Auto,
+        };
+        return host.resolve_container_tools();
     }
 
     let cwd = std::env::current_dir().context("getting current directory")?;
@@ -61,14 +63,16 @@ pub fn resolve_kubernetes_host(
         .map(|s| s.to_string())
         .or(kubernetes.namespace)
         .unwrap_or_else(|| "default".to_string());
-    Ok(Host::Kubernetes {
+    let host = Host::Kubernetes {
         context: kubernetes.context,
         namespace,
         registry: kubernetes.registry,
         node_selector: kubernetes.node_selector,
         tolerations: kubernetes.tolerations,
         builder: kubernetes.builder,
-    })
+        image_builder: config.container_engine.unwrap_or(ContainerEngine::Auto),
+    };
+    host.resolve_container_tools()
 }
 
 /// Build a `kube::Client` for the given context.  Mirrors what
@@ -96,7 +100,7 @@ fn host_parts(host: &Host) -> Result<(&str, &str)> {
         Host::Kubernetes {
             context, namespace, ..
         } => Ok((context.as_str(), namespace.as_str())),
-        Host::Localhost | Host::Ssh { .. } => {
+        Host::Localhost { .. } | Host::Ssh { .. } => {
             Err(anyhow::anyhow!("rumpel hub only supports Kubernetes hosts"))
         }
     }

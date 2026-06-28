@@ -1,6 +1,6 @@
 # Rumpelpod
 
-Manage multiple independent workspaces of a repository in Docker containers or Kubernetes pods, on local or remote hosts.
+Manage multiple independent workspaces of a repository in Docker or Podman containers, or Kubernetes pods, on local or remote hosts.
 Designed for running LLM coding agents.
 
 **Full documentation in the [user guide](GUIDE.md).**
@@ -10,14 +10,14 @@ curl -fsSL https://raw.githubusercontent.com/nvidia/rumpelpod/main/install.sh | 
 rumpel system-install
 ```
 
-Requirements: git, docker, optionally ssh and kubectl.
+Requirements: git, Docker or Podman, optionally ssh and kubectl.
 
 ## What Is This?
 
-Rumpelpod manages named, independent workspaces ("pods") of a repository inside Docker containers.
+Rumpelpod manages named, independent workspaces ("pods") of a repository inside containers.
 Each pod has its own full clone of the repository, synced via git, so multiple agents can work concurrently without interfering with each other or your local machine.
 
-Containers can run on the local Docker daemon, on a remote host via SSH, or on Kubernetes.
+Containers can run on the local Docker or Podman engine, on a remote Docker host via SSH, or on Kubernetes.
 Rumpelpod handles git synchronization, port forwarding, and container lifecycle in all cases.
 
 The main use case is running LLM coding agents.

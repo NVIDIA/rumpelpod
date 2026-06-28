@@ -21,19 +21,103 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use url::Url;
 
+/// Container CLI/runtime used for local container operations.
+///
+/// `Auto` prefers Docker so existing installations keep their current
+/// behavior, then falls back to Podman for Docker-free local hosts.
+#[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContainerEngine {
+    #[default]
+    Auto,
+    Docker,
+    Podman,
+}
+
+impl ContainerEngine {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "docker" => Ok(Self::Docker),
+            "podman" => Ok(Self::Podman),
+            _ => Err(format!(
+                "unknown container engine '{s}': expected auto, docker, or podman"
+            )),
+        }
+    }
+
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            Self::Auto => {
+                panic!("binary_name() called before resolving container engine auto")
+            }
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+
+    pub fn resolve(self, allow_podman: bool, reason: &str) -> Result<Self> {
+        match self {
+            Self::Auto => {
+                if crate::which("docker").is_some() {
+                    return Ok(Self::Docker);
+                }
+                if allow_podman && crate::which("podman").is_some() {
+                    return Ok(Self::Podman);
+                }
+                if allow_podman {
+                    Err(anyhow::anyhow!(
+                        "neither docker nor podman was found on PATH for {reason}"
+                    ))
+                } else {
+                    Err(anyhow::anyhow!("docker was not found on PATH for {reason}"))
+                }
+            }
+            Self::Docker => {
+                if crate::which("docker").is_some() {
+                    Ok(Self::Docker)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "containerEngine is docker, but docker was not found on PATH for {reason}"
+                    ))
+                }
+            }
+            Self::Podman => {
+                if !allow_podman {
+                    return Err(anyhow::anyhow!(
+                        "containerEngine is podman, but podman is not supported for {reason}"
+                    ));
+                }
+                if crate::which("podman").is_some() {
+                    Ok(Self::Podman)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "containerEngine is podman, but podman was not found on PATH for {reason}"
+                    ))
+                }
+            }
+        }
+    }
+}
+
 /// Where a pod runs.
 ///
 /// Either the local machine, a remote host accessed via SSH, or a Kubernetes
 /// cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Host {
-    /// The default Docker daemon on the local machine.
-    Localhost,
+    /// The local Docker or Podman engine.
+    Localhost {
+        #[serde(default)]
+        engine: ContainerEngine,
+    },
     /// A remote Docker daemon accessed via SSH.
     Ssh {
         /// The SSH destination string (e.g. "user@host" or just "host").
         /// Passed directly to the `ssh` command.
         ssh_destination: String,
+        #[serde(default)]
+        engine: ContainerEngine,
     },
     /// A Kubernetes cluster accessed via kubeconfig.
     Kubernetes {
@@ -58,6 +142,9 @@ pub enum Host {
         /// with the local Docker daemon and pushed to the registry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         builder: Option<String>,
+        /// Local image builder used when `builder` is not set.
+        #[serde(default)]
+        image_builder: ContainerEngine,
     },
 }
 
@@ -71,7 +158,9 @@ impl Host {
     /// Kubernetes hosts are configured via `--kubernetes-context` / `kubernetes` instead.
     pub fn parse(s: &str) -> Result<Self> {
         if s == "localhost" {
-            return Ok(Host::Localhost);
+            return Ok(Host::Localhost {
+                engine: ContainerEngine::Auto,
+            });
         }
 
         let url = Url::parse(s).with_context(|| {
@@ -105,7 +194,10 @@ impl Host {
                     host.to_string()
                 };
 
-                Ok(Host::Ssh { ssh_destination })
+                Ok(Host::Ssh {
+                    ssh_destination,
+                    engine: ContainerEngine::Auto,
+                })
             }
             other => Err(anyhow::anyhow!(
                 "unsupported scheme '{other}' in host '{s}'. \
@@ -119,8 +211,10 @@ impl Host {
     /// Panics if called on a non-SSH host.
     pub fn ssh_destination(&self) -> &str {
         match self {
-            Host::Ssh { ssh_destination } => ssh_destination,
-            Host::Localhost | Host::Kubernetes { .. } => {
+            Host::Ssh {
+                ssh_destination, ..
+            } => ssh_destination,
+            Host::Localhost { .. } | Host::Kubernetes { .. } => {
                 panic!("ssh_destination() called on non-SSH host")
             }
         }
@@ -129,15 +223,15 @@ impl Host {
     /// Whether this is a remote host (SSH or Kubernetes).
     pub fn is_remote(&self) -> bool {
         match self {
-            Host::Localhost => false,
+            Host::Localhost { .. } => false,
             Host::Ssh { .. } | Host::Kubernetes { .. } => true,
         }
     }
 
-    /// Whether this host uses Docker for container management.
+    /// Whether this host uses the Docker-compatible container executor.
     pub fn is_docker(&self) -> bool {
         match self {
-            Host::Localhost | Host::Ssh { .. } => true,
+            Host::Localhost { .. } | Host::Ssh { .. } => true,
             Host::Kubernetes { .. } => false,
         }
     }
@@ -147,10 +241,109 @@ impl Host {
     /// Panics if called on a Kubernetes host.
     pub fn docker_host_uri(&self) -> Option<String> {
         match self {
-            Host::Localhost => None,
-            Host::Ssh { ssh_destination } => Some(format!("ssh://{ssh_destination}")),
+            Host::Localhost { .. } => None,
+            Host::Ssh {
+                ssh_destination, ..
+            } => Some(format!("ssh://{ssh_destination}")),
             Host::Kubernetes { .. } => {
                 panic!("docker_host_uri() called on Kubernetes host")
+            }
+        }
+    }
+
+    pub fn with_container_engine(self, engine: ContainerEngine) -> Self {
+        match self {
+            Host::Localhost { .. } => Host::Localhost { engine },
+            Host::Ssh {
+                ssh_destination, ..
+            } => Host::Ssh {
+                ssh_destination,
+                engine,
+            },
+            Host::Kubernetes {
+                context,
+                namespace,
+                registry,
+                node_selector,
+                tolerations,
+                builder,
+                ..
+            } => Host::Kubernetes {
+                context,
+                namespace,
+                registry,
+                node_selector,
+                tolerations,
+                builder,
+                image_builder: engine,
+            },
+        }
+    }
+
+    pub fn container_engine(&self) -> Option<ContainerEngine> {
+        match self {
+            Host::Localhost { engine } | Host::Ssh { engine, .. } => Some(*engine),
+            Host::Kubernetes { .. } => None,
+        }
+    }
+
+    pub fn image_builder(&self) -> Option<ContainerEngine> {
+        match self {
+            Host::Localhost { engine } | Host::Ssh { engine, .. } => Some(*engine),
+            Host::Kubernetes { image_builder, .. } => Some(*image_builder),
+        }
+    }
+
+    /// Resolve `Auto` into a concrete installed engine before a pod is
+    /// stored or a build runs.
+    pub fn resolve_container_tools(self) -> Result<Self> {
+        match self {
+            Host::Localhost { engine } => Ok(Host::Localhost {
+                engine: engine.resolve(true, "local container executor")?,
+            }),
+            Host::Ssh {
+                ssh_destination,
+                engine,
+            } => {
+                let engine = engine.resolve(false, "ssh Docker executor")?;
+                match engine {
+                    ContainerEngine::Docker => Ok(Host::Ssh {
+                        ssh_destination,
+                        engine,
+                    }),
+                    ContainerEngine::Podman => Err(anyhow::anyhow!(
+                        "podman over ssh is not supported yet; Podman remote needs a configured \
+                         service URL or connection, not Docker's ssh:// transport"
+                    )),
+                    ContainerEngine::Auto => {
+                        panic!("container engine auto remained after resolve")
+                    }
+                }
+            }
+            Host::Kubernetes {
+                context,
+                namespace,
+                registry,
+                node_selector,
+                tolerations,
+                builder,
+                image_builder,
+            } => {
+                let reason = if builder.is_some() {
+                    "kubernetes.builder, which uses Docker buildx"
+                } else {
+                    "kubernetes image builder"
+                };
+                let image_builder = image_builder.resolve(builder.is_none(), reason)?;
+                Ok(Host::Kubernetes {
+                    context,
+                    namespace,
+                    registry,
+                    node_selector,
+                    tolerations,
+                    builder,
+                    image_builder,
+                })
             }
         }
     }
@@ -160,15 +353,41 @@ impl std::fmt::Display for Host {
     /// Human-readable display for `rumpel list` and error messages.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Host::Localhost => write!(f, "localhost"),
-            Host::Ssh { ssh_destination } => write!(f, "ssh://{ssh_destination}"),
+            Host::Localhost { engine } => match engine {
+                ContainerEngine::Auto | ContainerEngine::Docker => write!(f, "localhost"),
+                ContainerEngine::Podman => write!(f, "localhost (podman)"),
+            },
+            Host::Ssh {
+                ssh_destination,
+                engine,
+            } => match engine {
+                ContainerEngine::Auto | ContainerEngine::Docker => {
+                    write!(f, "ssh://{ssh_destination}")
+                }
+                ContainerEngine::Podman => write!(f, "ssh://{ssh_destination} (podman)"),
+            },
             Host::Kubernetes {
-                context, namespace, ..
+                context,
+                namespace,
+                image_builder,
+                ..
             } => {
                 if namespace == "default" {
-                    write!(f, "k8s:{context}")
+                    match image_builder {
+                        ContainerEngine::Auto | ContainerEngine::Docker => {
+                            write!(f, "k8s:{context}")
+                        }
+                        ContainerEngine::Podman => write!(f, "k8s:{context} (podman builder)"),
+                    }
                 } else {
-                    write!(f, "k8s:{context}/{namespace}")
+                    match image_builder {
+                        ContainerEngine::Auto | ContainerEngine::Docker => {
+                            write!(f, "k8s:{context}/{namespace}")
+                        }
+                        ContainerEngine::Podman => {
+                            write!(f, "k8s:{context}/{namespace} (podman builder)")
+                        }
+                    }
                 }
             }
         }
@@ -232,6 +451,10 @@ pub struct JsonConfig {
 
     /// Docker host: "localhost" for local or "ssh://user@host" for remote.
     pub host: Option<String>,
+
+    /// Container engine preference for local execution and image builds.
+    #[serde(default)]
+    pub container_engine: Option<ContainerEngine>,
 
     /// Kubernetes target. Mutually exclusive with `host`.
     pub kubernetes: Option<KubernetesConfig>,
@@ -461,7 +684,12 @@ mod tests {
     #[test]
     fn parse_localhost() {
         let host = Host::parse("localhost").unwrap();
-        assert_eq!(host, Host::Localhost);
+        assert_eq!(
+            host,
+            Host::Localhost {
+                engine: ContainerEngine::Auto
+            }
+        );
         assert_eq!(host.to_string(), "localhost");
     }
 
@@ -521,7 +749,13 @@ mod tests {
 
     #[test]
     fn docker_host_uri_localhost() {
-        assert_eq!(Host::Localhost.docker_host_uri(), None);
+        assert_eq!(
+            Host::Localhost {
+                engine: ContainerEngine::Auto
+            }
+            .docker_host_uri(),
+            None
+        );
     }
 
     #[test]
@@ -539,6 +773,7 @@ mod tests {
             node_selector: None,
             tolerations: None,
             builder: None,
+            image_builder: ContainerEngine::Auto,
         };
         assert_eq!(host.to_string(), "k8s:my-cluster");
     }
@@ -552,6 +787,7 @@ mod tests {
             node_selector: None,
             tolerations: None,
             builder: None,
+            image_builder: ContainerEngine::Auto,
         };
         assert_eq!(host.to_string(), "k8s:my-cluster/staging");
     }
@@ -565,6 +801,7 @@ mod tests {
             node_selector: None,
             tolerations: None,
             builder: None,
+            image_builder: ContainerEngine::Auto,
         };
         assert!(host.is_remote());
         assert!(!host.is_docker());
@@ -573,12 +810,16 @@ mod tests {
     #[test]
     fn serde_json_roundtrip() {
         let hosts = vec![
-            Host::Localhost,
+            Host::Localhost {
+                engine: ContainerEngine::Auto,
+            },
             Host::Ssh {
                 ssh_destination: "user@host".to_string(),
+                engine: ContainerEngine::Auto,
             },
             Host::Ssh {
                 ssh_destination: "dev".to_string(),
+                engine: ContainerEngine::Auto,
             },
             Host::Kubernetes {
                 context: "my-cluster".to_string(),
@@ -587,6 +828,7 @@ mod tests {
                 node_selector: None,
                 tolerations: None,
                 builder: None,
+                image_builder: ContainerEngine::Auto,
             },
         ];
         for host in hosts {
@@ -626,6 +868,32 @@ mod tests {
         assert_eq!(tols[0].value.as_deref(), Some("test"));
         assert_eq!(tols[0].effect, "NoSchedule");
         assert_eq!(tols[0].operator, None);
+    }
+
+    #[test]
+    fn parse_container_engine_preference() {
+        let config: JsonConfig = json5::from_str(indoc::indoc! {r#"
+            {
+              "containerEngine": "podman"
+            }
+        "#})
+        .unwrap();
+        assert_eq!(config.container_engine, Some(ContainerEngine::Podman));
+    }
+
+    #[test]
+    fn parse_unknown_container_engine_rejected() {
+        let err = json5::from_str::<JsonConfig>(indoc::indoc! {r#"
+            {
+              "containerEngine": "containerd"
+            }
+        "#})
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown variant") || msg.contains("containerd"),
+            "error should mention the invalid engine: {msg}"
+        );
     }
 
     #[test]
@@ -675,6 +943,7 @@ mod tests {
                 operator: None,
             }]),
             builder: None,
+            image_builder: ContainerEngine::Auto,
         };
         let json = serde_json::to_string(&host).unwrap();
         let roundtripped: Host = serde_json::from_str(&json).unwrap();

@@ -40,7 +40,7 @@ use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::timeout;
 
 use crate::async_runtime::RUNTIME;
-use crate::config::Host;
+use crate::config::{ContainerEngine, Host};
 use crate::k8s::K8sClient;
 
 /// Identity of a host: collapses `Host::Kubernetes`'s extra fields
@@ -48,17 +48,29 @@ use crate::k8s::K8sClient;
 /// actually determines which API server we are talking to.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum HostKey {
-    Localhost,
-    Ssh { destination: String },
-    Kubernetes { context: String, namespace: String },
+    Localhost {
+        engine: ContainerEngine,
+    },
+    Ssh {
+        destination: String,
+        engine: ContainerEngine,
+    },
+    Kubernetes {
+        context: String,
+        namespace: String,
+    },
 }
 
 impl HostKey {
     pub fn from_host(host: &Host) -> Self {
         match host {
-            Host::Localhost => HostKey::Localhost,
-            Host::Ssh { ssh_destination } => HostKey::Ssh {
+            Host::Localhost { engine } => HostKey::Localhost { engine: *engine },
+            Host::Ssh {
+                ssh_destination,
+                engine,
+            } => HostKey::Ssh {
                 destination: ssh_destination.clone(),
+                engine: *engine,
             },
             Host::Kubernetes {
                 context, namespace, ..
@@ -73,8 +85,17 @@ impl HostKey {
 impl std::fmt::Display for HostKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HostKey::Localhost => write!(f, "localhost"),
-            HostKey::Ssh { destination } => write!(f, "ssh://{destination}"),
+            HostKey::Localhost { engine } => match engine {
+                ContainerEngine::Auto | ContainerEngine::Docker => write!(f, "localhost"),
+                ContainerEngine::Podman => write!(f, "localhost (podman)"),
+            },
+            HostKey::Ssh {
+                destination,
+                engine,
+            } => match engine {
+                ContainerEngine::Auto | ContainerEngine::Docker => write!(f, "ssh://{destination}"),
+                ContainerEngine::Podman => write!(f, "ssh://{destination} (podman)"),
+            },
             HostKey::Kubernetes { context, namespace } => {
                 write!(f, "k8s:{context}/{namespace}")
             }
@@ -188,11 +209,15 @@ impl HostConnection {
     /// background monitor that owns liveness and reconnection.
     pub fn new(host: &Host, events_tx: HostConnectionEventTx) -> Result<Self> {
         match host {
-            Host::Localhost => Ok(HostConnection::Localhost(LocalhostConnection::new(
-                events_tx,
+            Host::Localhost { engine } => Ok(HostConnection::Localhost(LocalhostConnection::new(
+                *engine, events_tx,
             ))),
-            Host::Ssh { ssh_destination } => Ok(HostConnection::Ssh(SshConnection::new(
+            Host::Ssh {
+                ssh_destination,
+                engine,
+            } => Ok(HostConnection::Ssh(SshConnection::new(
                 ssh_destination.clone(),
+                *engine,
                 events_tx,
             ))),
             Host::Kubernetes {
@@ -207,7 +232,7 @@ impl HostConnection {
 
     pub fn key(&self) -> HostKey {
         match self {
-            HostConnection::Localhost(_) => HostKey::Localhost,
+            HostConnection::Localhost(c) => HostKey::Localhost { engine: c.engine() },
             HostConnection::Ssh(c) => c.key(),
             HostConnection::Kubernetes(c) => c.key(),
         }
@@ -274,6 +299,7 @@ impl Drop for AbortOnDrop {
 // ============================================================
 
 pub struct LocalhostConnection {
+    engine: ContainerEngine,
     // Held only so a future caller can read the events tx if
     // needed; today the constructor uses it once and the field
     // exists to mirror the other variants.
@@ -283,15 +309,22 @@ pub struct LocalhostConnection {
 }
 
 impl LocalhostConnection {
-    fn new(events_tx: HostConnectionEventTx) -> Arc<Self> {
+    fn new(engine: ContainerEngine, events_tx: HostConnectionEventTx) -> Arc<Self> {
         // Emit Connected once so the daemon's reader handles
         // localhost uniformly with the other variants.
-        let _ = events_tx.send(HostConnectionEvent::Connected(HostKey::Localhost));
+        let _ = events_tx.send(HostConnectionEvent::Connected(HostKey::Localhost {
+            engine,
+        }));
         let (status_tx, _) = watch::channel(HostStatus::Connected);
         Arc::new(Self {
+            engine,
             _events_tx: events_tx,
             status_tx,
         })
+    }
+
+    pub fn engine(&self) -> ContainerEngine {
+        self.engine
     }
 
     fn subscribe(&self) -> watch::Receiver<HostStatus> {
@@ -305,6 +338,7 @@ impl LocalhostConnection {
 
 pub struct SshConnection {
     destination: String,
+    engine: ContainerEngine,
     events_tx: HostConnectionEventTx,
     /// Single source of truth for liveness; updated by `ensure_connected`
     /// and observed by pod loops waiting for the host to come back.
@@ -318,13 +352,18 @@ pub struct SshConnection {
 }
 
 impl SshConnection {
-    fn new(destination: String, events_tx: HostConnectionEventTx) -> Arc<Self> {
+    fn new(
+        destination: String,
+        engine: ContainerEngine,
+        events_tx: HostConnectionEventTx,
+    ) -> Arc<Self> {
         let (status_tx, _) = watch::channel(HostStatus::Disconnected);
         let probe = Arc::new(Notify::new());
         Arc::new_cyclic(|weak: &Weak<SshConnection>| {
             let task = RUNTIME.spawn(ssh_monitor(weak.clone(), probe.clone()));
             SshConnection {
                 destination,
+                engine,
                 events_tx,
                 status_tx,
                 probe,
@@ -337,6 +376,7 @@ impl SshConnection {
     pub fn key(&self) -> HostKey {
         HostKey::Ssh {
             destination: self.destination.clone(),
+            engine: self.engine,
         }
     }
 
@@ -358,6 +398,10 @@ impl SshConnection {
 
     pub fn destination(&self) -> &str {
         &self.destination
+    }
+
+    pub fn engine(&self) -> ContainerEngine {
+        self.engine
     }
 
     /// Update liveness, emitting a host event only on a real transition.
@@ -729,18 +773,24 @@ mod ssh_tests {
 mod registry_tests {
     use super::*;
 
+    fn localhost() -> Host {
+        Host::Localhost {
+            engine: ContainerEngine::Docker,
+        }
+    }
+
     #[test]
     fn registry_does_not_keep_idle_connection_alive() {
         let (events_tx, _events_rx) = mpsc::unbounded_channel();
         let registry = HostConnectionRegistry::new(events_tx);
 
-        let conn = registry.get_or_create(&Host::Localhost).unwrap();
-        let same = registry.get_or_create(&Host::Localhost).unwrap();
+        let conn = registry.get_or_create(&localhost()).unwrap();
+        let same = registry.get_or_create(&localhost()).unwrap();
         assert!(Arc::ptr_eq(&conn, &same));
         drop(same);
 
-        assert!(registry.get(&Host::Localhost).is_some());
+        assert!(registry.get(&localhost()).is_some());
         drop(conn);
-        assert!(registry.get(&Host::Localhost).is_none());
+        assert!(registry.get(&localhost()).is_none());
     }
 }

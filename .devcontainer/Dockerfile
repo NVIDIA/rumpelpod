@@ -33,11 +33,38 @@ RUN export DEBIAN_FRONTEND=noninteractive \
         locales \
         gnupg \
         docker.io \
+        podman \
         kubectl \
         screen \
         skopeo \
         procps \
         unzip
+
+# Rootless Podman cannot create its user namespace under this outer sandbox.
+# Use Podman's rootful API service. The devcontainer runtime creates a
+# dedicated volume at /var/lib/containers; without it, Podman's rootful storage
+# stays on the outer overlay root and falls back to fuse-overlayfs, which cannot
+# run without /dev/fuse. Host networking avoids /dev/net/tun during Dockerfile
+# RUN steps.
+RUN mkdir -p \
+        /etc/containers \
+        /etc/systemd/system/podman.socket.d \
+    && printf '%s\n' \
+        '[storage]' \
+        'driver = "overlay"' \
+        'runroot = "/run/rumpelpod-podman/storage"' \
+        'graphroot = "/var/lib/containers/storage"' \
+        > /etc/containers/storage.conf \
+    && printf '%s\n' \
+        '[containers]' \
+        'netns = "host"' \
+        > /etc/containers/containers.conf \
+    && printf '%s\n' \
+        '[Socket]' \
+        'SocketGroup=docker' \
+        'SocketMode=0660' \
+        > /etc/systemd/system/podman.socket.d/rumpelpod.conf \
+    && systemctl enable podman.socket
 
 # Docker daemon config for the nested k3d setup:
 # - insecure-registries: the k3d built-in registry speaks HTTP. The
@@ -158,6 +185,8 @@ RUN if ! getent group ${USER} > /dev/null 2>&1; then \
     fi && \
     echo "${USER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
     usermod -aG docker -s /bin/bash ${USER}
+
+ENV CONTAINER_HOST=unix:///run/podman/podman.sock
 
 USER ${USER}
 
