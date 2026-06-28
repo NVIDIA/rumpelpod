@@ -153,7 +153,6 @@ impl Executor {
             if runtime.is_some() {
                 anyhow::bail!("--runtime requires a Kubernetes executor");
             }
-            require_podman_overlay_storage()?;
             env.push(("RUMPELPOD_TEST_EXECUTOR".into(), "podman".into()));
             eprintln!("Executor: podman");
             return Ok(ExecutorGuard::default());
@@ -312,34 +311,6 @@ impl Executor {
         eprintln!("k3d: {dir_display}");
 
         Ok(Some(ExecutorGuard::default()))
-    }
-}
-
-fn require_podman_overlay_storage() -> Result<()> {
-    let driver = tools::output(Command::new("podman").args([
-        "info",
-        "--format",
-        "{{.Store.GraphDriverName}}",
-    ]))
-    .context("checking Podman storage driver")?;
-    validate_podman_storage_driver(&driver)?;
-    eprintln!("Podman storage driver: {driver}");
-    Ok(())
-}
-
-fn validate_podman_storage_driver(driver: &str) -> Result<()> {
-    match driver {
-        "overlay" => Ok(()),
-        "vfs" => Err(anyhow::anyhow!(
-            "Podman is using the vfs storage driver; configure overlay storage before running \
-             --executor podman"
-        )),
-        "" => Err(anyhow::anyhow!(
-            "Podman did not report a storage driver; refusing to run --executor podman"
-        )),
-        other => Err(anyhow::anyhow!(
-            "Podman is using unsupported storage driver '{other}'; expected overlay"
-        )),
     }
 }
 
@@ -1345,22 +1316,4 @@ fn run() -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_podman_storage_driver;
-
-    #[test]
-    fn podman_executor_preflight_rejects_vfs_storage() {
-        // The integration suite builds many images, so vfs turns a
-        // signal test run into a storage benchmark.
-        let err = validate_podman_storage_driver("vfs").unwrap_err();
-        assert!(err.to_string().contains("vfs storage driver"));
-    }
-
-    #[test]
-    fn podman_executor_preflight_accepts_overlay_storage() {
-        validate_podman_storage_driver("overlay").unwrap();
-    }
 }
