@@ -225,6 +225,7 @@ pub fn run_container_server(
         .route("/claude-state", post(claude_state_handler))
         .route("/codex-state", post(codex_state_handler))
         .route("/claude", any(super::pty::claude_session_handler))
+        .route("/pi", any(super::pty::pi_session_handler))
         .route("/grok", any(super::pty::grok_session_handler))
         .route("/codex", any(super::codex::codex_ws_handler))
         .with_state(state.clone())
@@ -1239,6 +1240,8 @@ fn build_state_response(repo_path: &Path) -> Result<StateResponse> {
         .unwrap_or_else(|| PathBuf::from("/root"));
     let has_claude_state = home.join(".claude").exists() || home.join(".claude.json").exists();
     let has_codex_state = home.join(".codex").exists();
+    let has_pi_state = home.join(".pi").exists();
+    let has_pi_config = home.join(crate::daemon::PI_CONFIG_COPIED_SENTINEL).exists();
     let has_grok_state = home.join(".grok").exists();
 
     Ok(StateResponse {
@@ -1246,6 +1249,8 @@ fn build_state_response(repo_path: &Path) -> Result<StateResponse> {
         primary,
         has_claude_state,
         has_codex_state,
+        has_pi_state,
+        has_pi_config,
         has_grok_state,
         dirty,
     })
@@ -1812,6 +1817,7 @@ fn agent_paths(agent: &str) -> Option<&'static [&'static str]> {
     match agent {
         "claude" => Some(&[".claude.json", ".claude"]),
         "codex" => Some(&[".codex"]),
+        "pi" => Some(&[".pi"]),
         "grok" => Some(&[".grok"]),
         _ => None,
     }
@@ -2013,6 +2019,7 @@ fn agent_files_put_impl(
     match agent {
         "claude" => rewrite_claude_settings(&home, pod_name, permission_hook)?,
         "codex" => {}
+        "pi" => {}
         // Grok needs no post-extraction work: its notify-state hooks are
         // not wired up, so there is no settings file to rewrite.
         "grok" => {}

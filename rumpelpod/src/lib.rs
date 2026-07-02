@@ -31,6 +31,7 @@ mod k8s;
 mod list;
 mod llm;
 mod merge;
+mod pi;
 mod pod;
 mod port_file;
 mod ports;
@@ -201,6 +202,9 @@ pub fn run() -> Result<()> {
         },
         Command::Codex(ref cmd) => {
             codex::codex(cmd)?;
+        }
+        Command::Pi(ref cmd) => {
+            pi::pi(cmd)?;
         }
         Command::Grok(ref cmd) => {
             grok::grok(cmd)?;

@@ -1,0 +1,28 @@
+{"status":200,"path":"/v1/messages","headers":{"anthropic-organization-id":"3fd0c5c4-8e2b-46b5-bc86-860fcbb2881e","anthropic-ratelimit-input-tokens-limit":"10000000","anthropic-ratelimit-input-tokens-remaining":"9999000","anthropic-ratelimit-input-tokens-reset":"2026-06-23T17:46:14Z","anthropic-ratelimit-output-tokens-limit":"2000000","anthropic-ratelimit-output-tokens-remaining":"2000000","anthropic-ratelimit-output-tokens-reset":"2026-06-23T17:46:14Z","anthropic-ratelimit-requests-limit":"10000","anthropic-ratelimit-requests-remaining":"9999","anthropic-ratelimit-requests-reset":"2026-06-23T17:46:14Z","anthropic-ratelimit-tokens-limit":"12000000","anthropic-ratelimit-tokens-remaining":"11999000","anthropic-ratelimit-tokens-reset":"2026-06-23T17:46:14Z","cache-control":"no-cache","cf-cache-status":"DYNAMIC","cf-ray":"a1054f9bfc533388-CDG","content-security-policy":"default-src 'none'; frame-ancestors 'none'","content-type":"text/event-stream; charset=utf-8","date":"Tue, 23 Jun 2026 17:46:14 GMT","request-id":"req_011CcLcJLvPqDvJ8yABdZzK9","server":"cloudflare","set-cookie":"_cfuvid=9DFlWu3eNY0s.RUPPACY7sQi.hWIuvGzGFqrb7BSbNw-1782236773.7581809-1.0.1.1-KjAmHE7LijIZ6qJFL8DWEguXoSHeyBvBG7PUkep7Wc0; HttpOnly; SameSite=None; Secure; Path=/; Domain=api.anthropic.com","strict-transport-security":"max-age=31536000; includeSubDomains; preload","traceresponse":"00-2645a0e634ce3f47505a22e1169e1d5b-295ed5754921f886-01","vary":"Accept-Encoding","x-robots-tag":"none"}}
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-haiku-4-5-20251001","id":"msg_01N6Xr4K9yzvbXhgeeyCSM5p","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":1447,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":55,"service_tier":"standard","inference_geo":"not_available"}}    }
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01TbG3ohRvYE6kLHrnjXXnPL","name":"bash","input":{},"caller":{"type":"direct"}}              }
+
+event: ping
+data: {"type": "ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}           }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\": \"git remote -v"}         }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"}"}          }
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0    }
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":1447,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":55}         }
+
+event: message_stop
+data: {"type":"message_stop"        }
+

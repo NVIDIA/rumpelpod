@@ -434,7 +434,7 @@ pub struct KubernetesConfig {
 /// workspaceFolder, runtime, network) are intentionally omitted -- they
 /// should be set in devcontainer.json instead (runtime and network via
 /// `runArgs`).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct JsonConfig {
     #[serde(default)]
@@ -444,10 +444,22 @@ pub struct JsonConfig {
     pub codex: CodexConfig,
 
     #[serde(default)]
+    pub pi: PiConfig,
+
+    #[serde(default)]
     pub grok: GrokConfig,
 
     #[serde(default)]
     pub merge: MergeConfig,
+
+    /// Inject a system prompt describing the rumpelpod environment
+    /// (devcontainer layout, git remotes, push/fetch behavior) into
+    /// each installed agent's system-prompt location (CLAUDE.md,
+    /// AGENTS.md, pi's SYSTEM.md).  The description is the same for
+    /// every agent, so this is a single pod-level knob rather than a
+    /// per-agent one.  Defaults to true.
+    #[serde(default = "default_true")]
+    pub inject_system_prompt: bool,
 
     /// Docker host: "localhost" for local or "ssh://user@host" for remote.
     pub host: Option<String>,
@@ -478,7 +490,10 @@ pub fn load_json_config(repo_root: &Path) -> Result<JsonConfig> {
 
         Ok(config)
     } else {
-        Ok(JsonConfig::default())
+        // Parse an empty config so serde field defaults (e.g.
+        // inject_system_prompt) apply uniformly whether or not the file
+        // exists.
+        json5::from_str("{}").context("constructing default config")
     }
 }
 
@@ -497,13 +512,6 @@ pub struct ClaudeConfig {
     #[serde(default)]
     pub dangerously_skip_permissions_hook: bool,
 
-    /// Inject a system prompt describing the rumpelpod environment
-    /// (devcontainer layout, git remotes, push/fetch behavior) into
-    /// /etc/claude-code/CLAUDE.md inside the container.
-    /// Defaults to true.
-    #[serde(default = "default_true")]
-    pub inject_system_prompt: bool,
-
     /// Copy per-project session JSONLs from
     /// ~/.claude/projects/<encoded-cwd>/ into the pod so
     /// `claude --resume <uuid>` can pick up sessions started on the
@@ -521,7 +529,6 @@ impl Default for ClaudeConfig {
         Self {
             dangerously_skip_permissions: true,
             dangerously_skip_permissions_hook: false,
-            inject_system_prompt: true,
             sessions: None,
         }
     }
@@ -549,6 +556,26 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             dangerously_bypass_approvals_and_sandbox: true,
+        }
+    }
+}
+
+/// Configuration for `rumpel pi`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PiConfig {
+    /// Pre-trust the workspace so pi's TUI does not block on the
+    /// project-trust prompt (it forces `defaultProjectTrust: "always"`
+    /// in the copied settings.json).  The pod provides the sandbox, so
+    /// pi does not need its own approval gate.  Defaults to true.
+    #[serde(default = "default_true")]
+    pub trust_workspace: bool,
+}
+
+impl Default for PiConfig {
+    fn default() -> Self {
+        Self {
+            trust_workspace: true,
         }
     }
 }

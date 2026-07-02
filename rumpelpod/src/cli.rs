@@ -273,6 +273,14 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Codex(CodexCommand),
 
+    /// Run the pi coding agent inside a pod.
+    ///
+    /// Examples:
+    ///   rumpel pi dev                          # Launch pi in 'dev' pod
+    ///   rumpel pi dev -- --model anthropic/claude-opus-4-7
+    #[command(verbatim_doc_comment)]
+    Pi(PiCommand),
+
     /// Launch the xAI Grok CLI inside a persistent session in a pod.
     ///
     /// On first run, copies your local Grok credentials (~/.grok) and
@@ -683,6 +691,24 @@ pub struct CodexCommand {
 }
 
 #[derive(Args)]
+pub struct PiCommand {
+    /// Name for this pod instance (e.g., 'dev', 'test')
+    #[arg(value_parser = validate_pod_name, add = PodNameCompleter::candidates())]
+    pub name: String,
+
+    #[command(flatten)]
+    pub host_args: HostArgs,
+
+    /// Create the pod without prompting if it doesn't exist
+    #[arg(long)]
+    pub create: bool,
+
+    /// Arguments forwarded to the `pi` CLI inside the pod (e.g. --model)
+    #[arg(last = true, value_name = "ARGS")]
+    pub args: Vec<String>,
+}
+
+#[derive(Args)]
 pub struct GrokCommand {
     /// Name for this pod instance (e.g., 'dev', 'test')
     #[arg(value_parser = validate_pod_name, add = PodNameCompleter::candidates())]
@@ -740,6 +766,10 @@ pub struct PrepareImageCommand {
     #[arg(long)]
     pub claude_version: Option<String>,
 
+    /// pi CLI version to install (skip if not provided)
+    #[arg(long)]
+    pub pi_version: Option<String>,
+
     /// Install the Codex CLI into the prepared image
     #[arg(long)]
     pub install_codex: bool,
@@ -760,7 +790,7 @@ pub struct PrepareImageCommand {
     #[arg(long = "mount-target")]
     pub mount_targets: Vec<String>,
 
-    /// Write /etc/claude-code/CLAUDE.md with a rumpelpod environment description
+    /// Write a rumpelpod environment description for installed agents
     #[arg(long)]
     pub inject_system_prompt: bool,
 

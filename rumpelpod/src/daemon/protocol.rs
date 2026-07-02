@@ -208,11 +208,14 @@ pub struct PodLaunchParams {
     /// Absolute path to the Codex CLI binary on the local machine,
     /// resolved by the client for the same reason as `claude_cli_path`.
     pub codex_cli_path: Option<PathBuf>,
+    /// Absolute path to the pi CLI binary on the local machine,
+    /// resolved by the client for the same reason as `claude_cli_path`.
+    pub pi_cli_path: Option<PathBuf>,
     /// Absolute path to the Grok CLI binary on the local machine,
     /// resolved by the client for the same reason as `claude_cli_path`.
     pub grok_cli_path: Option<PathBuf>,
-    /// Write /etc/claude-code/CLAUDE.md with a rumpelpod environment description
-    /// into the prepared image.
+    /// Write a rumpelpod environment description into each installed
+    /// agent's system-prompt location in the prepared image.
     pub inject_system_prompt: bool,
     /// Path of the description file for merge commit messages (None = disabled).
     /// Included in the system prompt so the agent knows where to write it.
@@ -370,6 +373,20 @@ pub struct EnsureClaudeConfigRequest {
     pub copy_sessions: bool,
 }
 
+/// Request body for ensure_pi_config endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnsurePiConfigRequest {
+    pub pod_name: PodName,
+    pub repo_path: PathBuf,
+    pub container_id: ContainerId,
+    pub container_url: String,
+    pub container_token: String,
+    /// Force `defaultProjectTrust: "always"` into the copied
+    /// settings.json so pi's TUI does not block on the project-trust
+    /// prompt.  Driven by the user-facing `pi.trustWorkspace` knob.
+    pub trust_workspace: bool,
+}
+
 /// Request body for the pod reconnect-events SSE endpoint.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PodReconnectRequest {
@@ -466,6 +483,11 @@ pub trait Daemon: Send + Sync + 'static {
     // Ensure Claude Code config files are present in the container.
     // Idempotent: skips the copy if it has already been done for this pod.
     fn ensure_claude_config(&self, request: EnsureClaudeConfigRequest) -> Result<()>;
+
+    // PUT /pod/pi-config
+    // Ensure pi auth/config files are present in the container.
+    // Idempotent: skips the copy if it has already been done for this pod.
+    fn ensure_pi_config(&self, request: EnsurePiConfigRequest) -> Result<()>;
 
     // POST /pod/ssh-agent
     // Ensure the pod's host-side ssh-agent is running and return the
@@ -829,6 +851,20 @@ impl Daemon for DaemonClient {
             .map_err(|e| anyhow::anyhow!("failed to send request: {e}"))?;
 
         let _: serde_json::Value = read_sse_result(response, "configuring Claude Code")?;
+        Ok(())
+    }
+
+    fn ensure_pi_config(&self, request: EnsurePiConfigRequest) -> Result<()> {
+        let url = self.url.join("/pod/pi-config")?;
+
+        let response = self
+            .client
+            .put(url)
+            .json(&request)
+            .send()
+            .map_err(|e| anyhow::anyhow!("failed to send request: {e}"))?;
+
+        let _: serde_json::Value = read_sse_result(response, "configuring pi")?;
         Ok(())
     }
 
@@ -1378,6 +1414,17 @@ async fn ensure_claude_config_handler<D: Daemon>(
     })
 }
 
+/// Handler for PUT /pod/pi-config endpoint.
+async fn ensure_pi_config_handler<D: Daemon>(
+    State(daemon): State<Arc<D>>,
+    Json(request): Json<EnsurePiConfigRequest>,
+) -> Response {
+    streaming_result_response("configuring pi...".into(), move || {
+        daemon.ensure_pi_config(request)?;
+        Ok(serde_json::Value::Null)
+    })
+}
+
 /// Handler for POST /pod/ssh-agent endpoint.
 async fn ensure_ssh_agent_handler<D: Daemon>(
     State(daemon): State<Arc<D>>,
@@ -1502,6 +1549,7 @@ where
             get(list_ports_handler::<D>).post(add_forwarded_port_handler::<D>),
         )
         .route("/pod/claude-config", put(ensure_claude_config_handler::<D>))
+        .route("/pod/pi-config", put(ensure_pi_config_handler::<D>))
         .route("/pod/ssh-agent", post(ensure_ssh_agent_handler::<D>))
         .route(
             "/pod/reconnect-events",

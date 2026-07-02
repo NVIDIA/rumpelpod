@@ -236,6 +236,30 @@ RUN ARCH=$(uname -m) && \
     curl -fsSL "https://x.ai/cli/grok-0.2.60-linux-$GROK_ARCH" -o /usr/local/bin/grok && \
     chmod +x /usr/local/bin/grok
 
+ARG PI_VERSION=0.79.10
+
+# pi requires a newer Node than stable distro packages often provide.
+RUN ARCH=$(uname -m) && \
+    case "$ARCH" in \
+        x86_64) NODE_ARCH="x64" ;; \
+        aarch64) NODE_ARCH="arm64" ;; \
+        *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac && \
+    NODE_BASE="https://nodejs.org/dist/latest-v22.x" && \
+    NODE_TARBALL=$(curl -fsSL "$NODE_BASE/SHASUMS256.txt" \
+        | awk -v suffix="-linux-${NODE_ARCH}.tar.gz" \
+            '$2 ~ ("^node-v.*" suffix "$") { print $2; exit }') && \
+    test -n "$NODE_TARBALL" && \
+    curl -fsSL "$NODE_BASE/$NODE_TARBALL" -o /tmp/node.tar.gz && \
+    tar xzf /tmp/node.tar.gz -C /opt && \
+    NODE_DIR="/opt/${NODE_TARBALL%.tar.gz}" && \
+    ln -sf "$NODE_DIR/bin/node" /usr/local/bin/node && \
+    ln -sf "$NODE_DIR/bin/npm" /usr/local/bin/npm && \
+    ln -sf "$NODE_DIR/bin/npx" /usr/local/bin/npx && \
+    rm /tmp/node.tar.gz && \
+    npm install -g --prefix /usr/local --ignore-scripts --no-fund --no-audit \
+        --loglevel=error "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
 RUN mkdir /workspaces && chown -R ${USER}:${USER} /workspaces
 USER ${USER}
 
