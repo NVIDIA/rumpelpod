@@ -52,7 +52,7 @@ Run the full pipeline before submitting:
 cargo pipeline
 ```
 
-For a faster iteration loop on a subset of tests, pass a regex:
+For a faster iteration loop on a subset of tests, pass a substring filter:
 
 ```bash
 cargo pipeline enter_smoke_test

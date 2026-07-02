@@ -12,7 +12,7 @@ This is a rust project implementing an isolated LLM agent runner (rumpelpod).
   `cargo pipeline` is expensive overall because of the tests.
   Run smoke tests first: `enter_smoke_test`, `enter_verifies_user_and_repo_path`, `claude_smoke`, `gateway_pod_commit_triggers_push`, plus tests related to what you changed.
   Changes in src/ that affect the rumpel binary need a full pipeline run after smoke and feature tests pass.
-  `cargo pipeline` accepts the same test name regex as `cargo test`, e.g. `cargo pipeline enter_`.
+  `cargo pipeline` accepts a single substring filter for test names (not a regex, no alternation), e.g. `cargo pipeline enter_`.
   The pipeline runs all tests to completion even when some fail.
   Use `cargo pipeline --continue` to resume from a previous run, skipping tests that already passed.
   Most individual test cases finish in under 60 seconds with the localhost executor (the default).

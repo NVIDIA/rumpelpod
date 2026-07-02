@@ -1,0 +1,7 @@
+Correct docs on cargo pipeline test filtering
+
+CLAUDE.md/AGENTS.md and CONTRIBUTING.md claimed cargo pipeline accepts a
+test name regex.  It does not: positional args are forwarded through
+cargo test to the libtest binaries, which only do substring matching,
+and cargo test rejects more than one positional filter.  Document that
+only a single substring filter (no regex, no alternation) works.
