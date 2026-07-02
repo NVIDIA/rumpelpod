@@ -944,14 +944,16 @@ fn write_codex_system_prompt(user: &str, description_file: Option<&str>) -> Resu
     )
 }
 
-/// Write ~/.pi/agent/SYSTEM.md (the container user's home) so pi
-/// understands the container layout and git remote conventions.
+/// Append the rumpelpod system prompt to ~/.pi/agent/SYSTEM.md (the
+/// container user's home) so pi understands the container layout and
+/// git remote conventions.
 ///
 /// pi reads its global system prompt from the per-user agent dir, so
 /// this is written under the container user's home rather than a fixed
-/// path like claude/codex.  The whole ~/.pi subtree is chowned to the
-/// container user so the runtime config copy (which runs as that user)
-/// can write auth/settings alongside it.
+/// path like claude/codex.  Appends rather than overwrites so a base
+/// image's existing file is preserved.  The whole ~/.pi subtree is
+/// chowned to the container user so the runtime config copy (which
+/// runs as that user) can write auth/settings alongside it.
 fn write_pi_system_prompt(user: &str, description_file: Option<&str>) -> Result<()> {
     let pw = nix::unistd::User::from_name(user)
         .with_context(|| format!("looking up user '{user}'"))?
@@ -961,8 +963,21 @@ fn write_pi_system_prompt(user: &str, description_file: Option<&str>) -> Result<
     fs::create_dir_all(&agent_dir).with_context(|| format!("creating {agent_dir_display}"))?;
     let system_md = agent_dir.join("SYSTEM.md");
     let system_md_display = system_md.display();
-    fs::write(&system_md, system_prompt(description_file))
-        .with_context(|| format!("writing {system_md_display}"))?;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&system_md)
+        .with_context(|| format!("opening {system_md_display} for append"))?;
+    let prompt = system_prompt(description_file);
+    // Separate from any existing content with a blank line.
+    if system_md.metadata().is_ok_and(|m| m.len() > 0) {
+        file.write_all(b"\n")
+            .context("writing SYSTEM.md separator")?;
+    }
+    file.write_all(prompt.as_bytes())
+        .with_context(|| format!("writing rumpelpod prompt to {system_md_display}"))?;
+    drop(file);
 
     let pi_root = pw.dir.join(".pi");
     let user_colon = format!("{user}:");
