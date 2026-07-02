@@ -480,13 +480,18 @@ fn detect_existing_submodules_recursive(parent_dir: &Path, prefix: &str) -> Vec<
     let mut all = Vec::new();
     for sub in submodules {
         let sub_worktree = parent_dir.join(&sub.path);
-        all.push(sub.clone());
-        if sub_worktree.exists() {
-            all.extend(detect_existing_submodules_recursive(
-                &sub_worktree,
-                &sub.displaypath,
-            ));
+        // An uninitialized submodule leaves at most an empty
+        // placeholder directory in the worktree.  Git commands run
+        // there resolve to the parent repo and would rewrite its
+        // config, so only include submodules with a gitlink.
+        if !sub_worktree.join(".git").exists() {
+            continue;
         }
+        all.push(sub.clone());
+        all.extend(detect_existing_submodules_recursive(
+            &sub_worktree,
+            &sub.displaypath,
+        ));
     }
     all
 }

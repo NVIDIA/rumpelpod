@@ -5,3 +5,7 @@ replacement tunnel binds a different in-container port. The tunnel
 server notifies container-serve when it can, container-serve refreshes
 git remotes on startup and before recovery pushes, and the regression
 test forces a port change before `git push rumpelpod`.
+
+The refresh skips .gitmodules entries whose submodule was never
+initialized: git commands run in their empty placeholder directories
+resolve to the parent repo and would rewrite its remotes.

@@ -538,13 +538,12 @@ async fn refresh_gateway_base_url(state: &PodServerState, base_url: String) -> R
         .clone()
         .ok_or_else(|| anyhow::anyhow!("repo_path not set yet"))?;
 
-    let git_token = token.clone();
     let git_base_url = base_url.clone();
     tokio::task::spawn_blocking(move || {
         git_setup::refresh_gateway_urls_impl(&git_setup::GitGatewayRefreshRequest {
             repo_path,
             base_url: git_base_url,
-            token: git_token,
+            token,
         })
     })
     .await
@@ -555,7 +554,6 @@ async fn refresh_gateway_base_url(state: &PodServerState, base_url: String) -> R
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("ssh relay not configured"))?;
     config.url = base_url;
-    config.token = token;
     Ok(())
 }
 
