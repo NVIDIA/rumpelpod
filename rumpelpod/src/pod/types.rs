@@ -222,6 +222,16 @@ pub struct NotifyCodexStateRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Gateway tunnel
+// ---------------------------------------------------------------------------
+
+/// Pod-local notification that the gateway tunnel has a new base URL.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RefreshGatewayRequest {
+    pub base_url: String,
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 

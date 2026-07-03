@@ -211,6 +211,7 @@ pub fn run_container_server(
             get(git_patch_get_handler).post(git_patch_post_handler),
         )
         .route("/git/push", post(git_push_handler))
+        .route("/gateway/refresh", post(gateway_refresh_handler))
         .route("/state", get(state_handler))
         .route(
             "/agent-files/{agent}",
@@ -464,6 +465,14 @@ fn run_setup(
             })
             .expect("submodule setup failed");
         }
+    } else {
+        progress("refreshing git remotes...");
+        git_setup::refresh_gateway_urls_impl(&git_setup::GitGatewayRefreshRequest {
+            repo_path: repo_path.to_path_buf(),
+            base_url: tunnel_base_url.to_string(),
+            token: token.to_string(),
+        })
+        .expect("gateway refresh failed");
     }
 
     // -- Run lifecycle commands --
@@ -521,6 +530,55 @@ fn err_json(e: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
             error: format!("{e:#}"),
         }),
     )
+}
+
+async fn refresh_gateway_base_url(state: &PodServerState, base_url: String) -> Result<()> {
+    let token = {
+        let relay = state.ssh_relay.lock().await;
+        relay
+            .as_ref()
+            .map(|config| config.token.clone())
+            .ok_or_else(|| anyhow::anyhow!("ssh relay not configured"))?
+    };
+    let repo_path = state
+        .repo_path
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("repo_path not set yet"))?;
+
+    let git_base_url = base_url.clone();
+    tokio::task::spawn_blocking(move || {
+        git_setup::refresh_gateway_urls_impl(&git_setup::GitGatewayRefreshRequest {
+            repo_path,
+            base_url: git_base_url,
+            token,
+        })
+    })
+    .await
+    .expect("gateway refresh task panicked")?;
+
+    let mut relay = state.ssh_relay.lock().await;
+    let config = relay
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("ssh relay not configured"))?;
+    config.url = base_url;
+    Ok(())
+}
+
+async fn refresh_gateway_from_tunnel_port_file(state: &PodServerState) -> Result<()> {
+    let port = crate::port_file::read_required(Path::new(crate::port_file::TUNNEL_PORT_FILE))?;
+    refresh_gateway_base_url(state, format!("http://127.0.0.1:{port}")).await
+}
+
+async fn gateway_refresh_handler(
+    State(state): State<PodServerState>,
+    Json(req): Json<RefreshGatewayRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    refresh_gateway_base_url(&state, req.base_url)
+        .await
+        .map_err(err_json)?;
+    ok_json(serde_json::json!({}))
 }
 
 // ---------------------------------------------------------------------------
@@ -815,10 +873,15 @@ async fn events_handler(State(state): State<PodServerState>) -> Response {
         if let Some(repo_path) = repo_path {
             let gate = state_for_task.push_gate.clone();
             let pod_name = state_for_task.pod_name.clone();
+            let state_for_refresh = state_for_task.clone();
             tokio::spawn(async move {
                 let Ok(permit) = gate.acquire_owned().await else {
                     return;
                 };
+                if let Err(e) = refresh_gateway_from_tunnel_port_file(&state_for_refresh).await {
+                    eprintln!("events: refreshing gateway URL failed: {e:#}");
+                    return;
+                }
                 let result = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     recover_push(&repo_path, &pod_name);

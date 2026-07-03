@@ -3752,3 +3752,128 @@ fn gateway_daemon_restart_pushes_without_reenter() {
 
     wait_for_ref_commit(repo.path(), &expected_ref, &offline_commit);
 }
+
+#[test]
+fn gateway_push_after_daemon_restart_refreshes_changed_tunnel_port() {
+    // The failure mode depends on the Docker exec tunnel being lost
+    // while the container itself stays up.
+    if !matches!(executor::executor_mode(), executor::ExecutorMode::Docker) {
+        executor::skip_test();
+        return;
+    }
+
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let mut daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let pod_name = "restart-port-push";
+
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", pod_name, "--", "echo", "setup"])
+        .success()
+        .expect("initial enter failed");
+
+    let container_id = {
+        let output = Command::new("docker")
+            .args([
+                "ps",
+                "-q",
+                "--filter",
+                &format!("label=dev.rumpelpod.name={pod_name}"),
+            ])
+            .success()
+            .expect("docker ps failed");
+        String::from_utf8_lossy(&output)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    assert!(
+        !container_id.is_empty(),
+        "container not found for pod {pod_name}"
+    );
+
+    let old_url = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            pod_name,
+            "--",
+            "git",
+            "config",
+            "--get",
+            "remote.rumpelpod.url",
+        ])
+        .success()
+        .expect("reading initial rumpelpod remote failed");
+    let old_url = String::from_utf8_lossy(&old_url).trim().to_string();
+    let Some(old_port_text) = old_url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+    else {
+        panic!("unexpected gateway URL: {old_url}");
+    };
+    let old_port = old_port_text
+        .parse::<u16>()
+        .unwrap_or_else(|e| panic!("parsing port from {old_url}: {e}"));
+
+    let pick_new_port = formatdoc! {r#"
+        set -eu
+        old={old_port}
+        p=$((old + 1000))
+        if [ "$p" -gt 65000 ]; then
+            p=$((old - 1000))
+        fi
+        while :; do
+            hex=$(printf '%04X' "$p")
+            if ! grep -qi ":$hex " /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+                printf '%s\n' "$p" > /opt/rumpelpod/tunnel-port
+                printf '%s\n' "$p"
+                exit 0
+            fi
+            p=$((p + 1))
+            if [ "$p" -gt 65000 ]; then
+                p=30000
+            fi
+            if [ "$p" -eq "$old" ]; then
+                p=$((p + 1))
+            fi
+        done
+    "#};
+    let new_port_output = Command::new("docker")
+        .args([
+            "exec",
+            "-u",
+            "root",
+            &container_id,
+            "sh",
+            "-c",
+            &pick_new_port,
+        ])
+        .success()
+        .expect("writing next tunnel port failed");
+    let new_port = String::from_utf8_lossy(&new_port_output).trim().to_string();
+    assert_ne!(
+        new_port,
+        old_port.to_string(),
+        "test must force a different tunnel port"
+    );
+
+    daemon.kill();
+
+    let daemon = TestDaemon::start(&home);
+    let push_script = indoc::indoc! {r#"
+        set -eu
+        git commit --no-verify --allow-empty -m "post restart push"
+        GIT_HTTP_LOW_SPEED_LIMIT=1 \
+        GIT_HTTP_LOW_SPEED_TIME=3 \
+        git push rumpelpod --force --quiet
+    "#};
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", pod_name, "--", "sh", "-c", push_script])
+        .success()
+        .expect("git push rumpelpod should work after daemon restart");
+}

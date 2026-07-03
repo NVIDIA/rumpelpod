@@ -4,13 +4,14 @@
 use std::fs;
 use std::process::Command;
 
+use indoc::indoc;
 use rumpelpod::CommandExt;
 
 use super::get_pod_ref_commit;
 use crate::common::{
     create_commit, pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo,
 };
-use crate::executor::ExecutorResources;
+use crate::executor::{self, ExecutorResources};
 
 /// Create a parent TestRepo that contains a git submodule pointing to
 /// a second TestRepo.  Returns (parent, child_name) where child_name
@@ -576,4 +577,77 @@ fn nested_submodule_host_update_visible_in_pod() {
         fetched_commit, host_inner_commit,
         "Pod should see the host nested submodule commit via host/HEAD"
     );
+}
+
+#[test]
+fn uninitialized_submodule_keeps_parent_remotes_after_restart() {
+    // Restarting the daemon replaces the tunnel, which triggers the
+    // gateway URL refresh in the pod.  Only the Docker exec tunnel
+    // dies together with the daemon.
+    if !matches!(executor::executor_mode(), executor::ExecutorMode::Docker) {
+        executor::skip_test();
+        return;
+    }
+
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let mut daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let pod_name = "uninit-sub-refresh";
+
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", pod_name, "--", "echo", "setup"])
+        .success()
+        .expect("initial enter failed");
+
+    // A .gitmodules entry whose submodule was never initialized, as
+    // after switching to a branch that adds a submodule: the worktree
+    // only contains an empty placeholder directory.  Git commands run
+    // in the placeholder resolve to the parent repo, so the gateway
+    // refresh must skip the entry or it corrupts the parent remotes.
+    let add_entry = indoc! {r#"
+        set -eu
+        printf '[submodule "vendor"]\n\tpath = vendor\n\turl = https://example.invalid/vendor.git\n' > .gitmodules
+        mkdir vendor
+    "#};
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", pod_name, "--", "sh", "-c", add_entry])
+        .success()
+        .expect("adding uninitialized submodule entry failed");
+
+    daemon.kill();
+    let daemon = TestDaemon::start(&home);
+
+    let url = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            pod_name,
+            "--",
+            "git",
+            "config",
+            "--get",
+            "remote.rumpelpod.url",
+        ])
+        .success()
+        .expect("reading rumpelpod remote failed");
+    let url = String::from_utf8_lossy(&url).trim().to_string();
+    assert!(
+        !url.contains("/submodules/"),
+        "parent rumpelpod remote was rewritten to submodule URL: {url}"
+    );
+
+    let push_script = indoc! {r#"
+        set -eu
+        git commit --no-verify --allow-empty -m "post restart push"
+        GIT_HTTP_LOW_SPEED_LIMIT=1 \
+        GIT_HTTP_LOW_SPEED_TIME=3 \
+        git push rumpelpod --force --quiet
+    "#};
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", pod_name, "--", "sh", "-c", push_script])
+        .success()
+        .expect("git push rumpelpod should work after daemon restart");
 }

@@ -60,6 +60,13 @@ pub(crate) struct GitSetupSubmodulesRequest {
     pub is_first_entry: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct GitGatewayRefreshRequest {
+    pub repo_path: PathBuf,
+    pub base_url: String,
+    pub token: String,
+}
+
 // ---------------------------------------------------------------------------
 // Hook constants
 // ---------------------------------------------------------------------------
@@ -81,28 +88,12 @@ pub fn setup_git_impl(req: &GitSetupRequest) -> Result<()> {
     let pod_name = &req.pod_name;
     let token = &req.token;
     let push_refspec = format!("+refs/heads/*:refs/rumpelpod/*@{pod_name}");
+    let repo_url = &req.url;
 
-    Command::new("git")
-        .args([
-            "config",
-            "http.extraHeader",
-            &format!("Authorization: Bearer {token}"),
-        ])
-        .current_dir(repo_path)
-        .success()?;
-
-    // Set up host remote -- fetches branches directly from the host repo.
-    if Command::new("git")
-        .args(["remote", "add", "host", &req.url])
-        .current_dir(repo_path)
-        .success()
-        .is_err()
-    {
-        Command::new("git")
-            .args(["remote", "set-url", "host", &req.url])
-            .current_dir(repo_path)
-            .success()?;
-    }
+    // Set up gateway remotes. `host` fetches branches directly from
+    // the host repo; `rumpelpod` pushes pod branches back through the
+    // same gateway endpoint.
+    configure_gateway_urls(repo_path, repo_url, token)?;
     // Clear existing fetch refspecs (may be multi-valued from a prior
     // entry) and set the two we need.
     let _ = Command::new("git")
@@ -142,19 +133,6 @@ pub fn setup_git_impl(req: &GitSetupRequest) -> Result<()> {
         .current_dir(repo_path)
         .success()?;
 
-    // Set up rumpelpod remote -- pushes pod branches to refs/rumpelpod/ in the
-    // host repo and fetches other pods' branches from there.
-    if Command::new("git")
-        .args(["remote", "add", "rumpelpod", &req.url])
-        .current_dir(repo_path)
-        .success()
-        .is_err()
-    {
-        Command::new("git")
-            .args(["remote", "set-url", "rumpelpod", &req.url])
-            .current_dir(repo_path)
-            .success()?;
-    }
     // Push refspecs: all branches go to refs/rumpelpod/<branch>@<pod>,
     // and the primary branch also goes to refs/rumpelpod/<pod> as a
     // shortcut so the host sees a clean rumpelpod/<pod> remote ref.
@@ -246,6 +224,42 @@ pub fn setup_git_impl(req: &GitSetupRequest) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+pub(crate) fn refresh_gateway_urls_impl(req: &GitGatewayRefreshRequest) -> Result<()> {
+    let repo_url = format!("{}/rumpelpod.git", req.base_url);
+    configure_gateway_urls(&req.repo_path, &repo_url, &req.token)?;
+    refresh_submodule_gateway_urls(&req.repo_path, &req.base_url, &req.token)?;
+    Ok(())
+}
+
+fn configure_gateway_urls(repo_path: &Path, repo_url: &str, token: &str) -> Result<()> {
+    Command::new("git")
+        .args([
+            "config",
+            "http.extraHeader",
+            &format!("Authorization: Bearer {token}"),
+        ])
+        .current_dir(repo_path)
+        .success()?;
+    set_remote_url(repo_path, "host", repo_url)?;
+    set_remote_url(repo_path, "rumpelpod", repo_url)?;
+    Ok(())
+}
+
+fn set_remote_url(repo_path: &Path, remote: &str, url: &str) -> Result<()> {
+    if Command::new("git")
+        .args(["remote", "add", remote, url])
+        .current_dir(repo_path)
+        .success()
+        .is_err()
+    {
+        Command::new("git")
+            .args(["remote", "set-url", remote, url])
+            .current_dir(repo_path)
+            .success()?;
+    }
     Ok(())
 }
 
@@ -459,6 +473,86 @@ fn detect_submodules_from_gitmodules(repo_path: &Path, prefix: &str) -> Vec<Subm
         });
     }
     subs
+}
+
+fn detect_existing_submodules_recursive(parent_dir: &Path, prefix: &str) -> Vec<SubmoduleEntry> {
+    let submodules = detect_submodules_from_gitmodules(parent_dir, prefix);
+    let mut all = Vec::new();
+    for sub in submodules {
+        let sub_worktree = parent_dir.join(&sub.path);
+        // An uninitialized submodule leaves at most an empty
+        // placeholder directory in the worktree.  Git commands run
+        // there resolve to the parent repo and would rewrite its
+        // config, so only include submodules with a gitlink.
+        if !sub_worktree.join(".git").exists() {
+            continue;
+        }
+        all.push(sub.clone());
+        all.extend(detect_existing_submodules_recursive(
+            &sub_worktree,
+            &sub.displaypath,
+        ));
+    }
+    all
+}
+
+fn submodule_parent_dir(container_repo_path: &Path, sub: &SubmoduleEntry) -> PathBuf {
+    if sub.displaypath == sub.path {
+        return container_repo_path.to_path_buf();
+    }
+
+    let suffix = format!("/{}", sub.path);
+    let parent_displaypath = sub
+        .displaypath
+        .strip_suffix(&suffix)
+        .expect("nested submodule displaypath ends with its local path");
+    container_repo_path.join(parent_displaypath)
+}
+
+fn refresh_submodule_gateway_urls(
+    container_repo_path: &Path,
+    base_url: &str,
+    token: &str,
+) -> Result<()> {
+    let submodules = detect_existing_submodules_recursive(container_repo_path, "");
+    for sub in &submodules {
+        refresh_submodule_gateway_url(container_repo_path, sub, base_url, token)?;
+    }
+    Ok(())
+}
+
+fn refresh_submodule_gateway_url(
+    container_repo_path: &Path,
+    sub: &SubmoduleEntry,
+    base_url: &str,
+    token: &str,
+) -> Result<()> {
+    let sub_path = container_repo_path.join(&sub.displaypath);
+    let displaypath = &sub.displaypath;
+    let sub_url = format!("{base_url}/submodules/{displaypath}/rumpelpod.git");
+
+    let parent_dir = submodule_parent_dir(container_repo_path, sub);
+    let submodule_url_key = format!("submodule.{}.url", sub.name);
+    Command::new("git")
+        .args(["config", &submodule_url_key, &sub_url])
+        .current_dir(&parent_dir)
+        .success()
+        .with_context(|| format!("updating URL for submodule '{displaypath}'"))?;
+
+    Command::new("git")
+        .args([
+            "config",
+            "http.extraHeader",
+            &format!("Authorization: Bearer {token}"),
+        ])
+        .current_dir(&sub_path)
+        .success()
+        .with_context(|| format!("updating auth for submodule '{displaypath}'"))?;
+    set_remote_url(&sub_path, "host", &sub_url)
+        .with_context(|| format!("updating host remote for submodule '{displaypath}'"))?;
+    set_remote_url(&sub_path, "rumpelpod", &sub_url)
+        .with_context(|| format!("updating rumpelpod remote for submodule '{displaypath}'"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

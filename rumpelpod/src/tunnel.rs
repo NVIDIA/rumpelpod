@@ -146,6 +146,9 @@ async fn run_tunnel_server_async() {
     if let Err(e) = crate::port_file::write_atomic(path, actual_port) {
         panic!("writing tunnel port file: {e:#}");
     }
+    if let Err(e) = notify_container_server_gateway_port(actual_port).await {
+        panic!("notifying container server of tunnel port: {e:#}");
+    }
     eprintln!("tunnel listening on port {actual_port}");
 
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
@@ -273,6 +276,61 @@ async fn run_tunnel_server_async() {
             let _ = writer.shutdown().await;
         });
     }
+}
+
+async fn notify_container_server_gateway_port(tunnel_port: u16) -> Result<()> {
+    let server_port_path = std::path::Path::new(crate::port_file::SERVER_PORT_FILE);
+    let Some(server_port) = crate::port_file::read_preferred(server_port_path)? else {
+        return Ok(());
+    };
+    let token_path = std::path::Path::new(crate::pod::server::TOKEN_FILE);
+    let token = match std::fs::read_to_string(token_path) {
+        Ok(token) => token,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            let path = token_path.display();
+            return Err(anyhow::Error::new(e).context(format!("reading token file {path}")));
+        }
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        let path = token_path.display();
+        return Err(anyhow::anyhow!("token file {path} is empty"));
+    }
+
+    let base_url = format!("http://127.0.0.1:{tunnel_port}");
+    let server_url = format!("http://127.0.0.1:{server_port}/gateway/refresh");
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("building gateway refresh client")?;
+    let request = crate::pod::types::RefreshGatewayRequest { base_url };
+    let response = match client
+        .post(&server_url)
+        .bearer_auth(token)
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(e) if e.is_connect() => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "notifying container server at {server_url}: {e}"
+            ));
+        }
+    };
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(anyhow::anyhow!(
+        "container server gateway refresh returned {status}: {body}"
+    ))
 }
 
 // ── Host side ──────────────────────────────────────────────────────────
