@@ -29,15 +29,25 @@ pub const SSH_USER: &str = "testuser";
 /// Timeout for waiting for services to become available.
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A container simulating a remote Docker host with SSH access.
+/// Which container engine the remote host container runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RemoteEngine {
+    Docker,
+    Podman,
+}
+
+/// A container simulating a remote Docker or Podman host with SSH access.
 ///
 /// This is a test fixture similar to `TestRepo` and `TestDaemon`.
-/// It manages a Docker container running both an SSH server and a Docker daemon.
+/// It manages a Docker container running an SSH server plus either a
+/// Docker daemon or a rootful Podman API service.
 ///
 /// On drop, the container is stopped and removed.
 pub struct SshRemoteHost {
     /// Docker container ID.
     container_id: String,
+    /// The engine served by this remote host.
+    engine: RemoteEngine,
     /// IP address of the container (used on Linux for direct connection).
     ip_address: String,
     /// Published SSH port on localhost (used on macOS Docker Desktop where
@@ -57,16 +67,28 @@ impl SshRemoteHost {
     /// This builds (if necessary) and starts a container with SSH and Docker,
     /// generates SSH keys, and configures the container to accept connections.
     pub fn start() -> Self {
-        Self::start_inner(false)
+        Self::start_inner(false, RemoteEngine::Docker)
     }
 
     /// Start a new SSH remote host container with SSH published on localhost.
     pub fn start_published() -> Self {
-        Self::start_inner(true)
+        Self::start_inner(true, RemoteEngine::Docker)
     }
 
-    fn start_inner(force_publish_ssh: bool) -> Self {
-        let image_id = build_remote_docker_image().expect("Failed to build remote docker image");
+    /// Start a new SSH remote host container serving a Podman API socket.
+    pub fn start_podman() -> Self {
+        Self::start_inner(false, RemoteEngine::Podman)
+    }
+
+    fn start_inner(force_publish_ssh: bool, engine: RemoteEngine) -> Self {
+        let image_id = match engine {
+            RemoteEngine::Docker => {
+                build_remote_docker_image().expect("Failed to build remote docker image")
+            }
+            RemoteEngine::Podman => {
+                build_remote_podman_image().expect("Failed to build remote podman image")
+            }
+        };
 
         // Create temporary directory for SSH keys
         let temp_dir =
@@ -99,12 +121,19 @@ impl SshRemoteHost {
         let public_key =
             std::fs::read_to_string(&public_key_path).expect("Failed to read public key");
 
-        // Start the container with privileged mode for nested Docker.
+        // Start the container with privileged mode for the nested engine.
         // On macOS Docker Desktop, container IPs are inside the VM and not
         // routable from the host, so we publish the SSH port.
         let publish_ssh = force_publish_ssh || cfg!(target_os = "macos");
         let mut run_args = vec!["run", "-d", "--privileged", "--network"];
         run_args.push(&network_name);
+        if engine == RemoteEngine::Podman {
+            // Overlay upperdirs cannot live on the outer overlayfs and
+            // this sandbox has no /dev/fuse for the fuse-overlayfs
+            // fallback, so give the nested Podman tmpfs-backed storage.
+            run_args.push("--tmpfs");
+            run_args.push("/var/lib/containers:rw,size=4g,mode=0700");
+        }
         if publish_ssh {
             run_args.push("-p");
             run_args.push("0:22");
@@ -130,6 +159,7 @@ impl SshRemoteHost {
 
         let host = SshRemoteHost {
             container_id,
+            engine,
             ip_address,
             published_port,
             _temp_dir: temp_dir,
@@ -238,10 +268,43 @@ impl SshRemoteHost {
             .expect("Failed to install SSH public key");
     }
 
-    /// Wait for SSH and Docker services to be ready.
+    /// Wait for SSH and the container engine to be ready.
     fn wait_for_services(&self) {
-        self.wait_for_docker();
+        match self.engine {
+            RemoteEngine::Docker => self.wait_for_docker(),
+            RemoteEngine::Podman => self.wait_for_podman(),
+        }
         self.wait_for_ssh();
+    }
+
+    fn wait_for_podman(&self) {
+        let start = Instant::now();
+        while start.elapsed() < SERVICE_TIMEOUT {
+            // `podman version` requires a round-trip to the API socket,
+            // unlike client-only commands, so it proves the service is up.
+            let status = Command::new("docker")
+                .args([
+                    "exec",
+                    "--env",
+                    "CONTAINER_HOST=unix:///run/podman/podman.sock",
+                    &self.container_id,
+                    "podman",
+                    "version",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            if matches!(status, Ok(s) if s.success()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        panic!(
+            "Podman did not become available within {:?}",
+            SERVICE_TIMEOUT
+        );
     }
 
     fn wait_for_docker(&self) {
@@ -418,6 +481,101 @@ fn build_remote_docker_image() -> Result<String> {
         .args(["build", "-q", temp_dir.path().to_str().unwrap()])
         .output()
         .context("executing docker build for SSH server image")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("docker build failed: {stderr}"));
+    }
+
+    let image_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if image_id.is_empty() {
+        return Err(anyhow::anyhow!("docker build returned empty image ID"));
+    }
+
+    Ok(image_id)
+}
+
+/// Build the Docker image for the remote Podman host test container.
+///
+/// The container runs a rootful `podman system service` because rootless
+/// Podman cannot set up its user namespace in this sandbox (newuidmap is
+/// blocked even in privileged containers).  The SSH user reaches the
+/// rootful socket through group membership, and sshd's `SetEnv` points
+/// the user's podman client (including `podman system dial-stdio`) at it.
+/// On a real rootless remote, dial-stdio resolves the user's own socket
+/// instead and no such setup is needed.
+fn build_remote_podman_image() -> Result<String> {
+    let dockerfile = formatdoc! {r#"
+        FROM debian:13
+
+        # Install SSH server, Podman, and utilities
+        RUN apt-get update && apt-get install -y \
+            openssh-server \
+            podman \
+            git \
+            iproute2 \
+            && rm -rf /var/lib/apt/lists/*
+
+        # Create test user with access to the rootful Podman socket
+        RUN useradd -m -u {TEST_USER_UID} -s /bin/bash {SSH_USER} \
+            && groupadd podman-sock \
+            && usermod -aG podman-sock {SSH_USER}
+
+        # Native overlay on the tmpfs mounted at /var/lib/containers by
+        # the fixture; the Debian default would probe for fuse-overlayfs.
+        # Host networking because container network setup (pasta or a
+        # netavark bridge) needs /dev/net/tun, which this nested
+        # container lacks; same approach as the rumpelpod devcontainer.
+        RUN printf '%s\n' \
+            '[storage]' \
+            'driver = "overlay"' \
+            'runroot = "/run/containers/storage"' \
+            'graphroot = "/var/lib/containers/storage"' \
+            > /etc/containers/storage.conf \
+            && printf '%s\n' \
+            '[containers]' \
+            'netns = "host"' \
+            > /etc/containers/containers.conf
+
+        # Same Teleport-style locked-down sshd as the remote Docker
+        # image: no streamlocal forwarding, so the transport must use
+        # the exec channel (`podman system dial-stdio`), not Podman's
+        # built-in ssh:// socket forwarding.
+        RUN mkdir -p /run/sshd \
+            && ssh-keygen -A \
+            && sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config \
+            && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+            && sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+            && echo 'AllowStreamLocalForwarding no' >> /etc/ssh/sshd_config \
+            && echo 'SetEnv CONTAINER_HOST=unix:///run/podman/podman.sock' >> /etc/ssh/sshd_config
+
+        # Startup script that runs both the Podman API service and SSH.
+        RUN echo '#!/bin/bash\n\
+            set -e\n\
+            mkdir -p /run/podman\n\
+            rm -f /run/podman/podman.sock\n\
+            podman system service --time=0 unix:///run/podman/podman.sock &\n\
+            for i in $(seq 1 60); do\n\
+                if [ -S /run/podman/podman.sock ]; then break; fi\n\
+                sleep 1\n\
+            done\n\
+            chgrp podman-sock /run/podman/podman.sock\n\
+            chmod 660 /run/podman/podman.sock\n\
+            exec /usr/sbin/sshd -D\n\
+        ' > /start.sh && chmod +x /start.sh
+
+        CMD ["/start.sh"]
+    "#};
+
+    let temp_dir = TempDir::with_prefix("rumpelpod-podman-ssh-image-build-")
+        .context("creating temp dir for Podman SSH image build")?;
+    std::fs::write(temp_dir.path().join("Dockerfile"), &dockerfile)
+        .context("writing Dockerfile")?;
+
+    let output = Command::new("docker")
+        .args(["build", "-q", temp_dir.path().to_str().unwrap()])
+        .output()
+        .context("executing docker build for Podman SSH server image")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

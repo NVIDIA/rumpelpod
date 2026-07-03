@@ -14,9 +14,11 @@
 //! know how it was derived.
 
 mod engine;
+mod podman_ssh;
 mod spec;
 
 pub use engine::{ExecInteractiveOptions, Executor, PodBackendInfo};
+pub use podman_ssh::PodmanSshProxy;
 pub use spec::{
     DockerOnly, ExecOutput, ExecRequest, ExecStreams, K8sOnly, Mount, MountType, PodSpec, Resources,
 };

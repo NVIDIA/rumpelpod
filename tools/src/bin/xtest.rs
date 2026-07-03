@@ -972,14 +972,26 @@ fn run_tests(cases: Vec<TestCase>, config: &RunConfig) -> Vec<TestResult> {
     })
 }
 
-/// Remove leftover test containers so the pipeline's pre-flight
-/// check stays green.  The pipeline asserts no non-k3d containers
-/// exist before starting, so anything left after tests must be ours.
-fn cleanup_containers() {
-    let output = match Command::new("docker")
-        .args(["ps", "-a", "--format", "{{.Names}}"])
-        .output()
-    {
+/// Remove leftover test containers so failed tests do not poison the next run.
+fn cleanup_containers(executor: &Executor) {
+    let engine = match executor {
+        Executor::Podman => "podman",
+        Executor::Eks | Executor::Hetzner | Executor::K3d => "docker",
+    };
+    let args: &[&str] = match executor {
+        Executor::Podman => &[
+            "ps",
+            "-a",
+            "--filter",
+            "label=dev.rumpelpod.repo_path",
+            "--format",
+            "{{.Names}}",
+        ],
+        Executor::Eks | Executor::Hetzner | Executor::K3d => {
+            &["ps", "-a", "--format", "{{.Names}}"]
+        }
+    };
+    let output = match Command::new(engine).args(args).output() {
         Ok(out) if out.status.success() => out,
         _ => return,
     };
@@ -995,10 +1007,10 @@ fn cleanup_containers() {
         return;
     }
     eprintln!(
-        "warning: {} leftover Docker containers (per-test cleanup missed them)",
-        to_remove.len(),
+        "warning: {} leftover {engine} containers (per-test cleanup missed them)",
+        to_remove.len()
     );
-    let _ = Command::new("docker")
+    let _ = Command::new(engine)
         .arg("rm")
         .arg("-f")
         .args(&to_remove)
@@ -1293,7 +1305,7 @@ fn run() -> Result<ExitCode> {
     );
 
     let results = run_tests(cases, &config);
-    cleanup_containers();
+    cleanup_containers(&cleanup_executor);
     cleanup_k8s_namespaces(&cleanup_executor);
     let any_failed = results
         .iter()

@@ -149,10 +149,10 @@ pub enum Host {
 }
 
 impl Host {
-    /// Parse a Docker host specification from CLI or config file.
+    /// Parse a container host specification from CLI or config file.
     ///
-    /// - `"localhost"` means local Docker.
-    /// - `"ssh://user@host"` means remote Docker via SSH.
+    /// - `"localhost"` means the local Docker or Podman engine.
+    /// - `"ssh://user@host"` means a remote Docker or Podman engine via SSH.
     ///
     /// Bare hostnames like `"dev"` are rejected, use `"ssh://dev"` instead.
     /// Kubernetes hosts are configured via `--kubernetes-context` / `kubernetes` instead.
@@ -166,8 +166,8 @@ impl Host {
         let url = Url::parse(s).with_context(|| {
             if !s.contains("://") {
                 format!(
-                    "invalid host '{s}'. Use 'localhost' for local Docker \
-                     or 'ssh://host' for remote Docker."
+                    "invalid host '{s}'. Use 'localhost' for a local engine \
+                     or 'ssh://host' for a remote engine."
                 )
             } else {
                 format!("invalid URL: {s}")
@@ -201,7 +201,7 @@ impl Host {
             }
             other => Err(anyhow::anyhow!(
                 "unsupported scheme '{other}' in host '{s}'. \
-                     Use 'ssh://' for remote Docker, or \
+                     Use 'ssh://' for a remote engine, or \
                      '--kubernetes-context' / 'kubernetes' for Kubernetes."
             )),
         }
@@ -304,22 +304,10 @@ impl Host {
             Host::Ssh {
                 ssh_destination,
                 engine,
-            } => {
-                let engine = engine.resolve(false, "ssh Docker executor")?;
-                match engine {
-                    ContainerEngine::Docker => Ok(Host::Ssh {
-                        ssh_destination,
-                        engine,
-                    }),
-                    ContainerEngine::Podman => Err(anyhow::anyhow!(
-                        "podman over ssh is not supported yet; Podman remote needs a configured \
-                         service URL or connection, not Docker's ssh:// transport"
-                    )),
-                    ContainerEngine::Auto => {
-                        panic!("container engine auto remained after resolve")
-                    }
-                }
-            }
+            } => Ok(Host::Ssh {
+                ssh_destination,
+                engine: engine.resolve(true, "ssh container executor")?,
+            }),
             Host::Kubernetes {
                 context,
                 namespace,

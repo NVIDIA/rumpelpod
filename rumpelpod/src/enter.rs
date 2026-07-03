@@ -361,8 +361,9 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
     exec_cmd.extend(cmd.command.clone());
 
     // Local Docker reuses the socket the daemon resolved before it
-    // entered the test or user runtime environment.  SSH and
-    // Kubernetes connect through their native client transports.
+    // entered the test or user runtime environment.  SSH Docker and
+    // Kubernetes connect through their native client transports; SSH
+    // Podman starts a short-lived dial-stdio proxy for this exec.
     let executor = match &result.host {
         Host::Localhost {
             engine: ContainerEngine::Docker,

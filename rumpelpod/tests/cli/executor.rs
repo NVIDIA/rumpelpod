@@ -93,6 +93,10 @@ pub fn podman_executor_available() -> bool {
     command_succeeds(Command::new("podman").arg("info"))
 }
 
+pub fn docker_available() -> bool {
+    command_succeeds(Command::new("docker").arg("info"))
+}
+
 pub fn skip_unless_podman_executor() -> bool {
     if podman_executor_available() {
         true

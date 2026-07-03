@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -45,6 +46,10 @@ enum Inner {
 struct DockerBackend {
     engine: ContainerEngine,
     cli_target: DockerCliTarget,
+    /// Keeps a CLI-side podman SSH proxy alive for as long as this
+    /// executor.  Daemon-side executors point at the per-connection
+    /// proxy instead, which outlives them.
+    _podman_ssh_proxy: Option<Arc<crate::executor::PodmanSshProxy>>,
 }
 
 #[derive(Clone)]
@@ -69,23 +74,19 @@ impl Executor {
             inner: Inner::Docker(DockerBackend {
                 engine,
                 cli_target: DockerCliTarget::UnixSocket(socket.to_path_buf()),
+                _podman_ssh_proxy: None,
             }),
         })
     }
 
     /// Connect to a docker daemon through Docker's SSH transport.
-    pub fn docker_ssh(ssh_destination: &str, engine: ContainerEngine) -> Result<Self> {
-        if engine != ContainerEngine::Docker {
-            return Err(anyhow::anyhow!(
-                "ssh container hosts require docker; podman remote needs a configured \
-                 service URL or connection"
-            ));
-        }
+    pub fn docker_ssh(ssh_destination: &str) -> Result<Self> {
         let uri = format!("ssh://{ssh_destination}");
         Ok(Self {
             inner: Inner::Docker(DockerBackend {
-                engine,
+                engine: ContainerEngine::Docker,
                 cli_target: DockerCliTarget::Ssh { uri },
+                _podman_ssh_proxy: None,
             }),
         })
     }
@@ -96,8 +97,30 @@ impl Executor {
             inner: Inner::Docker(DockerBackend {
                 engine: ContainerEngine::Podman,
                 cli_target: DockerCliTarget::Local,
+                _podman_ssh_proxy: None,
             }),
         })
+    }
+
+    /// Connect to a remote Podman service through a fresh SSH proxy
+    /// owned by this executor.  The daemon uses the per-connection
+    /// proxy via [`Self::new`] instead; this is for CLI-side use where
+    /// no `HostConnection` exists.
+    pub fn podman_ssh(ssh_destination: &str) -> Result<Self> {
+        let proxy = Arc::new(crate::executor::PodmanSshProxy::start(ssh_destination)?);
+        Ok(Self::podman_proxied(proxy))
+    }
+
+    /// Connect to a remote Podman service through an already-running
+    /// SSH proxy.
+    pub fn podman_proxied(proxy: Arc<crate::executor::PodmanSshProxy>) -> Self {
+        Self {
+            inner: Inner::Docker(DockerBackend {
+                engine: ContainerEngine::Podman,
+                cli_target: DockerCliTarget::UnixSocket(proxy.socket_path().to_path_buf()),
+                _podman_ssh_proxy: Some(proxy),
+            }),
+        }
     }
 
     /// Connect to a Docker host without going through the daemon's
@@ -118,8 +141,18 @@ impl Executor {
             }
             Host::Ssh {
                 ssh_destination,
-                engine,
-            } => Self::docker_ssh(ssh_destination, *engine),
+                engine: ContainerEngine::Docker,
+            } => Self::docker_ssh(ssh_destination),
+            Host::Ssh {
+                ssh_destination,
+                engine: ContainerEngine::Podman,
+            } => Self::podman_ssh(ssh_destination),
+            Host::Ssh {
+                engine: ContainerEngine::Auto,
+                ..
+            } => {
+                panic!("container_host called with unresolved container engine auto")
+            }
             Host::Kubernetes { .. } => {
                 panic!("container_host called on Kubernetes host")
             }
@@ -154,8 +187,14 @@ impl Executor {
             },
             HostConnection::Ssh(ssh) => {
                 ssh.ensure_connected()
-                    .context("opening ssh docker transport")?;
-                Self::docker_ssh(ssh.destination(), ssh.engine())
+                    .context("opening ssh engine transport")?;
+                match ssh.engine() {
+                    ContainerEngine::Docker => Self::docker_ssh(ssh.destination()),
+                    ContainerEngine::Podman => Ok(Self::podman_proxied(ssh.podman_proxy()?)),
+                    ContainerEngine::Auto => {
+                        panic!("ssh connection has unresolved container engine auto")
+                    }
+                }
             }
             HostConnection::Kubernetes(k) => {
                 let client = k.ensure_client().context("opening k8s connection")?;
@@ -373,7 +412,7 @@ impl DockerBackend {
                     command.args(["--url", &format!("unix://{socket}")]);
                 }
                 DockerCliTarget::Ssh { .. } => {
-                    panic!("podman ssh target should have been rejected")
+                    panic!("podman ssh targets use a local proxy socket, not an ssh:// CLI target")
                 }
             },
             ContainerEngine::Auto => {
@@ -401,7 +440,7 @@ impl DockerBackend {
                     command.args(["--url", &format!("unix://{socket}")]);
                 }
                 DockerCliTarget::Ssh { .. } => {
-                    panic!("podman ssh target should have been rejected")
+                    panic!("podman ssh targets use a local proxy socket, not an ssh:// CLI target")
                 }
             },
             ContainerEngine::Auto => {
@@ -718,7 +757,19 @@ fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<(
         command.args(["--network", "bridge"]);
     }
     if let Some(runtime) = runtime {
-        command.args(["--runtime", &runtime]);
+        match backend.engine {
+            ContainerEngine::Docker => {
+                command.args(["--runtime", &runtime]);
+            }
+            ContainerEngine::Podman => {
+                // `podman create` has no --runtime flag; spec producers
+                // must null the runtime (with a warning) for Podman.
+                panic!("podman pod spec should not carry a runtime")
+            }
+            ContainerEngine::Auto => {
+                panic!("container engine auto remained after resolve")
+            }
+        }
     }
     if privileged {
         command.arg("--privileged");

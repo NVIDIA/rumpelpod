@@ -819,9 +819,11 @@ struct ResolvedLaunch {
     bind_sources: Vec<BindSource>,
     container_repo_path: PathBuf,
     executor: crate::executor::Executor,
-    /// `Some` only for localhost Docker, where client-side interactive
-    /// exec can reuse the exact daemon socket.  SSH and k8s clients
-    /// connect through their native transports.
+    /// Unix socket for engine CLI invocations during the launch: the
+    /// daemon-resolved socket for localhost Docker, the daemon's proxy
+    /// socket for SSH Podman, `None` otherwise.  Only the localhost
+    /// Docker value is forwarded to the client, which reuses it for
+    /// interactive exec.
     docker_socket: Option<PathBuf>,
 }
 
@@ -1138,9 +1140,11 @@ fn build_docker_pod_spec(
     image: &Image,
     repo_path: &Path,
     container_repo_path: &Path,
+    container_engine: ContainerEngine,
     dc: &DevContainer,
     mounts: &[devcontainer::MountObject],
     publish_ports: &HashMap<u16, u16>,
+    progress_tx: &std::sync::mpsc::Sender<OutputLine>,
 ) -> Result<crate::executor::PodSpec> {
     use crate::executor::{DockerOnly, K8sOnly, Mount, PodSpec};
 
@@ -1194,6 +1198,25 @@ fn build_docker_pod_spec(
 
     let init = dc.init == Some(true) || run_args_config.init;
 
+    let runtime = match container_engine {
+        ContainerEngine::Docker => run_args_config.runtime,
+        ContainerEngine::Podman => {
+            if run_args_config.runtime.is_some() {
+                progress_tx
+                    .send(OutputLine::Stderr(
+                        "warning: --runtime in runArgs is ignored by Podman; \
+                         configure the OCI runtime in containers.conf instead"
+                            .into(),
+                    ))
+                    .ok();
+            }
+            None
+        }
+        ContainerEngine::Auto => {
+            panic!("container engine auto remained after resolve")
+        }
+    };
+
     Ok(PodSpec {
         image: image.0.clone(),
         hostname: crate::executor::Hostname::new(sanitize_hostname(&pod_name.0))
@@ -1212,7 +1235,7 @@ fn build_docker_pod_spec(
         seccomp_unconfined: false,
         apparmor_unconfined: false,
         resources: None,
-        runtime: run_args_config.runtime,
+        runtime,
         docker_only: DockerOnly {
             init,
             devices: run_args_config.devices,
@@ -1993,6 +2016,36 @@ impl DaemonServer {
         crate::executor::Executor::new(&conn)
     }
 
+    /// The unix socket that engine CLI invocations (builds, inspects)
+    /// should target for this host, if any.  Localhost Docker pins the
+    /// daemon-resolved socket; localhost Podman uses the client's own
+    /// default resolution; SSH Podman goes through the per-connection
+    /// `PodmanSshProxy`; SSH Docker uses its native `ssh://` transport.
+    ///
+    /// The proxy socket lives only as long as the connection, so
+    /// callers must keep `conn` alive while they use the returned path.
+    fn engine_cli_socket(&self, conn: &host_connection::HostConnection) -> Result<Option<PathBuf>> {
+        match conn {
+            host_connection::HostConnection::Localhost(local) => match local.engine() {
+                ContainerEngine::Docker => Ok(Some(default_docker_socket())),
+                ContainerEngine::Podman => Ok(None),
+                ContainerEngine::Auto => {
+                    panic!("container engine auto remained after resolve")
+                }
+            },
+            host_connection::HostConnection::Ssh(ssh) => match ssh.engine() {
+                ContainerEngine::Docker => Ok(None),
+                ContainerEngine::Podman => {
+                    Ok(Some(ssh.podman_proxy()?.socket_path().to_path_buf()))
+                }
+                ContainerEngine::Auto => {
+                    panic!("container engine auto remained after resolve")
+                }
+            },
+            host_connection::HostConnection::Kubernetes(_) => Ok(None),
+        }
+    }
+
     /// Reconnect to an existing pod that is recorded in the database.
     ///
     /// Only a backend-confirmed Gone status means the DB row is stale.
@@ -2066,22 +2119,17 @@ impl DaemonServer {
                 ReconnectPodResult::Connected(Box::new(result))
             }
             Host::Localhost { .. } | Host::Ssh { .. } => {
-                let docker_socket = match docker_host {
-                    Host::Ssh { .. } => None,
-                    Host::Localhost {
-                        engine: ContainerEngine::Docker,
-                    } => Some(default_docker_socket()),
-                    Host::Localhost {
-                        engine: ContainerEngine::Podman,
-                    } => None,
-                    Host::Localhost {
-                        engine: ContainerEngine::Auto,
-                    } => {
-                        panic!("container engine auto remained after resolve")
-                    }
-                    Host::Kubernetes { .. } => unreachable!(),
+                // Keep the connection alive across the reconnect: a
+                // podman ssh proxy socket dies with the connection.
+                let host_conn = match self.host_connections.get_or_create(docker_host) {
+                    Ok(conn) => conn,
+                    Err(e) => return ReconnectPodResult::Unavailable(e),
                 };
-                let executor = match self.host_executor(docker_host) {
+                let docker_socket = match self.engine_cli_socket(&host_conn) {
+                    Ok(socket) => socket,
+                    Err(e) => return ReconnectPodResult::Unavailable(e),
+                };
+                let executor = match crate::executor::Executor::new(&host_conn) {
                     Ok(executor) => executor,
                     Err(e) => return ReconnectPodResult::Unavailable(e),
                 };
@@ -2470,7 +2518,13 @@ impl DaemonServer {
 
         Ok(LaunchResult {
             container_id: ContainerId(pod_id.as_str().to_string()),
-            docker_socket,
+            // Clients reuse this socket only for localhost Docker.  The
+            // SSH Podman proxy socket is daemon-internal; clients dial
+            // their own proxy.
+            docker_socket: match docker_host {
+                Host::Localhost { .. } => docker_socket,
+                Host::Ssh { .. } | Host::Kubernetes { .. } => None,
+            },
             host: docker_host.clone(),
             image_built: false,
             container_url,
@@ -2690,21 +2744,12 @@ impl DaemonServer {
             local_env_vars,
             ssh_auth_sock,
         } = params;
+        let requested_host = docker_host;
 
         let (mut devcontainer, used_default_image) =
             load_and_resolve_devcontainer(&repo_path, &pod_name.0, &local_env_vars)?;
         let raw_devcontainer_json =
             DevContainer::find_raw(&repo_path)?.unwrap_or_else(|| "{}".to_string());
-
-        if docker_host.is_remote() {
-            validate_bind_mount_ownership(&devcontainer)?;
-        }
-
-        if let Some(ref requirements) = devcontainer.host_requirements {
-            if let Some(msg) = host_requirements_message(requirements, &docker_host) {
-                build_tx.send(OutputLine::Stderr(msg)).ok();
-            }
-        }
 
         // When re-entering an existing pod, use the host it was created on
         // rather than whatever the current config resolves to.  The pod is
@@ -2714,7 +2759,6 @@ impl DaemonServer {
         // reconnect.  If the pod turns out to be gone (k8s eviction,
         // Docker removal), clean up the stale DB record and fall through
         // to a fresh create.
-        let mut docker_host = docker_host.resolve_container_tools()?;
         // Wait for any in-progress background stop to finish before
         // checking the DB for reentry or creating a new pod.
         for _ in 0..50 {
@@ -2730,21 +2774,13 @@ impl DaemonServer {
         {
             let conn = self.db.lock().unwrap();
             if let Some(existing) = db::get_pod(&conn, &repo_path, &pod_name.0)? {
-                let host_spec = serde_json::to_string(&docker_host)?;
-                if existing.host != host_spec {
-                    let existing_host: Host = serde_json::from_str(&existing.host)
-                        .context("parsing stored host for existing pod")?;
-                    eprintln!(
-                        "pod '{}' exists on {}, reconnecting there.",
-                        pod_name.0, existing_host,
-                    );
-                    docker_host = existing_host;
-                }
+                let existing_host: Host = serde_json::from_str(&existing.host)
+                    .context("parsing stored host for existing pod")?;
                 drop(conn);
                 match self.reconnect_pod(
                     &pod_name,
                     &repo_path,
-                    &docker_host,
+                    &existing_host,
                     &devcontainer,
                     &local_env_vars,
                     &existing,
@@ -2763,6 +2799,17 @@ impl DaemonServer {
                         )));
                     }
                 }
+            }
+        }
+
+        let docker_host = requested_host.resolve_container_tools()?;
+        if docker_host.is_remote() {
+            validate_bind_mount_ownership(&devcontainer)?;
+        }
+
+        if let Some(ref requirements) = devcontainer.host_requirements {
+            if let Some(msg) = host_requirements_message(requirements, &docker_host) {
+                build_tx.send(OutputLine::Stderr(msg)).ok();
             }
         }
 
@@ -2793,22 +2840,11 @@ impl DaemonServer {
         let container_repo_path = devcontainer.container_repo_path(&repo_path);
         let git_dir = fs::canonicalize(repo_path.join(".git")).context("resolving .git dir")?;
 
-        let docker_socket: Option<PathBuf> = match &docker_host {
-            Host::Ssh { .. } => None,
-            Host::Localhost {
-                engine: ContainerEngine::Docker,
-            } => Some(default_docker_socket()),
-            Host::Localhost {
-                engine: ContainerEngine::Podman,
-            } => None,
-            Host::Localhost {
-                engine: ContainerEngine::Auto,
-            } => {
-                panic!("container engine auto remained after resolve")
-            }
-            Host::Kubernetes { .. } => None,
-        };
-        let executor = self.host_executor(&docker_host)?;
+        // Keep the connection alive for the whole launch: a podman ssh
+        // proxy socket returned here dies with the connection.
+        let host_conn = self.host_connections.get_or_create(&docker_host)?;
+        let docker_socket = self.engine_cli_socket(&host_conn)?;
+        let executor = crate::executor::Executor::new(&host_conn)?;
 
         gateway::setup_gateway(&repo_path)?;
 
@@ -2948,22 +2984,11 @@ impl DaemonServer {
         let (mounts, bind_sources) = split_bind_mounts(all_mounts, &docker_host, &pod_name.0);
         let container_repo_path = devcontainer.container_repo_path(&repo_path);
 
-        let docker_socket: Option<PathBuf> = match &docker_host {
-            Host::Ssh { .. } => None,
-            Host::Localhost {
-                engine: ContainerEngine::Docker,
-            } => Some(default_docker_socket()),
-            Host::Localhost {
-                engine: ContainerEngine::Podman,
-            } => None,
-            Host::Localhost {
-                engine: ContainerEngine::Auto,
-            } => {
-                panic!("container engine auto remained after resolve")
-            }
-            Host::Kubernetes { .. } => None,
-        };
-        let executor = self.host_executor(&docker_host)?;
+        // Keep the connection alive for the whole launch: a podman ssh
+        // proxy socket returned here dies with the connection.
+        let host_conn = self.host_connections.get_or_create(&docker_host)?;
+        let docker_socket = self.engine_cli_socket(&host_conn)?;
+        let executor = crate::executor::Executor::new(&host_conn)?;
 
         gateway::setup_gateway(&repo_path)?;
         preflight_image_present(&executor, &source_image)?;
@@ -3097,9 +3122,13 @@ impl DaemonServer {
                 &image,
                 &repo_path,
                 &container_repo_path,
+                docker_host
+                    .container_engine()
+                    .expect("kubernetes hosts are handled before docker launch"),
                 &devcontainer,
                 &mounts,
                 &publish_ports,
+                &progress_tx,
             )?;
             executor.launch(&exec_pod_id, spec)?;
             let container_id = ContainerId(exec_pod_id.as_str().to_string());
@@ -3214,7 +3243,13 @@ impl DaemonServer {
 
         Ok(LaunchResult {
             container_id,
-            docker_socket,
+            // Clients reuse this socket only for localhost Docker.  The
+            // SSH Podman proxy socket is daemon-internal; clients dial
+            // their own proxy.
+            docker_socket: match &docker_host {
+                Host::Localhost { .. } => docker_socket,
+                Host::Ssh { .. } | Host::Kubernetes { .. } => None,
+            },
             host: docker_host,
             image_built,
             container_url,

@@ -24,7 +24,9 @@ use crate::CommandExt;
 ///
 /// Local Docker may pass an explicit socket so the command uses the
 /// same daemon endpoint rumpelpod resolved earlier.  SSH Docker hosts
-/// use Docker's native `ssh://` transport.
+/// use Docker's native `ssh://` transport.  SSH Podman hosts pass the
+/// daemon's per-host proxy socket (see `PodmanSshProxy`) as
+/// `docker_socket`.
 pub fn apply_docker_host(cmd: &mut Command, docker_host: &Host, docker_socket: Option<&Path>) {
     match docker_host {
         Host::Localhost {
@@ -60,7 +62,10 @@ pub fn apply_docker_host(cmd: &mut Command, docker_host: &Host, docker_socket: O
             engine: ContainerEngine::Podman,
             ..
         } => {
-            panic!("podman ssh target should have been rejected")
+            let socket = docker_socket
+                .expect("podman ssh commands require the proxy socket as docker_socket");
+            let socket = socket.display();
+            cmd.args(["--url", &format!("unix://{socket}")]);
         }
         Host::Ssh {
             engine: ContainerEngine::Auto,

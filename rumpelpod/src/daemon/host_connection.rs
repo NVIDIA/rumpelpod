@@ -8,8 +8,9 @@
 //! to that host:
 //!
 //! * `Localhost`: nothing.  Always considered up.
-//! * `Ssh`: direct `ssh ... docker system dial-stdio` probes; Docker
-//!   clients create their own SSH-backed transports.
+//! * `Ssh`: direct `ssh ... <engine> system dial-stdio` probes.  Docker
+//!   clients create their own SSH-backed transports; podman clients go
+//!   through a per-host `PodmanSshProxy` owned by the connection.
 //! * `Kubernetes`: a cached `kube` client.
 //!
 //! Callers (typically `Executor::new`) can trigger a short liveness
@@ -41,6 +42,7 @@ use tokio::time::timeout;
 
 use crate::async_runtime::RUNTIME;
 use crate::config::{ContainerEngine, Host};
+use crate::executor::PodmanSshProxy;
 use crate::k8s::K8sClient;
 
 /// Identity of a host: collapses `Host::Kubernetes`'s extra fields
@@ -347,6 +349,10 @@ pub struct SshConnection {
     probe: Arc<Notify>,
     /// Serializes probes so concurrent callers do not dial in parallel.
     bring_up: Mutex<()>,
+    /// Local proxy socket bridging the podman CLI to the remote API
+    /// service.  Started on first use; lives as long as the connection.
+    /// Always `None` for Docker hosts, which use `docker -H ssh://`.
+    podman_proxy: Mutex<Option<Arc<PodmanSshProxy>>>,
     /// The single per-host retry/liveness loop.  Aborted on drop.
     _monitor: AbortOnDrop,
 }
@@ -368,6 +374,7 @@ impl SshConnection {
                 status_tx,
                 probe,
                 bring_up: Mutex::new(()),
+                podman_proxy: Mutex::new(None),
                 _monitor: AbortOnDrop(task),
             }
         })
@@ -404,6 +411,28 @@ impl SshConnection {
         self.engine
     }
 
+    /// The local proxy socket through which the podman CLI reaches this
+    /// host, starting the proxy on first use.
+    /// Panics if called on a Docker host.
+    pub fn podman_proxy(&self) -> Result<Arc<PodmanSshProxy>> {
+        match self.engine {
+            ContainerEngine::Docker => {
+                panic!("podman_proxy() called on a Docker ssh host")
+            }
+            ContainerEngine::Podman => {}
+            ContainerEngine::Auto => {
+                panic!("container engine auto remained after resolve")
+            }
+        }
+        let mut proxy = self.podman_proxy.lock().unwrap();
+        if let Some(proxy) = proxy.as_ref() {
+            return Ok(proxy.clone());
+        }
+        let started = Arc::new(PodmanSshProxy::start(&self.destination)?);
+        *proxy = Some(started.clone());
+        Ok(started)
+    }
+
     /// Update liveness, emitting a host event only on a real transition.
     fn set_status(&self, status: HostStatus) {
         let changed = self.status_tx.send_if_modified(|current| {
@@ -431,15 +460,16 @@ impl SshConnection {
     pub fn ensure_connected(&self) -> Result<()> {
         let _guard = self.bring_up.lock().unwrap();
 
-        if ping_ssh_docker(&self.destination) {
+        if ping_ssh_engine(&self.destination, self.engine) {
             self.set_status(HostStatus::Connected);
             return Ok(());
         }
 
         self.set_status(HostStatus::Disconnected);
+        let engine = self.engine.binary_name();
         Err(anyhow::anyhow!(
-            "SSH Docker transport to {} failed to answer /_ping within {:?}. \
-             Check SSH configuration, remote Docker, and Docker socket permissions.",
+            "SSH {engine} transport to {} failed to answer /_ping within {:?}. \
+             Check SSH configuration, remote {engine}, and API socket permissions.",
             self.key(),
             PING_TIMEOUT
         ))
@@ -488,46 +518,46 @@ async fn ssh_monitor(weak: Weak<SshConnection>, probe: Arc<Notify>) {
     }
 }
 
-fn ssh_dial_stdio_args(destination: &str) -> Vec<OsString> {
+fn ssh_dial_stdio_args(destination: &str, engine: ContainerEngine) -> Vec<OsString> {
     vec![
         OsString::from("-o"),
         OsString::from("BatchMode=yes"),
         OsString::from(destination),
-        OsString::from("docker"),
+        OsString::from(engine.binary_name()),
         OsString::from("system"),
         OsString::from("dial-stdio"),
     ]
 }
 
-/// Hard ceiling on the docker `/_ping` round-trip over SSH.
+/// Hard ceiling on the engine `/_ping` round-trip over SSH.
 const PING_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn ping_ssh_docker(destination: &str) -> bool {
+fn ping_ssh_engine(destination: &str, engine: ContainerEngine) -> bool {
     let destination = destination.to_string();
     match RUNTIME
-        .block_on(async { timeout(PING_TIMEOUT, ping_ssh_docker_inner(destination)).await })
+        .block_on(async { timeout(PING_TIMEOUT, ping_ssh_engine_inner(destination, engine)).await })
     {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
-            debug!("ssh docker ping failed: {e:#}");
+            debug!("ssh engine ping failed: {e:#}");
             false
         }
         Err(_) => {
-            debug!("ssh docker ping timed out after {PING_TIMEOUT:?}");
+            debug!("ssh engine ping timed out after {PING_TIMEOUT:?}");
             false
         }
     }
 }
 
-async fn ping_ssh_docker_inner(destination: String) -> Result<()> {
+async fn ping_ssh_engine_inner(destination: String, engine: ContainerEngine) -> Result<()> {
     let mut child = TokioCommand::new("ssh")
-        .args(ssh_dial_stdio_args(&destination))
+        .args(ssh_dial_stdio_args(&destination, engine))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .context("spawning ssh docker dial-stdio")?;
+        .context("spawning ssh engine dial-stdio")?;
 
     let mut stdin = child.stdin.take().context("ssh child stdin missing")?;
     let mut stdout = child.stdout.take().context("ssh child stdout missing")?;
@@ -536,32 +566,32 @@ async fn ping_ssh_docker_inner(destination: String) -> Result<()> {
     stdin
         .write_all(request.as_bytes())
         .await
-        .context("writing docker ping request")?;
+        .context("writing engine ping request")?;
     stdin
         .shutdown()
         .await
-        .context("closing docker ping request")?;
+        .context("closing engine ping request")?;
 
     let mut response = [0u8; 256];
     let n = stdout
         .read(&mut response)
         .await
-        .context("reading docker ping response")?;
-    let status = child.wait().await.context("waiting for ssh docker ping")?;
+        .context("reading engine ping response")?;
+    let status = child.wait().await.context("waiting for ssh engine ping")?;
     if !status.success() {
         return Err(anyhow::anyhow!(
-            "ssh docker dial-stdio exited with {status}"
+            "ssh engine dial-stdio exited with {status}"
         ));
     }
     if n == 0 {
-        return Err(anyhow::anyhow!("empty docker ping response"));
+        return Err(anyhow::anyhow!("empty engine ping response"));
     }
 
     let response_str = String::from_utf8_lossy(&response[..n]);
     if response_str.starts_with("HTTP/1.1 200") || response_str.starts_with("HTTP/1.0 200") {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("unexpected docker ping response"))
+        Err(anyhow::anyhow!("unexpected engine ping response"))
     }
 }
 
@@ -751,7 +781,7 @@ mod ssh_tests {
 
     #[test]
     fn ssh_args_do_not_include_port() {
-        let args = args_to_strings(&ssh_dial_stdio_args("dev"));
+        let args = args_to_strings(&ssh_dial_stdio_args("dev", ContainerEngine::Docker));
 
         assert_eq!(
             args,
@@ -766,6 +796,23 @@ mod ssh_tests {
         );
         assert_no_rumpelpod_ssh_policy(&args);
         assert!(!args.iter().any(|arg| arg == "-p"));
+    }
+
+    #[test]
+    fn ssh_args_use_podman_dial_stdio_for_podman_hosts() {
+        let args = args_to_strings(&ssh_dial_stdio_args("dev", ContainerEngine::Podman));
+
+        assert_eq!(
+            args,
+            vec![
+                "-o",
+                "BatchMode=yes",
+                "dev",
+                "podman",
+                "system",
+                "dial-stdio"
+            ]
+        );
     }
 }
 

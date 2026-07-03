@@ -22,6 +22,8 @@ pub fn build(cmd: &ImageBuildCommand) -> Result<()> {
         ));
     }
     let docker_host = docker_host.resolve_container_tools()?;
+    let podman_proxy = crate::executor::PodmanSshProxy::for_host(&docker_host)?;
+    let docker_socket = podman_proxy.as_ref().map(|p| p.socket_path());
 
     let on_output: Option<image::BuildOutputFn> =
         Some(Box::new(|line: image::OutputLine| match line {
@@ -47,7 +49,7 @@ pub fn build(cmd: &ImageBuildCommand) -> Result<()> {
         // the context path always belongs in the tag.
         image::ContextPathTagging::Include,
         on_output,
-        None,
+        docker_socket,
         None,
     )?;
 
@@ -79,13 +81,15 @@ pub fn fetch(cmd: &ImageFetchCommand) -> Result<()> {
         ));
     }
     let docker_host = docker_host.resolve_container_tools()?;
+    let podman_proxy = crate::executor::PodmanSshProxy::for_host(&docker_host)?;
+    let docker_socket = podman_proxy.as_ref().map(|p| p.socket_path());
 
     let image_name = devcontainer
         .image
         .as_deref()
         .expect("either image or build must be set");
 
-    image::pull_image(image_name, &docker_host, None)?;
+    image::pull_image(image_name, &docker_host, docker_socket)?;
     println!("image pulled: {image_name}");
 
     Ok(())

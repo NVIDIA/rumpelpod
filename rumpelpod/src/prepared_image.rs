@@ -21,6 +21,7 @@ use crate::cli::PrepareImageCommand;
 use crate::config::{ContainerEngine, Host};
 use crate::git::GitRemote;
 use crate::image::{BuildOutputFn, BuildResult, BuildxMode, Image};
+use crate::CommandExt;
 
 /// GCS bucket hosting Claude Code releases (mirrors pod/pty.rs).
 const CLAUDE_CODE_DIST_BUCKET: &str =
@@ -316,9 +317,12 @@ fn compute_prepared_tag(
 
 /// Generate the Dockerfile content for the prepared image.
 ///
-/// The host `.git` dir is passed as a named build context (`gateway`)
-/// and bind-mounted at build time so its contents never end up in an
-/// image layer.
+/// The host `.git` dir travels as a `gateway-git/` copy in the build
+/// context, exposed through the `gateway` stage and bind-mounted into
+/// the prepare-image step, so its contents never end up in a layer of
+/// the prepared image.  A named build context would avoid the copy but
+/// Podman's remote API does not transfer additional build contexts, so
+/// all engines share the in-context layout instead.
 ///
 /// After the rumpel binary is installed, remaining setup (repo clone,
 /// Claude CLI) is delegated to `rumpel prepare-image` so the logic
@@ -399,6 +403,9 @@ fn generate_dockerfile(
     // sessions -- switch_user() handles dropping to the container
     // user in-pod.
     formatdoc! {r#"
+        FROM scratch AS gateway
+        COPY gateway-git/ /
+
         FROM {base_image}
 
         ARG TARGETARCH
@@ -420,9 +427,8 @@ fn generate_dockerfile(
 
 /// Assemble the build context directory with the Dockerfile and binaries.
 ///
-/// The host `.git` dir is NOT included here -- it is passed separately
-/// via `--build-context` so buildx can transfer it efficiently and the
-/// Dockerfile bind-mounts it without baking it into a layer.
+/// The host `.git` dir is not staged here; the caller copies it in
+/// afterwards (see `copy_git_dir_into_context`).
 #[allow(clippy::too_many_arguments)]
 fn assemble_build_context(
     base_image: &str,
@@ -454,6 +460,13 @@ fn assemble_build_context(
     );
     let binaries = find_rumpel_binaries()?;
 
+    // TODO: BuildKit's incremental context transfer is keyed to the
+    // context path, so a fresh temp dir per build means every
+    // cache-miss build re-transfers the whole context, including
+    // gateway-git/.  Staging at a stable per-repo path would enable
+    // delta transfer for docker and k8s builders (podman's remote API
+    // has no incremental filesync).  Only worth it if cache-miss
+    // builds of large repos turn out to be frequent enough to hurt.
     let tmp = tempfile::tempdir().context("creating build context temp dir")?;
     fs::write(tmp.path().join("Dockerfile"), dockerfile)
         .context("writing Dockerfile to build context")?;
@@ -481,22 +494,26 @@ fn assemble_build_context(
     Ok(tmp)
 }
 
-/// Create a symlink to the `.git` dir without the `.git` suffix.
+/// Copy the `.git` dir into the build context as `gateway-git/`.
 ///
-/// Buildx misidentifies directories containing a HEAD file as remote
-/// git URLs.  A symlink without `.git` in the name forces
-/// local-directory treatment.
-fn create_gateway_link(git_dir: &Path, build_context: &Path) -> Result<PathBuf> {
+/// A named build context would avoid this copy, but Podman's remote
+/// API cannot transfer additional build contexts, so the git dir
+/// travels inside the main context for every engine.  The copy is a
+/// snapshot: builds do not see concurrent mutation of the live `.git`.
+fn copy_git_dir_into_context(git_dir: &Path, build_context: &Path) -> Result<()> {
     let resolved = fs::canonicalize(git_dir).with_context(|| {
         let dir = git_dir.display();
         format!("resolving git dir {dir}")
     })?;
-    let gateway_link = build_context.join("gateway-link");
-    std::os::unix::fs::symlink(&resolved, &gateway_link).with_context(|| {
-        let target = resolved.display();
-        format!("symlinking gateway-link -> {target}")
-    })?;
-    Ok(gateway_link)
+    let source = resolved.display();
+    let dest = build_context.join("gateway-git");
+    Command::new("cp")
+        .arg("-a")
+        .arg(&resolved)
+        .arg(&dest)
+        .success()
+        .with_context(|| format!("copying git dir {source} into build context"))?;
+    Ok(())
 }
 
 /// Tag an image by its sha256 digest so `docker build FROM` can reference it.
@@ -673,14 +690,9 @@ pub fn build_prepared_image(
         raw_devcontainer_json,
         container_env_keys,
     )?;
+    copy_git_dir_into_context(git_dir, build_ctx.path())?;
 
-    let gateway_link = create_gateway_link(git_dir, build_ctx.path())?;
-    let gateway_link_display = gateway_link.display().to_string();
-
-    let mut extra_args = vec![
-        format!("--build-context=gateway={gateway_link_display}"),
-        format!("--build-arg=BASE_USER={image_user}"),
-    ];
+    let mut extra_args = vec![format!("--build-arg=BASE_USER={image_user}")];
     extra_args.extend(build_options.iter().cloned());
 
     let dockerfile = build_ctx.path().join("Dockerfile");
