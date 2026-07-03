@@ -18,6 +18,7 @@
 //! or `CONTAINER_HOST` from e.g. sshd `SetEnv`).
 
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -47,6 +48,12 @@ impl PodmanSshProxy {
         // bytes, which longer runtime or temp dirs can exceed.
         let dir = tempfile::TempDir::with_prefix_in("rp-podman-", "/tmp")
             .context("creating podman ssh proxy dir")?;
+        // Connecting here grants full API access to the remote podman,
+        // and tempfile honors the umask, so restrict the directory
+        // explicitly.  Before the bind, so the socket is never
+        // reachable through a laxer directory.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .context("restricting podman ssh proxy dir")?;
         let socket_path = dir.path().join("podman.sock");
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("binding podman ssh proxy {}", socket_path.display()))?;
