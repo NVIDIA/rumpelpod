@@ -162,7 +162,7 @@ fn list_shows_repo_state() {
 
     // Check list again - should show ahead
     let output = pod_command(&repo, &daemon)
-        .arg("list")
+        .args(["list", "--sync"])
         .output()
         .expect("Failed to run rumpel list command");
 

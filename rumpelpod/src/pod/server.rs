@@ -225,6 +225,7 @@ pub fn run_container_server(
         .route("/claude-state", post(claude_state_handler))
         .route("/codex-state", post(codex_state_handler))
         .route("/claude", any(super::pty::claude_session_handler))
+        .route("/pi", any(super::pty::pi_session_handler))
         .route("/grok", any(super::pty::grok_session_handler))
         .route("/codex", any(super::codex::codex_ws_handler))
         .with_state(state.clone())
@@ -255,6 +256,14 @@ pub fn run_container_server(
                 }
             });
         }
+
+        // Any codex app-server we advertised belonged to a previous
+        // container-serve; this process will never proxy to it, so
+        // drop the record before anything can mistake it for live.
+        crate::port_file::remove_if_present(Path::new(
+            crate::port_file::CODEX_APP_SERVER_PORT_FILE,
+        ))
+        .expect("clearing stale codex app-server port file");
 
         // Reuse the previously recorded port if the file is still
         // around (stable ports across a container restart aid
@@ -721,15 +730,25 @@ fn recover_push(repo_path: &Path, pod_name: &str) {
             return;
         }
     }
-    match Command::new("git")
+    let skip_lfs_pre_push = match crate::git::prepare_lfs_for_rumpelpod_push(repo_path, pod_name) {
+        Ok(skip) => skip,
+        Err(e) => {
+            eprintln!("events: git lfs push failed: {e:#}");
+            return;
+        }
+    };
+    let mut command = Command::new("git");
+    command
         .args(["push", "rumpelpod", "--force", "--quiet"])
         .current_dir(repo_path)
         .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
         .env("GIT_HTTP_LOW_SPEED_TIME", "10")
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-    {
+        .stderr(Stdio::piped());
+    if skip_lfs_pre_push {
+        command.env("GIT_LFS_SKIP_PUSH", "1");
+    }
+    match command.output() {
         Ok(output) if !output.status.success() => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let status = output.status;
@@ -1221,6 +1240,8 @@ fn build_state_response(repo_path: &Path) -> Result<StateResponse> {
         .unwrap_or_else(|| PathBuf::from("/root"));
     let has_claude_state = home.join(".claude").exists() || home.join(".claude.json").exists();
     let has_codex_state = home.join(".codex").exists();
+    let has_pi_state = home.join(".pi").exists();
+    let has_pi_config = home.join(crate::daemon::PI_CONFIG_COPIED_SENTINEL).exists();
     let has_grok_state = home.join(".grok").exists();
 
     Ok(StateResponse {
@@ -1228,6 +1249,8 @@ fn build_state_response(repo_path: &Path) -> Result<StateResponse> {
         primary,
         has_claude_state,
         has_codex_state,
+        has_pi_state,
+        has_pi_config,
         has_grok_state,
         dirty,
     })
@@ -1248,15 +1271,21 @@ async fn git_push_handler(
         .await
         .clone()
         .ok_or_else(|| err_json(anyhow::anyhow!("repo_path not set yet")))?;
+    let pod_name = state.pod_name.clone();
 
     tokio::task::spawn_blocking(move || {
-        let output = Command::new("git")
+        let skip_lfs_pre_push = crate::git::prepare_lfs_for_rumpelpod_push(&repo_path, &pod_name)
+            .context("preparing git lfs for new refs")?;
+        let mut command = Command::new("git");
+        command
             .args(["push", "rumpelpod", "--force", "--quiet"])
             .current_dir(&repo_path)
             .env("GIT_HTTP_LOW_SPEED_LIMIT", "1")
-            .env("GIT_HTTP_LOW_SPEED_TIME", "10")
-            .output()
-            .context("spawning git push")?;
+            .env("GIT_HTTP_LOW_SPEED_TIME", "10");
+        if skip_lfs_pre_push {
+            command.env("GIT_LFS_SKIP_PUSH", "1");
+        }
+        let output = command.output().context("spawning git push")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow::anyhow!("git push rumpelpod failed: {stderr}"));
@@ -1788,6 +1817,7 @@ fn agent_paths(agent: &str) -> Option<&'static [&'static str]> {
     match agent {
         "claude" => Some(&[".claude.json", ".claude"]),
         "codex" => Some(&[".codex"]),
+        "pi" => Some(&[".pi"]),
         "grok" => Some(&[".grok"]),
         _ => None,
     }
@@ -1989,6 +2019,7 @@ fn agent_files_put_impl(
     match agent {
         "claude" => rewrite_claude_settings(&home, pod_name, permission_hook)?,
         "codex" => {}
+        "pi" => {}
         // Grok needs no post-extraction work: its notify-state hooks are
         // not wired up, so there is no settings file to rewrite.
         "grok" => {}

@@ -29,7 +29,7 @@ const CLAUDE_CODE_DIST_BUCKET: &str =
 
 /// Bump this when the Dockerfile template changes in a way that
 /// invalidates previously built prepared images.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// File baked into the prepared image listing the container env var
 /// names the daemon resolved from `containerEnv` and `--env-file` at
@@ -57,6 +57,18 @@ struct LocalClaudeInfo {
     version: String,
 }
 
+/// Information about the pi CLI on the local machine, used to pin the
+/// exact version inside the prepared image.
+struct LocalPiInfo {
+    version: String,
+}
+
+/// npm package implementing the pi coding agent CLI.
+const PI_NPM_PACKAGE: &str = "@earendil-works/pi-coding-agent";
+
+/// Minimum Node.js version pi requires (major, minor, patch).
+const PI_MIN_NODE: (u64, u64, u64) = (22, 19, 0);
+
 /// Whether the Codex CLI on the local machine works.
 ///
 /// Uses the client-provided path so the daemon does not depend on its
@@ -83,6 +95,21 @@ fn container_has_codex() -> bool {
     }
 
     Command::new("codex")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Whether a pi CLI is already available inside the build container.
+fn container_has_pi() -> bool {
+    let bin_path = Path::new(crate::daemon::PI_CONTAINER_BIN);
+    if bin_path.exists() {
+        return true;
+    }
+
+    Command::new("pi")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -155,6 +182,41 @@ fn detect_local_claude(claude_cli_path: Option<&Path>) -> Option<LocalClaudeInfo
     Some(LocalClaudeInfo { version })
 }
 
+/// Try to detect the pi CLI on the local machine and return its version.
+///
+/// Uses the client-provided path if available, falling back to a PATH
+/// search.  `pi --version` may print the version anywhere in its output,
+/// so pick the first whitespace token that looks like a version number
+/// (starts with a digit, optionally after a leading `v`).
+fn detect_local_pi(pi_cli_path: Option<&Path>) -> Option<LocalPiInfo> {
+    let bin = match pi_cli_path {
+        Some(path) => path.to_path_buf(),
+        None => PathBuf::from("pi"),
+    };
+    let output = Command::new(&bin)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let version = raw
+        .split_whitespace()
+        .find(|token| {
+            token
+                .trim_start_matches('v')
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })?
+        .trim_start_matches('v')
+        .to_string();
+    Some(LocalPiInfo { version })
+}
+
 /// Find all `rumpel-linux-{amd64,arm64}` binaries next to the running
 /// executable.  Returns (filename, full_path) pairs.
 ///
@@ -198,6 +260,7 @@ fn compute_prepared_tag(
     container_repo_path: &Path,
     container_user: &str,
     claude_info: Option<&LocalClaudeInfo>,
+    pi_info: Option<&LocalPiInfo>,
     install_codex: bool,
     install_grok: bool,
     host_remotes: &[GitRemote],
@@ -213,6 +276,9 @@ fn compute_prepared_tag(
     hasher.update(container_repo_path.as_os_str().as_encoded_bytes());
     hasher.update(container_user.as_bytes());
     if let Some(info) = claude_info {
+        hasher.update(info.version.as_bytes());
+    }
+    if let Some(info) = pi_info {
         hasher.update(info.version.as_bytes());
     }
     hasher.update([u8::from(install_codex)]);
@@ -266,6 +332,7 @@ fn generate_dockerfile(
     container_repo_path: &Path,
     container_user: &str,
     claude_info: Option<&LocalClaudeInfo>,
+    pi_info: Option<&LocalPiInfo>,
     install_codex: bool,
     install_grok: bool,
     host_remotes: &[GitRemote],
@@ -279,6 +346,11 @@ fn generate_dockerfile(
 
     let claude_flag = match claude_info {
         Some(info) => format!(" \\\n      --claude-version '{}'", info.version),
+        None => String::new(),
+    };
+
+    let pi_flag = match pi_info {
+        Some(info) => format!(" \\\n      --pi-version '{}'", info.version),
         None => String::new(),
     };
 
@@ -330,6 +402,14 @@ fn generate_dockerfile(
         String::new()
     };
 
+    // Each flag above already carries its own ` \<newline>` prefix, so
+    // concatenating them keeps the generated RUN line one-flag-per-line.
+    // Assembling them here keeps the template below readable.
+    let prepare_image_flags = format!(
+        "{claude_flag}{pi_flag}{codex_flag}{grok_flag}{remote_flags}\
+         {mount_target_flags}{system_prompt_flag}{description_flag}"
+    );
+
     // The image must end with the base image's original USER so that
     // the ENTRYPOINT/CMD runs as the user the base image intended.
     // This is distinct from the container user (remoteUser /
@@ -350,7 +430,7 @@ fn generate_dockerfile(
         RUN --mount=type=bind,from=gateway,target={BUILD_GIT_DIR_PATH} \
             {rumpel} prepare-image \
               --repo-path '{repo_path}' \
-              --user '{container_user}'{claude_flag}{codex_flag}{grok_flag}{remote_flags}{mount_target_flags}{system_prompt_flag}{description_flag}
+              --user '{container_user}'{prepare_image_flags}
 
         USER ${{BASE_USER}}
     "#}
@@ -358,15 +438,17 @@ fn generate_dockerfile(
 
 /// Assemble the build context directory with the Dockerfile and binaries.
 ///
-/// The host `.git` dir is NOT included here -- it is passed separately
-/// via `--build-context` so buildx can transfer it efficiently and the
-/// Dockerfile bind-mounts it without baking it into a layer.
+/// The host `.git` dir is not staged here.  It is normally passed
+/// separately via `--build-context` so buildx can transfer it
+/// efficiently; for remote Podman builds the caller copies it in
+/// afterwards (see `copy_git_dir_into_context`).
 #[allow(clippy::too_many_arguments)]
 fn assemble_build_context(
     base_image: &str,
     container_repo_path: &Path,
     container_user: &str,
     claude_info: Option<&LocalClaudeInfo>,
+    pi_info: Option<&LocalPiInfo>,
     install_codex: bool,
     install_grok: bool,
     host_remotes: &[GitRemote],
@@ -382,6 +464,7 @@ fn assemble_build_context(
         container_repo_path,
         container_user,
         claude_info,
+        pi_info,
         install_codex,
         install_grok,
         host_remotes,
@@ -521,6 +604,7 @@ pub fn build_prepared_image(
     mount_targets: &[String],
     claude_cli_path: Option<&Path>,
     codex_cli_path: Option<&Path>,
+    pi_cli_path: Option<&Path>,
     grok_cli_path: Option<&Path>,
     docker_socket: Option<&Path>,
     inject_system_prompt: bool,
@@ -532,6 +616,7 @@ pub fn build_prepared_image(
     on_output: Option<BuildOutputFn>,
 ) -> Result<BuildResult> {
     let claude_info = detect_local_claude(claude_cli_path);
+    let pi_info = detect_local_pi(pi_cli_path);
     let install_codex = local_has_codex(codex_cli_path);
     let install_grok = local_has_grok(grok_cli_path);
 
@@ -573,6 +658,7 @@ pub fn build_prepared_image(
         container_repo_path,
         container_user,
         claude_info.as_ref(),
+        pi_info.as_ref(),
         install_codex,
         install_grok,
         host_remotes,
@@ -628,6 +714,7 @@ pub fn build_prepared_image(
         container_repo_path,
         container_user,
         claude_info.as_ref(),
+        pi_info.as_ref(),
         install_codex,
         install_grok,
         host_remotes,
@@ -750,6 +837,10 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
         install_claude_cli(version)?;
     }
 
+    if let Some(ref version) = cmd.pi_version {
+        install_pi_cli(version)?;
+    }
+
     if cmd.install_codex {
         install_codex_cli()?;
     }
@@ -762,6 +853,9 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
         write_system_prompt(cmd.description_file.as_deref())?;
         if container_has_codex() {
             write_codex_system_prompt(&cmd.user, cmd.description_file.as_deref())?;
+        }
+        if container_has_pi() {
+            write_pi_system_prompt(&cmd.user, cmd.description_file.as_deref())?;
         }
     }
 
@@ -901,6 +995,54 @@ fn write_codex_system_prompt(user: &str, description_file: Option<&str>) -> Resu
             format!("chowning {p}")
         },
     )
+}
+
+/// Append the rumpelpod system prompt to ~/.pi/agent/SYSTEM.md (the
+/// container user's home) so pi understands the container layout and
+/// git remote conventions.
+///
+/// pi reads its global system prompt from the per-user agent dir, so
+/// this is written under the container user's home rather than a fixed
+/// path like claude/codex.  Appends rather than overwrites so a base
+/// image's existing file is preserved.  The whole ~/.pi subtree is
+/// chowned to the container user so the runtime config copy (which
+/// runs as that user) can write auth/settings alongside it.
+fn write_pi_system_prompt(user: &str, description_file: Option<&str>) -> Result<()> {
+    let pw = nix::unistd::User::from_name(user)
+        .with_context(|| format!("looking up user '{user}'"))?
+        .with_context(|| format!("user '{user}' not found in /etc/passwd"))?;
+    let agent_dir = pw.dir.join(".pi/agent");
+    let agent_dir_display = agent_dir.display();
+    fs::create_dir_all(&agent_dir).with_context(|| format!("creating {agent_dir_display}"))?;
+    let system_md = agent_dir.join("SYSTEM.md");
+    let system_md_display = system_md.display();
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&system_md)
+        .with_context(|| format!("opening {system_md_display} for append"))?;
+    let prompt = system_prompt(description_file);
+    // Separate from any existing content with a blank line.
+    if system_md.metadata().is_ok_and(|m| m.len() > 0) {
+        file.write_all(b"\n")
+            .context("writing SYSTEM.md separator")?;
+    }
+    file.write_all(prompt.as_bytes())
+        .with_context(|| format!("writing rumpelpod prompt to {system_md_display}"))?;
+    drop(file);
+
+    let pi_root = pw.dir.join(".pi");
+    let user_colon = format!("{user}:");
+    let status = Command::new("chown")
+        .args(["-R", &user_colon])
+        .arg(&pi_root)
+        .status()
+        .context("setting ~/.pi ownership")?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("chown ~/.pi failed"));
+    }
+    Ok(())
 }
 
 /// Write `.git/hooks/pre-commit` in the cloned repo.  The hook fails
@@ -1137,6 +1279,221 @@ fn install_codex_cli() -> Result<()> {
         .context("making codex binary executable")?;
 
     Ok(())
+}
+
+/// Install the pi coding agent CLI at a specific version via npm.
+///
+/// pi is a Node.js program (not a self-contained binary like claude or
+/// codex), so this first provisions a new-enough Node runtime, then
+/// `npm install -g`s the pinned package under /opt/rumpelpod (yielding
+/// /opt/rumpelpod/bin/pi).  Skips if a `pi` binary is already present.
+fn install_pi_cli(version: &str) -> Result<()> {
+    if container_has_pi() {
+        return Ok(());
+    }
+
+    let node_bin_dir = ensure_node()?;
+
+    // Prepend the resolved node bin dir so npm's `#!/usr/bin/env node`
+    // shim resolves and npm's own `node` spawns use this runtime.
+    let path_env = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut p = node_bin_dir.clone().into_os_string();
+            p.push(":");
+            p.push(existing);
+            p
+        }
+        None => node_bin_dir.clone().into_os_string(),
+    };
+
+    let npm = node_bin_dir.join("npm");
+    let npm = if npm.exists() {
+        npm
+    } else {
+        PathBuf::from("npm")
+    };
+
+    let spec = format!("{PI_NPM_PACKAGE}@{version}");
+    let status = Command::new(&npm)
+        .args([
+            "install",
+            "-g",
+            "--prefix",
+            "/opt/rumpelpod",
+            // pi publishes an npm-shrinkwrap, so install scripts are not
+            // needed; skipping them mirrors pi's own installer.
+            "--ignore-scripts",
+            "--no-fund",
+            "--no-audit",
+            "--loglevel=error",
+        ])
+        .arg(&spec)
+        .env("PATH", &path_env)
+        .status()
+        .with_context(|| format!("running npm install for {spec}"))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("npm install {spec} failed"));
+    }
+
+    let bin_path = Path::new(crate::daemon::PI_CONTAINER_BIN);
+    if !bin_path.exists() {
+        let bin_path = bin_path.display();
+        return Err(anyhow::anyhow!(
+            "pi binary missing at {bin_path} after npm install"
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure a Node.js runtime that satisfies pi's minimum version is
+/// available, returning the directory containing its `node`/`npm`.
+///
+/// Mirrors pi's `install.sh` Linux logic: prefer an already-usable
+/// `node`, then the base image's package manager (apt or apk), and fall
+/// back to a standalone Node download when the packaged version is too
+/// old (as on debian stable).  Fails hard if none of these yield a
+/// new-enough runtime.
+fn ensure_node() -> Result<PathBuf> {
+    if let Some(dir) = usable_node_bin_dir() {
+        return Ok(dir);
+    }
+
+    // Install via the base image's package manager, then re-check: the
+    // packaged node may still be too old, in which case we fall through
+    // to the standalone download.
+    if crate::which("apt-get").is_some() {
+        run_node_pkg_install(
+            "apt-get",
+            &[&["update"], &["install", "-y", "nodejs", "npm"]],
+        )?;
+        if let Some(dir) = usable_node_bin_dir() {
+            return Ok(dir);
+        }
+    } else if crate::which("apk").is_some() {
+        run_node_pkg_install("apk", &[&["add", "--no-cache", "nodejs", "npm"]])?;
+        if let Some(dir) = usable_node_bin_dir() {
+            return Ok(dir);
+        }
+    }
+
+    install_node_standalone()
+}
+
+/// Run a sequence of package-manager invocations (e.g. apt-get update,
+/// then install).  Errors if any step fails.
+fn run_node_pkg_install(manager: &str, arg_sets: &[&[&str]]) -> Result<()> {
+    for args in arg_sets {
+        let status = Command::new(manager)
+            .args(*args)
+            .status()
+            .with_context(|| format!("running {manager} to install Node.js"))?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("{manager} {args:?} failed"));
+        }
+    }
+    Ok(())
+}
+
+/// Return the directory holding `node`/`npm` if a new-enough Node.js is
+/// already on PATH, else None.
+fn usable_node_bin_dir() -> Option<PathBuf> {
+    let node = crate::which("node")?;
+    crate::which("npm")?;
+    let output = Command::new(&node)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    if !node_version_at_least(&version, PI_MIN_NODE) {
+        return None;
+    }
+    node.parent().map(Path::to_path_buf)
+}
+
+/// Whether `version` (e.g. "v22.20.0") is at least `min`.
+fn node_version_at_least(version: &str, min: (u64, u64, u64)) -> bool {
+    let mut parts = version.trim().trim_start_matches('v').split('.');
+    let parse = |p: Option<&str>| -> Option<u64> {
+        p.map(|s| s.trim_matches(|c: char| !c.is_ascii_digit()))
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok())
+    };
+    let Some(major) = parse(parts.next()) else {
+        return false;
+    };
+    let minor = parse(parts.next()).unwrap_or(0);
+    let patch = parse(parts.next()).unwrap_or(0);
+    (major, minor, patch) >= min
+}
+
+/// Download and unpack a standalone Node.js v22.x into /opt/rumpelpod,
+/// symlinking node/npm/npx onto the default PATH so pi's npm shim
+/// resolves at runtime.  Returns the directory holding the binaries.
+///
+/// Uses the official `.tar.gz` (not `.tar.xz`) so extraction reuses the
+/// already-vendored flate2 + tar crates without an xz dependency.
+fn install_node_standalone() -> Result<PathBuf> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => return Err(anyhow::anyhow!("unsupported architecture '{other}'")),
+    };
+
+    // Resolve the exact latest-v22.x filename from SHASUMS256.txt rather
+    // than pinning a Node patch release that may be pruned from the
+    // mirror (mirrors pi's install.sh).
+    let base = "https://nodejs.org/dist/latest-v22.x";
+    let shasums = download_cli_asset(&format!("{base}/SHASUMS256.txt"), "Node.js checksums")?;
+    let shasums = String::from_utf8_lossy(&shasums);
+    let suffix = format!("-linux-{arch}.tar.gz");
+    let filename = shasums
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .find(|name| name.starts_with("node-v") && name.ends_with(&suffix))
+        .ok_or_else(|| anyhow::anyhow!("no Node.js linux-{arch} tarball in SHASUMS256.txt"))?
+        .to_string();
+
+    let data = download_cli_asset(&format!("{base}/{filename}"), "Node.js tarball")?;
+
+    let dest = Path::new("/opt/rumpelpod");
+    let decoder = flate2::read::GzDecoder::new(&data[..]);
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(dest).context("extracting Node.js tarball")?;
+
+    // The tarball unpacks to <dest>/node-v<ver>-linux-<arch>/.
+    let top = filename.trim_end_matches(".tar.gz");
+    let bin_dir = dest.join(top).join("bin");
+
+    for name in ["node", "npm", "npx"] {
+        let target = bin_dir.join(name);
+        if !target.exists() {
+            continue;
+        }
+        let link = Path::new("/usr/local/bin").join(name);
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent).context("creating /usr/local/bin")?;
+        }
+        // Replace any stale (too-old) binary the package manager left.
+        match fs::remove_file(&link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let link = link.display();
+                return Err(anyhow::Error::from(e).context(format!("removing {link}")));
+            }
+        }
+        std::os::unix::fs::symlink(&target, &link).with_context(|| {
+            let link = link.display();
+            format!("symlinking {link} -> Node.js binary")
+        })?;
+    }
+
+    Ok(bin_dir)
 }
 
 /// Pinned Grok CLI version.  xAI serves a per-(version, platform) static

@@ -4,16 +4,17 @@
 //! Codex App Server lifecycle and WebSocket proxy.
 //!
 //! The pod server exposes a `/codex` WebSocket endpoint. On the first
-//! connection, it spawns `codex app-server --listen ws://127.0.0.1:4500`
-//! as a background process. Subsequent connections reuse the same
-//! app-server, which persists thread state across client reconnections.
-//! All WebSocket frames are forwarded bidirectionally between the
+//! connection, it spawns `codex app-server` on a fresh ephemeral
+//! loopback port. Subsequent connections reuse the same app-server,
+//! which persists thread state across client reconnections. All
+//! WebSocket frames are forwarded bidirectionally between the
 //! connecting client and the app-server.
 //!
 //! A separate monitoring connection tracks thread status independently
 //! of TUI client connections so that `rumpel list` always reflects the
 //! current codex state while the app-server is running.
 
+use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
@@ -30,16 +31,17 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite;
 
-const CODEX_APP_SERVER_ADDR: &str = "127.0.0.1:4500";
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cap how much app-server stderr we keep for diagnostics so a chatty
 /// process cannot balloon memory while we wait.
 const STDERR_BUF_CAP: usize = 16 * 1024;
+const CODEX_APP_SERVER_HOST: &str = "127.0.0.1";
 
 /// Running codex app-server plus its captured stderr.
 pub struct AppServerHandle {
     child: Child,
     stderr: Arc<StdMutex<String>>,
+    port: u16,
 }
 
 /// Shared handle to the codex app-server child process.
@@ -71,25 +73,31 @@ async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodS
         }
     };
 
-    if let Err(e) = ensure_app_server_running(&state.codex_app_server, &repo_path).await {
-        eprintln!("codex: failed to start app-server: {e:#}");
-        let _ = client_ws
-            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                code: 1011,
-                reason: format!("failed to start codex app-server: {e}").into(),
-            })))
-            .await;
-        return;
-    }
+    let port = match ensure_app_server_running(&state.codex_app_server, &repo_path).await {
+        Ok(port) => port,
+        Err(e) => {
+            eprintln!("codex: failed to start app-server: {e:#}");
+            let _ = client_ws
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: format!("failed to start codex app-server: {e}").into(),
+                })))
+                .await;
+            return;
+        }
+    };
 
     // Spawn the state monitor once.  The monitor maintains its own
     // WebSocket connection to the app-server and tracks thread status
     // changes independently of the TUI proxy below.
     if !state.codex_monitor_started.swap(true, Ordering::SeqCst) {
-        tokio::spawn(codex_state_monitor(state.codex_state.clone()));
+        tokio::spawn(codex_state_monitor(
+            state.codex_state.clone(),
+            state.codex_app_server.clone(),
+        ));
     }
 
-    if let Err(e) = proxy_to_app_server(client_ws).await {
+    if let Err(e) = proxy_to_app_server(client_ws, port).await {
         eprintln!("codex: proxy error: {e:#}");
     }
 }
@@ -100,15 +108,29 @@ async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodS
 /// concurrent /codex connections do not race to spawn a second
 /// app-server, and so that the first arriving caller's captured
 /// stderr is the one every retry sees on failure.
-async fn ensure_app_server_running(app_server: &CodexAppServer, repo_path: &Path) -> Result<()> {
+async fn ensure_app_server_running(app_server: &CodexAppServer, repo_path: &Path) -> Result<u16> {
     let mut guard = app_server.lock().await;
+    let port = ensure_app_server_running_locked(&mut guard, repo_path).await?;
+    // Rewrite the advertisement on every path, not just fresh spawns:
+    // an earlier attempt may have errored after the app-server came
+    // up, leaving the file stale or missing.
+    write_app_server_port_file(port)?;
+    Ok(port)
+}
 
+/// Body of [ensure_app_server_running], running under the app-server
+/// mutex.
+async fn ensure_app_server_running_locked(
+    guard: &mut Option<AppServerHandle>,
+    repo_path: &Path,
+) -> Result<u16> {
     // Reuse a live handle if its /healthz already answers.
     if let Some(handle) = guard.as_mut() {
         match handle.child.try_wait() {
-            Ok(None) if health_check().await => return Ok(()),
+            Ok(None) if health_check(handle.port).await => return Ok(handle.port),
             Ok(None) => {
-                return wait_for_healthy(&mut handle.child, &handle.stderr).await;
+                wait_for_healthy(&mut handle.child, &handle.stderr, handle.port).await?;
+                return Ok(handle.port);
             }
             Ok(Some(_)) => {
                 // Exited -- fall through to respawn.
@@ -120,13 +142,12 @@ async fn ensure_app_server_running(app_server: &CodexAppServer, repo_path: &Path
     }
 
     let codex_bin = find_codex_cli()?;
+    let port = choose_app_server_port()?;
+    let addr = format!("{CODEX_APP_SERVER_HOST}:{port}");
+    let listen_url = format!("ws://{addr}");
     let repo_path_display = repo_path.display();
     let mut child = Command::new(&codex_bin)
-        .args([
-            "app-server",
-            "--listen",
-            &format!("ws://{CODEX_APP_SERVER_ADDR}"),
-        ])
+        .args(["app-server", "--listen", &listen_url])
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
@@ -171,16 +192,49 @@ async fn ensure_app_server_running(app_server: &CodexAppServer, repo_path: &Path
     *guard = Some(AppServerHandle {
         child,
         stderr: Arc::clone(&stderr_buf),
+        port,
     });
     let handle = guard.as_mut().unwrap();
-    wait_for_healthy(&mut handle.child, &handle.stderr).await
+    wait_for_healthy(&mut handle.child, &handle.stderr, port).await?;
+    Ok(port)
+}
+
+/// Pick a fresh ephemeral port for the app-server.
+///
+/// Deliberately never reuses the previously advertised port: under
+/// host networking (--network=host) all pods share the host loopback,
+/// so a stale port may already belong to another pod's app-server.
+/// Nothing needs the port to be stable anyway -- clients only reach
+/// the app-server through the /codex proxy, which uses the in-memory
+/// port of the current handle.
+fn choose_app_server_port() -> Result<u16> {
+    let listener = StdTcpListener::bind((CODEX_APP_SERVER_HOST, 0))
+        .context("binding ephemeral codex app-server port")?;
+    let port = listener
+        .local_addr()
+        .context("reading codex app-server listener address")?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+/// Advertise the current app-server port for debugging and tests.
+/// No traffic routes through this file, so a stale value (e.g. after
+/// a crash) can at worst mislead a reader, never misdirect a proxy.
+fn write_app_server_port_file(port: u16) -> Result<()> {
+    let path = Path::new(crate::port_file::CODEX_APP_SERVER_PORT_FILE);
+    crate::port_file::write_atomic(path, port).context("writing codex port file")
 }
 
 /// Poll the app-server's health endpoint until it responds or the
 /// wall-clock deadline passes.  Also bails out early if the child has
 /// already exited, since polling a dead process just wastes time.
-async fn wait_for_healthy(child: &mut Child, stderr: &Arc<StdMutex<String>>) -> Result<()> {
-    let url = format!("http://{CODEX_APP_SERVER_ADDR}/healthz");
+async fn wait_for_healthy(
+    child: &mut Child,
+    stderr: &Arc<StdMutex<String>>,
+    port: u16,
+) -> Result<()> {
+    let url = app_server_http_url(port, "/healthz");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()
@@ -197,6 +251,19 @@ async fn wait_for_healthy(child: &mut Child, stderr: &Arc<StdMutex<String>>) -> 
 
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
+                // Under host networking another pod can win the bind
+                // race for this port, and its app-server answers
+                // /healthz just as convincingly.  Our child exits
+                // quickly when it loses the bind, so re-checking after
+                // a success catches most impostor responses.
+                if let Ok(Some(status)) = child.try_wait() {
+                    let captured = stderr.lock().unwrap().clone();
+                    return Err(anyhow::anyhow!(
+                        "codex app-server exited with {status} although /healthz answered; \
+                         the response likely came from a foreign process on the same port\n\
+                         stderr:\n{captured}"
+                    ));
+                }
                 return Ok(());
             }
         }
@@ -213,16 +280,16 @@ async fn wait_for_healthy(child: &mut Child, stderr: &Arc<StdMutex<String>>) -> 
 }
 
 /// Quick health check without retries.
-async fn health_check() -> bool {
-    let url = format!("http://{CODEX_APP_SERVER_ADDR}/healthz");
+async fn health_check(port: u16) -> bool {
+    let url = app_server_http_url(port, "/healthz");
     reqwest::get(&url)
         .await
         .is_ok_and(|r| r.status().is_success())
 }
 
 /// Connect to the app-server and bidirectionally forward WebSocket frames.
-async fn proxy_to_app_server(client_ws: WebSocket) -> Result<()> {
-    let ws_url = format!("ws://{CODEX_APP_SERVER_ADDR}");
+async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
+    let ws_url = app_server_ws_url(port);
     let (server_ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .context("connecting to codex app-server WebSocket")?;
@@ -260,6 +327,14 @@ async fn proxy_to_app_server(client_ws: WebSocket) -> Result<()> {
     Ok(())
 }
 
+fn app_server_http_url(port: u16, path: &str) -> String {
+    format!("http://{CODEX_APP_SERVER_HOST}:{port}{path}")
+}
+
+fn app_server_ws_url(port: u16) -> String {
+    format!("ws://{CODEX_APP_SERVER_HOST}:{port}")
+}
+
 // ---------------------------------------------------------------------------
 // State monitor -- dedicated connection for tracking thread status
 // ---------------------------------------------------------------------------
@@ -267,10 +342,34 @@ async fn proxy_to_app_server(client_ws: WebSocket) -> Result<()> {
 /// Long-running task that maintains a WebSocket connection to the codex
 /// app-server and updates the shared state channel from
 /// `thread/status/changed` notifications.
-async fn codex_state_monitor(tx: tokio::sync::watch::Sender<Option<super::types::CodexState>>) {
+async fn codex_state_monitor(
+    tx: tokio::sync::watch::Sender<Option<super::types::CodexState>>,
+    app_server: CodexAppServer,
+) {
     loop {
-        if let Err(e) = run_codex_monitor(&tx).await {
-            eprintln!("codex state monitor: {e:#}");
+        // Take the port from the live handle on every reconnect.  Once
+        // the app-server dies its port may be rebound by anyone --
+        // under host networking even another pod's app-server -- so a
+        // dead child's port must never be dialed.  The next /codex
+        // connection respawns the app-server and replaces the handle.
+        let port = {
+            let mut guard = app_server.lock().await;
+            match guard.as_mut() {
+                Some(handle) => match handle.child.try_wait() {
+                    Ok(None) => Some(handle.port),
+                    Ok(Some(_)) => None,
+                    Err(e) => {
+                        eprintln!("codex state monitor: try_wait error on app-server: {e}");
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+        if let Some(port) = port {
+            if let Err(e) = run_codex_monitor(&tx, port).await {
+                eprintln!("codex state monitor: {e:#}");
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -280,8 +379,9 @@ async fn codex_state_monitor(tx: tokio::sync::watch::Sender<Option<super::types:
 /// until the connection drops.
 async fn run_codex_monitor(
     tx: &tokio::sync::watch::Sender<Option<super::types::CodexState>>,
+    port: u16,
 ) -> Result<()> {
-    let ws_url = format!("ws://{CODEX_APP_SERVER_ADDR}");
+    let ws_url = app_server_ws_url(port);
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .context("connecting to codex app-server")?;

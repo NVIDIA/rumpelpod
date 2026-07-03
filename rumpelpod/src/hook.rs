@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io::BufRead;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -78,8 +79,13 @@ fn read_ref_updates() -> Result<Vec<(String, String, String)>> {
 }
 
 /// Run a git command, logging failures to stderr.
-fn run_git(args: &[&str]) {
-    if let Err(e) = Command::new("git").args(args).success() {
+fn run_git(args: &[&str], skip_lfs_pre_push: bool) {
+    let mut command = Command::new("git");
+    command.args(args);
+    if skip_lfs_pre_push {
+        command.env("GIT_LFS_SKIP_PUSH", "1");
+    }
+    if let Err(e) = command.success() {
         eprintln!("rumpelpod hook: {e:#}");
     }
 }
@@ -100,16 +106,31 @@ pub fn reference_transaction(cmd: &ReferenceTransactionCommand) -> Result<()> {
         .ok()
         .map(|out| String::from_utf8_lossy(&out).trim().to_string());
 
-    for (_oldvalue, newvalue, refname) in read_ref_updates()? {
+    for (oldvalue, newvalue, refname) in read_ref_updates()? {
         let branch = match refname.strip_prefix("refs/heads/") {
             Some(b) => b,
             None => continue,
         };
 
-        if newvalue == ZERO_OID {
-            run_git(&["push", "rumpelpod", "--delete", branch, "--quiet"]);
+        let skip_lfs_pre_push = if newvalue != ZERO_OID && oldvalue == ZERO_OID {
+            match crate::git::prepare_lfs_for_new_ref(Path::new("."), "rumpelpod", &newvalue) {
+                Ok(skip) => skip,
+                Err(e) => {
+                    eprintln!("rumpelpod hook: git lfs push failed: {e:#}");
+                    continue;
+                }
+            }
         } else {
-            run_git(&["push", "rumpelpod", branch, "--force", "--quiet"]);
+            false
+        };
+
+        if newvalue == ZERO_OID {
+            run_git(&["push", "rumpelpod", "--delete", branch, "--quiet"], false);
+        } else {
+            run_git(
+                &["push", "rumpelpod", branch, "--force", "--quiet"],
+                skip_lfs_pre_push,
+            );
         }
 
         // Push the primary branch shortcut (refs/rumpelpod/<pod>) so
@@ -118,21 +139,27 @@ pub fn reference_transaction(cmd: &ReferenceTransactionCommand) -> Result<()> {
         // the hook must push the shortcut explicitly.
         if pod_name.as_deref() == Some(branch) {
             if newvalue == ZERO_OID {
-                run_git(&[
-                    "push",
-                    "rumpelpod",
-                    "--delete",
-                    &format!("refs/rumpelpod/{branch}"),
-                    "--quiet",
-                ]);
+                run_git(
+                    &[
+                        "push",
+                        "rumpelpod",
+                        "--delete",
+                        &format!("refs/rumpelpod/{branch}"),
+                        "--quiet",
+                    ],
+                    false,
+                );
             } else {
-                run_git(&[
-                    "push",
-                    "rumpelpod",
-                    &format!("HEAD:refs/rumpelpod/{branch}"),
-                    "--force",
-                    "--quiet",
-                ]);
+                run_git(
+                    &[
+                        "push",
+                        "rumpelpod",
+                        &format!("HEAD:refs/rumpelpod/{branch}"),
+                        "--force",
+                        "--quiet",
+                    ],
+                    skip_lfs_pre_push,
+                );
             }
         }
     }

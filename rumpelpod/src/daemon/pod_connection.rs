@@ -242,6 +242,7 @@ impl PodConnection {
         let codex_state = self.codex_state.clone();
         let pod_name = self.key.pod_name.clone();
 
+        *self.status.lock().unwrap() = PodConnectionStatus::Connecting;
         let thread = std::thread::Builder::new()
             .name(format!("pod-connection-{pod_name}"))
             .spawn(move || {
@@ -542,6 +543,11 @@ impl PodConnectionRegistry {
     pub fn codex_state(&self, repo_path: &Path, pod_name: &str) -> Option<CodexState> {
         self.get(repo_path, pod_name)
             .and_then(|connection| connection.codex_state())
+    }
+
+    pub fn status(&self, repo_path: &Path, pod_name: &str) -> Option<PodConnectionStatus> {
+        self.get(repo_path, pod_name)
+            .map(|connection| connection.status())
     }
 
     pub fn notify_host_connected(&self, host: &HostKey) {

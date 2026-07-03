@@ -144,7 +144,7 @@ fn pod_names() -> Option<Vec<String>> {
         .unwrap_or(DEFAULT_TIMEOUT_MS);
     let client =
         DaemonClient::new_unix_with_timeout(&socket_path, Some(Duration::from_millis(timeout_ms)));
-    let pods = client.list_pods(repo_path).ok()?;
+    let pods = client.list_pods(repo_path, true, false).ok()?;
     Some(pods.into_iter().map(|p| p.name).collect())
 }
 

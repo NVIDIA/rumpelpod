@@ -49,6 +49,10 @@ pub struct StateResponse {
     pub has_claude_state: bool,
     /// Whether ~/.codex exists.
     pub has_codex_state: bool,
+    /// Whether ~/.pi exists.
+    pub has_pi_state: bool,
+    /// Whether rumpelpod has copied host pi config into this pod.
+    pub has_pi_config: bool,
     /// Whether ~/.grok exists.
     pub has_grok_state: bool,
     /// Working tree has uncommitted changes.

@@ -7,6 +7,7 @@ use anyhow::Result;
 use comfy_table::presets::NOTHING;
 use comfy_table::Table;
 
+use crate::cli::ListCommand;
 use crate::daemon;
 use crate::daemon::protocol::{Daemon, DaemonClient, PodStatus};
 use crate::git::get_repo_root;
@@ -31,13 +32,13 @@ fn codex_state_str(state: Option<CodexState>) -> &'static str {
     }
 }
 
-pub fn list() -> Result<()> {
+pub fn list(cmd: &ListCommand) -> Result<()> {
     let repo_path = get_repo_root()?;
 
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
 
-    let mut pods = client.list_pods(repo_path)?;
+    let mut pods = client.list_pods(repo_path, cmd.sync, cmd.sync)?;
     // Running pods first, then by most recent commit on the pod's primary branch.
     pods.sort_by_key(|pod| {
         (

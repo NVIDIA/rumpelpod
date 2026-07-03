@@ -5,6 +5,7 @@
 
 mod common;
 mod detach;
+mod host_network;
 mod install;
 mod lifecycle;
 mod session_isolation;

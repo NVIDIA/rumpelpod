@@ -208,11 +208,14 @@ pub struct PodLaunchParams {
     /// Absolute path to the Codex CLI binary on the local machine,
     /// resolved by the client for the same reason as `claude_cli_path`.
     pub codex_cli_path: Option<PathBuf>,
+    /// Absolute path to the pi CLI binary on the local machine,
+    /// resolved by the client for the same reason as `claude_cli_path`.
+    pub pi_cli_path: Option<PathBuf>,
     /// Absolute path to the Grok CLI binary on the local machine,
     /// resolved by the client for the same reason as `claude_cli_path`.
     pub grok_cli_path: Option<PathBuf>,
-    /// Write /etc/claude-code/CLAUDE.md with a rumpelpod environment description
-    /// into the prepared image.
+    /// Write a rumpelpod environment description into each installed
+    /// agent's system-prompt location in the prepared image.
     pub inject_system_prompt: bool,
     /// Path of the description file for merge commit messages (None = disabled).
     /// Included in the system prompt so the agent knows where to write it.
@@ -298,6 +301,8 @@ struct DeleteAllPodsResponse {
 #[derive(Debug, Serialize, Deserialize)]
 struct ListPodsRequest {
     repo_path: PathBuf,
+    sync: bool,
+    sync_refs: bool,
 }
 
 /// Response body for list_pods endpoint.
@@ -366,6 +371,20 @@ pub struct EnsureClaudeConfigRequest {
     /// --resume <uuid>` can pick up sessions started on the host.
     /// Driven by the user-facing `claude.sessions` config knob.
     pub copy_sessions: bool,
+}
+
+/// Request body for ensure_pi_config endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EnsurePiConfigRequest {
+    pub pod_name: PodName,
+    pub repo_path: PathBuf,
+    pub container_id: ContainerId,
+    pub container_url: String,
+    pub container_token: String,
+    /// Force `defaultProjectTrust: "always"` into the copied
+    /// settings.json so pi's TUI does not block on the project-trust
+    /// prompt.  Driven by the user-facing `pi.trustWorkspace` knob.
+    pub trust_workspace: bool,
 }
 
 /// Request body for the pod reconnect-events SSE endpoint.
@@ -442,7 +461,7 @@ pub trait Daemon: Send + Sync + 'static {
 
     // GET /pod
     // Lists all pods for a given repository.
-    fn list_pods(&self, repo_path: PathBuf) -> Result<Vec<PodInfo>>;
+    fn list_pods(&self, repo_path: PathBuf, sync: bool, sync_refs: bool) -> Result<Vec<PodInfo>>;
 
     // POST /pods/delete-all
     // Nukes all containers/pods across all repos.  Only triggers
@@ -464,6 +483,11 @@ pub trait Daemon: Send + Sync + 'static {
     // Ensure Claude Code config files are present in the container.
     // Idempotent: skips the copy if it has already been done for this pod.
     fn ensure_claude_config(&self, request: EnsureClaudeConfigRequest) -> Result<()>;
+
+    // PUT /pod/pi-config
+    // Ensure pi auth/config files are present in the container.
+    // Idempotent: skips the copy if it has already been done for this pod.
+    fn ensure_pi_config(&self, request: EnsurePiConfigRequest) -> Result<()>;
 
     // POST /pod/ssh-agent
     // Ensure the pod's host-side ssh-agent is running and return the
@@ -734,9 +758,13 @@ impl Daemon for DaemonClient {
         Ok(())
     }
 
-    fn list_pods(&self, repo_path: PathBuf) -> Result<Vec<PodInfo>> {
+    fn list_pods(&self, repo_path: PathBuf, sync: bool, sync_refs: bool) -> Result<Vec<PodInfo>> {
         let url = self.url.join("/pod")?;
-        let request = ListPodsRequest { repo_path };
+        let request = ListPodsRequest {
+            repo_path,
+            sync,
+            sync_refs,
+        };
 
         let response = self
             .client
@@ -823,6 +851,20 @@ impl Daemon for DaemonClient {
             .map_err(|e| anyhow::anyhow!("failed to send request: {e}"))?;
 
         let _: serde_json::Value = read_sse_result(response, "configuring Claude Code")?;
+        Ok(())
+    }
+
+    fn ensure_pi_config(&self, request: EnsurePiConfigRequest) -> Result<()> {
+        let url = self.url.join("/pod/pi-config")?;
+
+        let response = self
+            .client
+            .put(url)
+            .json(&request)
+            .send()
+            .map_err(|e| anyhow::anyhow!("failed to send request: {e}"))?;
+
+        let _: serde_json::Value = read_sse_result(response, "configuring pi")?;
         Ok(())
     }
 
@@ -1320,7 +1362,7 @@ async fn list_pods_handler<D: Daemon>(
     Json(request): Json<ListPodsRequest>,
 ) -> Response {
     streaming_result_response("listing pods...".into(), move || {
-        let pods = daemon.list_pods(request.repo_path)?;
+        let pods = daemon.list_pods(request.repo_path, request.sync, request.sync_refs)?;
         Ok(ListPodsResponse { pods })
     })
 }
@@ -1368,6 +1410,17 @@ async fn ensure_claude_config_handler<D: Daemon>(
 ) -> Response {
     streaming_result_response("configuring Claude Code...".into(), move || {
         daemon.ensure_claude_config(request)?;
+        Ok(serde_json::Value::Null)
+    })
+}
+
+/// Handler for PUT /pod/pi-config endpoint.
+async fn ensure_pi_config_handler<D: Daemon>(
+    State(daemon): State<Arc<D>>,
+    Json(request): Json<EnsurePiConfigRequest>,
+) -> Response {
+    streaming_result_response("configuring pi...".into(), move || {
+        daemon.ensure_pi_config(request)?;
         Ok(serde_json::Value::Null)
     })
 }
@@ -1496,6 +1549,7 @@ where
             get(list_ports_handler::<D>).post(add_forwarded_port_handler::<D>),
         )
         .route("/pod/claude-config", put(ensure_claude_config_handler::<D>))
+        .route("/pod/pi-config", put(ensure_pi_config_handler::<D>))
         .route("/pod/ssh-agent", post(ensure_ssh_agent_handler::<D>))
         .route(
             "/pod/reconnect-events",

@@ -308,7 +308,7 @@ pub fn review(cmd: &ReviewCommand) -> Result<()> {
     // "ref not found" message for typos or deleted pods.
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
-    let pods = client.list_pods(repo_root.clone())?;
+    let pods = client.list_pods(repo_root.clone(), true, false)?;
     if !pods.iter().any(|s| s.name == cmd.name) {
         let name = &cmd.name;
         return Err(anyhow::anyhow!("pod '{name}' does not exist"));

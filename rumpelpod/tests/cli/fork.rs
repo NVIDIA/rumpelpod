@@ -5,7 +5,10 @@
 
 use std::fs;
 
-use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
+use crate::common::{
+    ensure_pi_config_via_daemon, launch_pod_via_daemon, pod_command, write_host_pi_settings,
+    write_test_devcontainer, write_test_devcontainer_with_fake_pi, TestDaemon, TestHome, TestRepo,
+};
 use crate::executor::ExecutorResources;
 use rumpelpod::CommandExt;
 
@@ -137,6 +140,55 @@ fn fork_preserves_codex_state_symlinks() {
         .success()
         .expect("read forked codex symlink failed");
     assert_eq!(String::from_utf8_lossy(&stdout).trim(), "/tmp/codex-target");
+}
+
+#[test]
+fn fork_preserves_pi_state() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer_with_fake_pi(&repo);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    let source_launch = launch_pod_via_daemon(&repo, &daemon, "src");
+    write_host_pi_settings(&home, "host-before");
+    ensure_pi_config_via_daemon(&repo, &daemon, "src", &source_launch);
+
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "src",
+            "--",
+            "sh",
+            "-c",
+            r#"mkdir -p "$HOME/.pi/agent" && printf '{"defaultProjectTrust":"always","source":"pod"}' > "$HOME/.pi/agent/settings.json""#,
+        ])
+        .success()
+        .expect("create pi state failed");
+
+    write_host_pi_settings(&home, "host-after");
+
+    pod_command(&repo, &daemon)
+        .args(["fork", "src", "fk"])
+        .success()
+        .expect("rumpel fork failed");
+
+    let fork_launch = launch_pod_via_daemon(&repo, &daemon, "fk");
+    ensure_pi_config_via_daemon(&repo, &daemon, "fk", &fork_launch);
+
+    let stdout = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "fk",
+            "--",
+            "cat",
+            "/home/testuser/.pi/agent/settings.json",
+        ])
+        .success()
+        .expect("read forked pi state failed");
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(stdout.contains(r#""source":"pod""#), "{stdout}");
 }
 
 #[test]

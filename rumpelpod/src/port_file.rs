@@ -15,6 +15,10 @@
 //! * Readers (in-container consumers like the Claude hook and
 //!   `rumpel container-exec`) fail hard on missing or empty files.
 //!   There are no default ports.
+//! * The codex app-server port file is advertisement-only: the pod
+//!   server always picks a fresh ephemeral port (a recorded one may
+//!   belong to another pod under host networking) and routes all
+//!   traffic via its in-memory copy of the port.
 
 use std::fs::{self, File, Permissions};
 use std::io::Write;
@@ -26,6 +30,7 @@ use anyhow::{Context, Result};
 
 pub const SERVER_PORT_FILE: &str = "/opt/rumpelpod/server-port";
 pub const TUNNEL_PORT_FILE: &str = "/opt/rumpelpod/tunnel-port";
+pub const CODEX_APP_SERVER_PORT_FILE: &str = "/opt/rumpelpod/codex-app-server-port";
 
 /// Read and parse a port file.  Fails on missing, empty, or
 /// unparseable content -- the caller has no fallback.

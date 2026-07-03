@@ -27,7 +27,7 @@ pub fn fork(cmd: &ForkCommand) -> Result<()> {
     // Sanity-check names against the pod list before we ship the
     // request, so common mistakes (typo'd source, name collision)
     // surface as plain CLI errors instead of via the SSE stream.
-    let pods = client.list_pods(repo_root.clone())?;
+    let pods = client.list_pods(repo_root.clone(), true, false)?;
     if !pods.iter().any(|p| p.name == cmd.source) {
         let source = &cmd.source;
         return Err(anyhow::anyhow!("source pod '{source}' does not exist"));

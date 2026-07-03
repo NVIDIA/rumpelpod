@@ -87,6 +87,17 @@ pub struct CodexSession {
 impl CodexSession {
     /// Spawn `rumpel codex test` inside a PTY.
     pub fn spawn(repo: &TestRepo, daemon: &TestDaemon, home: &Path, codex_args: &[&str]) -> Self {
+        Self::spawn_named(repo, daemon, home, "test", codex_args)
+    }
+
+    /// Spawn `rumpel codex <pod_name>` inside a PTY.
+    pub fn spawn_named(
+        repo: &TestRepo,
+        daemon: &TestDaemon,
+        home: &Path,
+        pod_name: &str,
+        codex_args: &[&str],
+    ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -114,7 +125,7 @@ impl CodexSession {
             std::env::var("RUMPELPOD_TEST_LLM_OFFLINE").unwrap_or_else(|_| "1".to_string()),
         );
 
-        cmd.args(["codex", "--create", "test"]);
+        cmd.args(["codex", "--create", pod_name]);
         if !codex_args.is_empty() {
             cmd.arg("--");
             for arg in codex_args {

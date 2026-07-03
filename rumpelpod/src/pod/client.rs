@@ -75,6 +75,21 @@ impl PodClient {
         Ok(pod)
     }
 
+    /// Build a client for callers that already have a live endpoint
+    /// and need bounded request time instead of readiness polling.
+    pub fn new_with_timeout(url: &str, token: &str, timeout: Duration) -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .gzip(true)
+            .build()
+            .expect("failed to build reqwest client");
+        Ok(Self {
+            client,
+            url: url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+        })
+    }
+
     /// Block until the container server accepts connections on /events
     /// and sends its `state` greeting.
     ///

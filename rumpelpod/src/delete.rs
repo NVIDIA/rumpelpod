@@ -25,7 +25,7 @@ pub fn delete(cmd: &DeleteCommand) -> Result<()> {
     let socket_path = daemon::socket_path()?;
     let client = DaemonClient::new_unix(&socket_path);
 
-    let pods = client.list_pods(repo_path.clone())?;
+    let pods = client.list_pods(repo_path.clone(), true, false)?;
 
     let mut failed = 0u32;
 

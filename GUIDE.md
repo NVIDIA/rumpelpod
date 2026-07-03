@@ -32,7 +32,7 @@ This launches a persistent Claude Code session in auto-accept mode inside an iso
 The pod gets its own checkout of the repository and a copy of your Claude credentials from your local machine.
 Its container image is based on existing [devcontainer configuration](#container-configuration) or a default image.
 The first invocation builds the image, which can take a while; subsequent pods reuse it and start much faster.
-`rumpel codex` does the same for OpenAI Codex.
+`rumpel codex` does the same for OpenAI Codex, and `rumpel pi` for the [pi](https://pi.dev) coding agent.
 
 Have the agent make a change and commit it.
 Once the commit lands, rumpelpod automatically pushes it to your local repository, where it appears as `rumpelpod/my-pod`.
@@ -460,12 +460,7 @@ Each toleration is a [Kubernetes toleration][kubernetes-toleration] with the sam
 ### `claude`
 
 ```json
-{
-  "claude": {
-    "dangerouslySkipPermissions": false,
-    "injectSystemPrompt": false
-  }
-}
+{ "claude": { "dangerouslySkipPermissions": false } }
 ```
 
 The `claude` object configures the `rumpel claude` command.
@@ -473,7 +468,6 @@ The `claude` object configures the `rumpel claude` command.
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `dangerouslySkipPermissions` | bool | `true` | passes `--dangerously-skip-permissions` to the claude CLI. The pod already provides an isolated environment, so Claude does not need its own tool-call approval flow on top. |
-| `injectSystemPrompt` | bool | `true` | writes a rumpelpod-aware prompt to `/etc/claude-code/CLAUDE.md` inside the container so Claude knows about the devcontainer layout, git remotes, and the push-on-commit flow |
 
 ### `codex`
 
@@ -486,6 +480,28 @@ The `codex` object configures the `rumpel codex` command.
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `dangerouslyBypassApprovalsAndSandbox` | bool | `true` | passes `--dangerously-bypass-approvals-and-sandbox` to the codex TUI. The pod already provides an isolated environment, so codex does not need its own sandbox on top. |
+
+### `pi`
+
+```json
+{ "pi": { "trustWorkspace": false } }
+```
+
+The `pi` object configures the `rumpel pi` command.
+
+| Field | Type | Default | Notes |
+|-------|------|---------|-------|
+| `trustWorkspace` | bool | `true` | pre-trusts the workspace (`defaultProjectTrust: "always"`) so pi's TUI does not block on the project-trust prompt. The pod already provides an isolated environment. |
+
+### `injectSystemPrompt`
+
+```json
+{ "injectSystemPrompt": false }
+```
+
+Whether to write a rumpelpod-aware system prompt into each installed agent's prompt location (`/etc/claude-code/CLAUDE.md` for Claude, `~/.codex/AGENTS.md` for codex, `~/.pi/agent/SYSTEM.md` for pi) so the agent knows about the devcontainer layout, git remotes, and the push-on-commit flow.
+The description is identical for every agent, so this is a single pod-level switch rather than a per-agent one.
+Defaults to `true`.
 
 ### `merge`
 
