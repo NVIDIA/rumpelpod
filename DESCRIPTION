@@ -14,3 +14,8 @@ streamlocal forwarding (rejected by locked-down servers) and ignores
 proxy.  The daemon keeps one proxy per SSH host; CLI-side interactive
 exec starts an ephemeral one.  Covered by a new smoke test against a
 locked-down sshd fixture serving a rootful Podman service.
+
+Prepared image builds now ship the host git dir inside the main build
+context for every engine (Podman's remote API cannot transfer named
+build contexts, and the named context bought buildx nothing), dropping
+the engine-specific gateway plumbing.

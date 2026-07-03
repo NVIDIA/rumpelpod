@@ -317,11 +317,12 @@ fn compute_prepared_tag(
 
 /// Generate the Dockerfile content for the prepared image.
 ///
-/// The host `.git` dir is bind-mounted at build time so its contents
-/// never end up in a layer of the prepared image.  It reaches the
-/// build either as a named build context (`gateway`) or, when
-/// `gateway_in_context` is set, as a `gateway` stage populated from a
-/// `gateway-git/` copy in the main build context.
+/// The host `.git` dir travels as a `gateway-git/` copy in the build
+/// context, exposed through the `gateway` stage and bind-mounted into
+/// the prepare-image step, so its contents never end up in a layer of
+/// the prepared image.  A named build context would avoid the copy but
+/// Podman's remote API does not transfer additional build contexts, so
+/// all engines share the in-context layout instead.
 ///
 /// After the rumpel binary is installed, remaining setup (repo clone,
 /// Claude CLI) is delegated to `rumpel prepare-image` so the logic
@@ -339,7 +340,6 @@ fn generate_dockerfile(
     mount_targets: &[String],
     inject_system_prompt: bool,
     description_file: Option<&str>,
-    gateway_in_context: bool,
 ) -> String {
     let repo_path = container_repo_path.display();
     let rumpel = crate::daemon::RUMPEL_CONTAINER_BIN;
@@ -388,20 +388,6 @@ fn generate_dockerfile(
         None => String::new(),
     };
 
-    // Podman's remote API does not transfer additional build contexts
-    // to the server, so for remote Podman builds the git dir travels
-    // inside the main context and a stage stands in for the named
-    // context; `from=gateway` resolves to either.
-    let gateway_stage = if gateway_in_context {
-        formatdoc! {r#"
-            FROM scratch AS gateway
-            COPY gateway-git/ /
-
-        "#}
-    } else {
-        String::new()
-    };
-
     // Each flag above already carries its own ` \<newline>` prefix, so
     // concatenating them keeps the generated RUN line one-flag-per-line.
     // Assembling them here keeps the template below readable.
@@ -417,7 +403,10 @@ fn generate_dockerfile(
     // sessions -- switch_user() handles dropping to the container
     // user in-pod.
     formatdoc! {r#"
-        {gateway_stage}FROM {base_image}
+        FROM scratch AS gateway
+        COPY gateway-git/ /
+
+        FROM {base_image}
 
         ARG TARGETARCH
         ARG BASE_USER=root
@@ -438,9 +427,7 @@ fn generate_dockerfile(
 
 /// Assemble the build context directory with the Dockerfile and binaries.
 ///
-/// The host `.git` dir is not staged here.  It is normally passed
-/// separately via `--build-context` so buildx can transfer it
-/// efficiently; for remote Podman builds the caller copies it in
+/// The host `.git` dir is not staged here; the caller copies it in
 /// afterwards (see `copy_git_dir_into_context`).
 #[allow(clippy::too_many_arguments)]
 fn assemble_build_context(
@@ -457,7 +444,6 @@ fn assemble_build_context(
     description_file: Option<&str>,
     raw_devcontainer_json: &str,
     container_env_keys: &[String],
-    gateway_in_context: bool,
 ) -> Result<tempfile::TempDir> {
     let dockerfile = generate_dockerfile(
         base_image,
@@ -471,7 +457,6 @@ fn assemble_build_context(
         mount_targets,
         inject_system_prompt,
         description_file,
-        gateway_in_context,
     );
     let binaries = find_rumpel_binaries()?;
 
@@ -502,8 +487,12 @@ fn assemble_build_context(
     Ok(tmp)
 }
 
-/// Copy the `.git` dir into the build context as `gateway-git/` for
-/// engines whose remote API cannot transfer additional build contexts.
+/// Copy the `.git` dir into the build context as `gateway-git/`.
+///
+/// A named build context would avoid this copy, but Podman's remote
+/// API cannot transfer additional build contexts, so the git dir
+/// travels inside the main context for every engine.  The copy is a
+/// snapshot: builds do not see concurrent mutation of the live `.git`.
 fn copy_git_dir_into_context(git_dir: &Path, build_context: &Path) -> Result<()> {
     let resolved = fs::canonicalize(git_dir).with_context(|| {
         let dir = git_dir.display();
@@ -518,24 +507,6 @@ fn copy_git_dir_into_context(git_dir: &Path, build_context: &Path) -> Result<()>
         .success()
         .with_context(|| format!("copying git dir {source} into build context"))?;
     Ok(())
-}
-
-/// Create a symlink to the `.git` dir without the `.git` suffix.
-///
-/// Buildx misidentifies directories containing a HEAD file as remote
-/// git URLs.  A symlink without `.git` in the name forces
-/// local-directory treatment.
-fn create_gateway_link(git_dir: &Path, build_context: &Path) -> Result<PathBuf> {
-    let resolved = fs::canonicalize(git_dir).with_context(|| {
-        let dir = git_dir.display();
-        format!("resolving git dir {dir}")
-    })?;
-    let gateway_link = build_context.join("gateway-link");
-    std::os::unix::fs::symlink(&resolved, &gateway_link).with_context(|| {
-        let target = resolved.display();
-        format!("symlinking gateway-link -> {target}")
-    })?;
-    Ok(gateway_link)
 }
 
 /// Tag an image by its sha256 digest so `docker build FROM` can reference it.
@@ -697,18 +668,6 @@ pub fn build_prepared_image(
         }
     }
 
-    // Podman's remote API does not transfer additional build contexts,
-    // so remote Podman builds ship the git dir inside the main context
-    // instead (see `generate_dockerfile`).
-    let gateway_in_context = matches!(
-        &mode,
-        BuildxMode::Load {
-            docker_host: Host::Ssh { .. },
-            engine: ContainerEngine::Podman,
-            ..
-        }
-    );
-
     let build_ctx = assemble_build_context(
         &buildable_base,
         container_repo_path,
@@ -723,17 +682,10 @@ pub fn build_prepared_image(
         description_file,
         raw_devcontainer_json,
         container_env_keys,
-        gateway_in_context,
     )?;
+    copy_git_dir_into_context(git_dir, build_ctx.path())?;
 
     let mut extra_args = vec![format!("--build-arg=BASE_USER={image_user}")];
-    if gateway_in_context {
-        copy_git_dir_into_context(git_dir, build_ctx.path())?;
-    } else {
-        let gateway_link = create_gateway_link(git_dir, build_ctx.path())?;
-        let gateway_link_display = gateway_link.display().to_string();
-        extra_args.push(format!("--build-context=gateway={gateway_link_display}"));
-    }
     extra_args.extend(build_options.iter().cloned());
 
     let dockerfile = build_ctx.path().join("Dockerfile");
