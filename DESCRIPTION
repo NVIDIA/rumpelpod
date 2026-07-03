@@ -1,0 +1,5 @@
+Regenerate THIRD-PARTY-NOTICES after version bump
+
+The crate version bump to 0.3.0 changed the "Used by" entries for the
+workspace crates, so the checked-in notices no longer matched what
+cargo-about generates. Caught by third_party_notices_is_up_to_date.
