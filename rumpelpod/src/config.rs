@@ -105,6 +105,7 @@ impl ContainerEngine {
 /// Either the local machine, a remote host accessed via SSH, or a Kubernetes
 /// cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum Host {
     /// The local Docker or Podman engine.
     Localhost {
@@ -146,6 +147,62 @@ pub enum Host {
         #[serde(default)]
         image_builder: ContainerEngine,
     },
+}
+
+// Pre-Podman versions declared Localhost as a unit variant, so pod
+// databases written by them contain the JSON string "Localhost" instead
+// of a map. Deserialization accepts both encodings; serialization always
+// emits the current one. The remote = "Self" attribute above turns the
+// derived implementations into inherent methods that these impls
+// delegate to.
+impl Serialize for Host {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Host::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Host {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HostVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HostVisitor {
+            type Value = Host;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a host variant map or the legacy string \"Localhost\"")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Host, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    // ContainerEngine::Auto prefers Docker, so legacy pods
+                    // keep targeting the Docker engine they were created
+                    // with.
+                    "Localhost" => Ok(Host::Localhost {
+                        engine: ContainerEngine::Auto,
+                    }),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
+                }
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Host, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                Host::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+
+        deserializer.deserialize_any(HostVisitor)
+    }
 }
 
 impl Host {
