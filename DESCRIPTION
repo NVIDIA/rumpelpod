@@ -1,0 +1,18 @@
+Pin devcontainer build inputs for CI rebuilds
+
+The devcontainer is rebuilt from scratch in CI, so every floating input
+(debian:testing, the live apt archive, latest release downloads) made
+consecutive builds diverge. Pin the base image by digest, freeze apt on
+the matching snapshot.debian.org timestamp, and pin the previously
+floating tool versions: Rust toolchain (via rust-toolchain.toml),
+cargo-about, claude, codex, eksctl, aws-cli and node (with checksum
+verification). Preloaded container images are pinned by digest since
+tags like wolfi-base:latest and registry:2 move. The repo clone that
+warms the cargo cache gets a RUMPELPOD_REF build arg so CI can pin the
+commit under test.
+
+Also fix the ECR credential helper download to use the arm64 build on
+arm64 instead of unconditionally fetching amd64, and drop the
+dockerfile syntax header: it pulled the floating docker/dockerfile:1.7
+frontend image although no feature beyond the builtin frontend of any
+BuildKit-era docker is used.

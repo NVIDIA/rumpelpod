@@ -2,7 +2,7 @@
     "build": {
         "dockerfile": "Dockerfile",
         "args": {
-            "BASE_IMAGE": "${localEnv:BASE_IMAGE:debian:testing}"
+            "BASE_IMAGE": "${localEnv:BASE_IMAGE:debian:testing-20260623@sha256:1c79280f13304aedb1d88795f80fbc26d818f951e56adab23d365ea626187271}"
         }
     },
     "runArgs": [
