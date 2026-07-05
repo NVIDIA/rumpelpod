@@ -1,13 +1,25 @@
-# syntax=docker/dockerfile:1.7
-
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-ARG BASE_IMAGE=debian:testing
-
-FROM $BASE_IMAGE
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE:-debian:testing-20260623@sha256:1c79280f13304aedb1d88795f80fbc26d818f951e56adab23d365ea626187271}
 
 USER root
+
+# Freeze apt on the archive snapshot matching the base image build date
+# so package versions do not drift; bump both pins together.
+ARG APT_SNAPSHOT=20260623T000000Z
+# sed exits 0 even when nothing matches, so assert the rewrite took;
+# otherwise a base image with a different sources layout would build
+# unpinned without any error.
+RUN sed -i -E \
+        -e "s|^URIs: http://deb.debian.org/debian-security$|URIs: http://snapshot.debian.org/archive/debian-security/${APT_SNAPSHOT}\nCheck-Valid-Until: no|" \
+        -e "s|^URIs: http://deb.debian.org/debian$|URIs: http://snapshot.debian.org/archive/debian/${APT_SNAPSHOT}\nCheck-Valid-Until: no|" \
+        /etc/apt/sources.list.d/debian.sources \
+    && grep -q "^URIs: http://snapshot.debian.org/archive/debian/${APT_SNAPSHOT}$" \
+        /etc/apt/sources.list.d/debian.sources \
+    && ! grep -rq "deb.debian.org" /etc/apt/sources.list.d/ \
+    && echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80-retries
 
 RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
@@ -104,10 +116,10 @@ RUN curl -fsSL "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-linux
     chmod +x /usr/local/bin/k3d
 
 RUN dpkg_arch=$(dpkg --print-architecture) && \
-    curl -fsSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_${dpkg_arch}.tar.gz" \
+    curl -fsSL "https://github.com/eksctl-io/eksctl/releases/download/v0.229.0/eksctl_Linux_${dpkg_arch}.tar.gz" \
     | tar xz -C /usr/local/bin
 
-RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" \
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m)-2.35.15.zip" \
         -o /tmp/awscliv2.zip && \
     unzip -q /tmp/awscliv2.zip -d /tmp && \
     /tmp/aws/install && \
@@ -115,7 +127,8 @@ RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" \
 
 # ECR credential helper so docker/buildx can push to ECR without
 # manual `docker login` (tokens are refreshed automatically via AWS creds).
-RUN curl -fsSL "https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/0.9.0/linux-amd64/docker-credential-ecr-login" \
+RUN dpkg_arch=$(dpkg --print-architecture) && \
+    curl -fsSL "https://amazon-ecr-credential-helper-releases.s3.us-east-2.amazonaws.com/0.9.0/linux-${dpkg_arch}/docker-credential-ecr-login" \
         -o /usr/local/bin/docker-credential-ecr-login && \
     chmod +x /usr/local/bin/docker-credential-ecr-login
 
@@ -191,14 +204,16 @@ ENV CONTAINER_HOST=unix:///run/podman/podman.sock
 
 USER ${USER}
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# The toolchain version must match rust-toolchain.toml at the repo root.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+        --default-toolchain 1.96.1
 ENV PATH="/home/${USER}/.cargo/bin:${PATH}"
 RUN rustup component add rust-analyzer \
     && rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
 # cargo-about generates ATTRIBUTION.md; the attribution integration test
 # shells out to it on every pipeline run.
-RUN cargo install cargo-about --locked --features cli
+RUN cargo install cargo-about --version 0.9.1 --locked --features cli
 
 # Set default target to native architecture. Cargo merges this with the
 # project's .cargo/config.toml which has per-target linker settings.
@@ -211,7 +226,7 @@ RUN dpkg_arch=$(dpkg --print-architecture) && \
     mkdir -p ~/.cargo && \
     printf '[build]\ntarget = "%s"\n' "$default_target" > ~/.cargo/config.toml
 
-RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.201
 
 USER root
 
@@ -222,7 +237,7 @@ RUN ARCH=$(uname -m) && \
         x86_64) CODEX_ARCH="x86_64-unknown-linux-musl" ;; \
         aarch64) CODEX_ARCH="aarch64-unknown-linux-musl" ;; \
     esac && \
-    curl -fsSL "https://github.com/openai/codex/releases/latest/download/codex-$CODEX_ARCH.tar.gz" \
+    curl -fsSL "https://github.com/openai/codex/releases/download/rust-v0.142.5/codex-$CODEX_ARCH.tar.gz" \
     | tar xz -C /tmp && \
     mv "/tmp/codex-$CODEX_ARCH" /usr/local/bin/codex && \
     chmod +x /usr/local/bin/codex
@@ -238,33 +253,39 @@ RUN ARCH=$(uname -m) && \
     chmod +x /usr/local/bin/grok
 
 ARG PI_VERSION=0.79.10
+ARG NODE_VERSION=22.23.1
 
 # pi requires a newer Node than stable distro packages often provide.
+# The tarball is verified against the checksum file of its release.
 RUN ARCH=$(uname -m) && \
     case "$ARCH" in \
         x86_64) NODE_ARCH="x64" ;; \
         aarch64) NODE_ARCH="arm64" ;; \
         *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;; \
     esac && \
-    NODE_BASE="https://nodejs.org/dist/latest-v22.x" && \
-    NODE_TARBALL=$(curl -fsSL "$NODE_BASE/SHASUMS256.txt" \
-        | awk -v suffix="-linux-${NODE_ARCH}.tar.gz" \
-            '$2 ~ ("^node-v.*" suffix "$") { print $2; exit }') && \
-    test -n "$NODE_TARBALL" && \
-    curl -fsSL "$NODE_BASE/$NODE_TARBALL" -o /tmp/node.tar.gz && \
-    tar xzf /tmp/node.tar.gz -C /opt && \
+    NODE_BASE="https://nodejs.org/dist/v${NODE_VERSION}" && \
+    NODE_TARBALL="node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz" && \
+    curl -fsSL "$NODE_BASE/$NODE_TARBALL" -o "/tmp/$NODE_TARBALL" && \
+    curl -fsSL "$NODE_BASE/SHASUMS256.txt" -o /tmp/SHASUMS256.txt && \
+    cd /tmp && \
+    grep " $NODE_TARBALL\$" SHASUMS256.txt | sha256sum -c - && \
+    tar xzf "/tmp/$NODE_TARBALL" -C /opt && \
     NODE_DIR="/opt/${NODE_TARBALL%.tar.gz}" && \
     ln -sf "$NODE_DIR/bin/node" /usr/local/bin/node && \
     ln -sf "$NODE_DIR/bin/npm" /usr/local/bin/npm && \
     ln -sf "$NODE_DIR/bin/npx" /usr/local/bin/npx && \
-    rm /tmp/node.tar.gz && \
+    rm "/tmp/$NODE_TARBALL" /tmp/SHASUMS256.txt && \
     npm install -g --prefix /usr/local --ignore-scripts --no-fund --no-audit \
         --loglevel=error "@earendil-works/pi-coding-agent@${PI_VERSION}"
 
 RUN mkdir /workspaces && chown -R ${USER}:${USER} /workspaces
 USER ${USER}
 
-RUN git clone https://github.com/nvidia/rumpelpod /workspaces/rumpelpod
+# The clone only warms the cargo cache below; RUMPELPOD_REF lets a CI
+# build pin the exact commit it is testing instead of current main.
+ARG RUMPELPOD_REF=main
+RUN git clone https://github.com/nvidia/rumpelpod /workspaces/rumpelpod \
+    && git -C /workspaces/rumpelpod checkout --detach "${RUMPELPOD_REF}"
 WORKDIR /workspaces/rumpelpod
 
 COPY --chown=${USER}:${USER} --chmod=755 commit-msg /workspaces/rumpelpod/.git/hooks/commit-msg
@@ -278,13 +299,15 @@ RUN cargo build --bin rumpel --target x86_64-unknown-linux-musl \
 USER root
 
 # Pre-download container images so services start without network access.
+# Sources are pinned by digest because tags (especially :latest and :2)
+# move; the docker-archive references keep the tags the tooling expects.
 RUN mkdir /preloaded-images \
-    && skopeo copy docker://cgr.dev/chainguard/wolfi-base:latest docker-archive:/preloaded-images/wolfi-base.tar:cgr.dev/chainguard/wolfi-base:latest \
-    && skopeo copy docker://docker.io/rancher/k3s:v1.31.5-k3s1 docker-archive:/preloaded-images/k3s.tar:rancher/k3s:v1.31.5-k3s1 \
-    && skopeo copy docker://ghcr.io/k3d-io/k3d-tools:5.8.3 docker-archive:/preloaded-images/k3d-tools.tar:ghcr.io/k3d-io/k3d-tools:5.8.3 \
-    && skopeo copy docker://ghcr.io/k3d-io/k3d-proxy:5.8.3 docker-archive:/preloaded-images/k3d-proxy.tar:ghcr.io/k3d-io/k3d-proxy:5.8.3 \
-    && skopeo copy docker://docker.io/library/registry:2 docker-archive:/preloaded-images/registry-2.tar:registry:2 \
-    && skopeo copy docker://docker.io/moby/buildkit:v0.21.1 docker-archive:/preloaded-images/buildkit.tar:moby/buildkit:v0.21.1
+    && skopeo copy docker://cgr.dev/chainguard/wolfi-base@sha256:2f7a5c164eafbdbe46fe1d91bd1ab4c8cb5c2bdbd10641c3d61bd39962384cdb docker-archive:/preloaded-images/wolfi-base.tar:cgr.dev/chainguard/wolfi-base:latest \
+    && skopeo copy docker://docker.io/rancher/k3s@sha256:53cf744fe2fabf140cee240d2db70d13a4f2d98f1a13c98f58f457f423096917 docker-archive:/preloaded-images/k3s.tar:rancher/k3s:v1.31.5-k3s1 \
+    && skopeo copy docker://ghcr.io/k3d-io/k3d-tools@sha256:c5ceb2b9e8ff2cf55917b0bee8bc9c54fe1483a16366b734117e2cfac1417bed docker-archive:/preloaded-images/k3d-tools.tar:ghcr.io/k3d-io/k3d-tools:5.8.3 \
+    && skopeo copy docker://ghcr.io/k3d-io/k3d-proxy@sha256:d43e6ffd27c216d0b21815c1226c8aeac2e07086ac5a988eb39bd7e308f6e370 docker-archive:/preloaded-images/k3d-proxy.tar:ghcr.io/k3d-io/k3d-proxy:5.8.3 \
+    && skopeo copy docker://docker.io/library/registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373 docker-archive:/preloaded-images/registry-2.tar:registry:2 \
+    && skopeo copy docker://docker.io/moby/buildkit@sha256:87afb62ed6a762bb65b85d53819f3b341fb74a36d1fc0a1153a64f367637bfda docker-archive:/preloaded-images/buildkit.tar:moby/buildkit:v0.21.1
 
 RUN printf '[Unit]\nAfter=docker.service\nRequires=docker.service\n\n[Service]\nType=oneshot\nExecStart=/bin/sh -c '"'"'for f in /preloaded-images/*.tar; do /usr/bin/docker load -i "$f"; done'"'"'\n\n[Install]\nWantedBy=multi-user.target\n' \
     > /etc/systemd/system/preload-images.service \
