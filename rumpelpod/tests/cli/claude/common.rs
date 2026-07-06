@@ -47,9 +47,19 @@ fn write_claude_test_devcontainer(repo: &TestRepo) {
     // ANTHROPIC_BASE_URL points at the pod server's LLM cache proxy
     // route.  `${containerEnv:RUMPELPOD_SERVER_PORT}` resolves to the
     // ephemeral port container-serve exports (test-mode only).
+    //
+    // The DISABLE_* vars make Claude deterministic so the recorded
+    // cache replays offline. NONESSENTIAL_TRAFFIC stops the Statsig
+    // fetch that otherwise toggles runtime feature gates per a random
+    // per-run anonymousId -- gates that add the "ttl" prompt-cache hint
+    // and inject a random available-skills reminder into tool results.
+    // DISABLE_THINKING drops extended-thinking blocks, whose signature
+    // is a fresh token every generation.
     let extra_json = r#",
         "remoteEnv": {
-            "ANTHROPIC_BASE_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/anthropic"
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:${containerEnv:RUMPELPOD_SERVER_PORT}/llm-cache-proxy/anthropic",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "CLAUDE_CODE_DISABLE_THINKING": "1"
         }"#;
 
     write_test_devcontainer(repo, &extra_dockerfile, extra_json);
