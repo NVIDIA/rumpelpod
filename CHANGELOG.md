@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- On macOS, Claude Code OAuth credentials stored in the login Keychain
-  (the default for `claude login`) are now copied into pods. Previously
-  only `~/.claude/.credentials.json` was read, which does not exist on
-  macOS, so `rumpel claude` prompted for a fresh browser login inside
-  every new pod.
-
 ## [0.1.0] - TBD
 
 ### Added
