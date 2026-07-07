@@ -130,9 +130,7 @@ pub(crate) fn read_local_credentials(local_home: &Path) -> Result<Option<Vec<u8>
     match std::fs::read(local_home.join(".claude/.credentials.json")) {
         Ok(data) => return Ok(Some(data)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(anyhow::Error::from(e).context("reading ~/.claude/.credentials.json"))
-        }
+        Err(e) => return Err(anyhow::Error::from(e).context("reading ~/.claude/.credentials.json")),
     }
     Ok(read_keychain_credentials())
 }
@@ -146,7 +144,12 @@ pub(crate) fn read_local_credentials(local_home: &Path) -> Result<Option<Vec<u8>
 #[cfg(target_os = "macos")]
 fn read_keychain_credentials() -> Option<Vec<u8>> {
     let output = match std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
     {
         Ok(output) => output,
