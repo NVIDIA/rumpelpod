@@ -1,13 +1,17 @@
-Show container id in list without --sync
+Show container ids in list without --sync
 
 The CONTAINER ID column was only populated when --sync queried the
-backend; plain "rumpel list" always showed it blank. The backend name
-(docker/podman container name, kubernetes pod name) is a pure function
-of the repo path and pod name, both of which the daemon already
-persists, so derive it at list time instead of querying the backend.
-This keeps the column correct across daemon restarts, needs no DB
-schema change, and replaces the docker hash id with the container
-name, which docker accepts wherever it accepts ids. The value is no
-longer truncated to 12 characters since the hash prefix convention no
-longer applies and the shared "rumpel-<repo>" prefix would make
-truncated names indistinguishable.
+backend; plain "rumpel list" always showed it blank. The daemon now
+keeps an in-memory cache of backend container ids (docker container
+id, kubernetes pod name), keyed by repo path and pod name, and serves
+list requests from it. The cache is filled at launch (docker create
+prints the id; the k8s pod name is the pod id we chose), refreshed by
+the same per-host queries --sync runs, and entries are dropped when
+the daemon deletes a container, so recreate never shows a stale id.
+
+Because docker assigns ids at creation and nothing persists them,
+a restarted daemon re-fetches ids on the first list: hosts not yet
+reconciled this daemon lifetime are queried once, then marked warmed
+so gone containers do not trigger a backend query on every list.
+SSH hosts are only queried while connected, as with --sync. This
+avoids a DB schema change, for which there is no migration story yet.

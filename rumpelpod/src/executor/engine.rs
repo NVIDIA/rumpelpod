@@ -210,7 +210,10 @@ impl Executor {
     /// On kubernetes this polls for the `Running` phase, surfacing
     /// container-level errors (e.g. ImagePullBackOff).  On docker,
     /// `docker start` is synchronous and no wait is needed.
-    pub fn launch(&self, id: &PodId, spec: PodSpec) -> Result<()> {
+    ///
+    /// Returns the backend's identifier for the new pod: the docker
+    /// container id, or the kubernetes pod name.
+    pub fn launch(&self, id: &PodId, spec: PodSpec) -> Result<String> {
         match &self.inner {
             Inner::Docker(d) => {
                 if !spec.k8s_only.is_empty() {
@@ -227,7 +230,8 @@ impl Executor {
                          set on a kubernetes launch"
                     );
                 }
-                k8s_launch(k, id, spec)
+                k8s_launch(k, id, spec)?;
+                Ok(id.as_str().to_string())
             }
         }
     }
@@ -348,9 +352,9 @@ impl Executor {
     ///
     /// Filters by a backend-specific repo label (full path on docker,
     /// repo-hash on kubernetes).  Returns a map keyed by logical pod
-    /// name (from the `rumpelpod-name` label) with the pod's status.
-    /// Pods without the name label are skipped rather than reported
-    /// as unnamed.
+    /// name (from the `rumpelpod-name` label) with the pod's status
+    /// and backend identifier.  Pods without the name label are
+    /// skipped rather than reported as unnamed.
     pub fn list_by_repo(&self, repo_path: &Path) -> Result<HashMap<String, PodBackendInfo>> {
         match &self.inner {
             Inner::Docker(d) => docker_list_by_repo(d, repo_path),
@@ -363,6 +367,9 @@ impl Executor {
 #[derive(Debug, Clone)]
 pub struct PodBackendInfo {
     pub status: PodStatus,
+    /// Backend's identifier for the pod: docker container id on docker,
+    /// pod name on kubernetes.
+    pub container_id: String,
 }
 
 /// Options for [`Executor::exec_interactive`].
@@ -448,6 +455,8 @@ impl DockerBackend {
 
 #[derive(Deserialize)]
 struct DockerContainerInspect {
+    #[serde(rename = "Id")]
+    id: Option<String>,
     #[serde(rename = "Config")]
     config: Option<DockerContainerConfig>,
     #[serde(rename = "State")]
@@ -714,7 +723,7 @@ async fn k8s_exec_streaming(
     })
 }
 
-fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<()> {
+fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<String> {
     let PodSpec {
         image,
         hostname,
@@ -804,9 +813,10 @@ fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<(
         command.args(cmd);
     }
 
-    command.success().context("creating container")?;
+    let stdout = command.success().context("creating container")?;
+    let container_id = String::from_utf8_lossy(&stdout).trim().to_string();
     docker_start(backend, id).context("starting container")?;
-    Ok(())
+    Ok(container_id)
 }
 
 fn docker_mount_arg(mount: super::Mount) -> String {
@@ -1090,7 +1100,16 @@ fn docker_list_by_repo(
         } else {
             PodStatus::Stopped
         };
-        out.insert(pod_name, PodBackendInfo { status });
+        let container_id = container
+            .id
+            .context("docker container inspect response missing Id")?;
+        out.insert(
+            pod_name,
+            PodBackendInfo {
+                status,
+                container_id,
+            },
+        );
     }
     Ok(out)
 }
@@ -1126,7 +1145,14 @@ fn k8s_list_by_repo(
             "Failed" | "Succeeded" => PodStatus::Gone,
             _ => PodStatus::Disconnected,
         };
-        out.insert(pod_name, PodBackendInfo { status });
+        let container_id = pod.metadata.name.unwrap_or_default();
+        out.insert(
+            pod_name,
+            PodBackendInfo {
+                status,
+                container_id,
+            },
+        );
     }
     Ok(out)
 }

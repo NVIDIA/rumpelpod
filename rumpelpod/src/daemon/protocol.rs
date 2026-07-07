@@ -162,10 +162,11 @@ pub struct PodInfo {
     pub host: String,
     /// State of the repository in the pod (e.g. "ahead 1, behind 2").
     pub repo_state: Option<String>,
-    /// Backend name of the pod's container: the docker/podman container
-    /// name, or the kubernetes pod name.  Derived from the repo path and
-    /// pod name, so it is present even when the container is gone.
-    pub container_id: String,
+    /// Backend id of the pod's container: the full docker container id,
+    /// or the kubernetes pod name.  Served from the daemon's cache;
+    /// `None` when the container is gone or the backend has not been
+    /// reachable since the daemon started.
+    pub container_id: Option<String>,
     /// Committer timestamp (unix seconds) of the tip of the pod's primary branch on the host.
     pub last_commit_time: Option<i64>,
     /// Current Claude Code session state, if known.

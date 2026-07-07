@@ -78,6 +78,10 @@ pub fn list(cmd: &ListCommand) -> Result<()> {
             PodStatus::Broken => "broken",
         };
         let repo_state = pod.repo_state.as_deref().unwrap_or("");
+        // Truncate to the docker-style 12-char short id.
+        let header = "CONTAINER ID";
+        let container_id = pod.container_id.as_deref().unwrap_or("");
+        let container_id = &container_id[..container_id.len().min(header.len())];
 
         let mut row = vec![pod.name];
         if show_claude {
@@ -90,7 +94,7 @@ pub fn list(cmd: &ListCommand) -> Result<()> {
         if show_host {
             row.push(pod.host);
         }
-        row.push(pod.container_id);
+        row.push(container_id.to_string());
         table.add_row(row);
     }
 

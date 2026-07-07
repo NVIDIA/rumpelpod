@@ -92,15 +92,20 @@ fn list_shows_created_pod() {
 
 #[test]
 fn list_shows_container_id_without_sync() {
+    // Slice the row at the header's column offset rather than taking
+    // the last whitespace token: CONTAINER ID is the last column, so
+    // when it is blank the last token would silently be the previous
+    // column's value.
     fn container_id_column(stdout: &str, pod_name: &str) -> String {
+        let header_offset = stdout
+            .lines()
+            .find_map(|line| line.find("CONTAINER ID"))
+            .unwrap_or_else(|| panic!("no CONTAINER ID header in output: {stdout}"));
         let line = stdout
             .lines()
             .find(|line| line.contains(pod_name))
             .unwrap_or_else(|| panic!("no row for pod '{pod_name}' in output: {stdout}"));
-        line.split_whitespace()
-            .last()
-            .expect("matched row is not empty")
-            .to_string()
+        line.get(header_offset..).unwrap_or("").trim().to_string()
     }
 
     let repo = TestRepo::new();
@@ -120,9 +125,9 @@ fn list_shows_container_id_without_sync() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Without --sync the daemon serves from its cache and never
-    // queries the backend, so the container id must come from the
-    // derivation, not from a live lookup.
+    // Plain list, no --sync: the id comes from the daemon's cache,
+    // filled at launch (or, for a host not queried since daemon
+    // start, by the one-time warm query).
     let output = pod_command(&repo, &daemon)
         .arg("list")
         .output()
@@ -134,14 +139,28 @@ fn list_shows_container_id_without_sync() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let container_id = container_id_column(&stdout, "cid-test");
-    assert!(
-        container_id.starts_with("rumpel-") && container_id.contains("cid-test"),
-        "unexpected container id '{container_id}' in output: {stdout}"
-    );
+    match executor_mode() {
+        // Docker engines show the 12-char short id.
+        ExecutorMode::Docker | ExecutorMode::Podman | ExecutorMode::Ssh => {
+            assert!(
+                container_id.len() == 12 && container_id.chars().all(|c| c.is_ascii_hexdigit()),
+                "expected a 12-char hex container id, got '{container_id}': {stdout}"
+            );
+        }
+        // K8s shows the pod name, truncated to the same width.
+        ExecutorMode::K8s => {
+            assert!(
+                container_id.starts_with("rumpel-"),
+                "expected a rumpel- pod name prefix, got '{container_id}': {stdout}"
+            );
+        }
+    }
 
-    // The derived id must name the real backend container.  SSH and
-    // K8s put the container runtime behind a tunnel / the cluster
+    // The cached id must identify the real backend container.  SSH
+    // and K8s put the container runtime behind a tunnel / the cluster
     // API, so only the local engines can be cross-checked directly.
+    // The list output shows the docker-style 12-char short id, so
+    // compare by prefix.
     let engine_cli = match executor_mode() {
         ExecutorMode::Docker => Some("docker"),
         ExecutorMode::Podman => Some("podman"),
@@ -154,38 +173,46 @@ fn list_shows_container_id_without_sync() {
                 "--all",
                 "--filter",
                 "label=dev.rumpelpod.name=cid-test",
+                "--no-trunc",
                 "--format",
-                "{{.Names}}",
+                "{{.ID}}",
             ])
             .output()
             .unwrap_or_else(|e| panic!("{engine_cli} ps failed: {e}"));
         assert!(output.status.success());
-        let names = String::from_utf8_lossy(&output.stdout);
+        let ids = String::from_utf8_lossy(&output.stdout);
         assert!(
-            names.lines().any(|name| name == container_id),
-            "container id '{container_id}' not among {engine_cli} container names: {names}"
+            ids.lines().any(|id| id.starts_with(&container_id)),
+            "container id '{container_id}' is not a prefix of any {engine_cli} container id: {ids}"
         );
     }
 
-    // The id is derived from persisted state only, so it must survive
-    // a daemon restart.
-    daemon.kill();
-    let daemon = TestDaemon::start(&home);
-    let output = pod_command(&repo, &daemon)
-        .arg("list")
-        .output()
-        .expect("Failed to run rumpel list command");
-    assert!(
-        output.status.success(),
-        "rumpel list failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    assert_eq!(
-        container_id_column(&stdout, "cid-test"),
-        container_id,
-        "container id changed across daemon restart: {stdout}"
-    );
+    // A restarted daemon has an empty cache; the first list re-fetches
+    // ids from the backend.  SSH is excluded: its host connection is
+    // only re-established when a client enters the pod, so ids come
+    // back after the next enter or --sync instead.
+    match executor_mode() {
+        ExecutorMode::Docker | ExecutorMode::Podman | ExecutorMode::K8s => {
+            daemon.kill();
+            let daemon = TestDaemon::start(&home);
+            let output = pod_command(&repo, &daemon)
+                .arg("list")
+                .output()
+                .expect("Failed to run rumpel list command");
+            assert!(
+                output.status.success(),
+                "rumpel list failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            assert_eq!(
+                container_id_column(&stdout, "cid-test"),
+                container_id,
+                "container id changed across daemon restart: {stdout}"
+            );
+        }
+        ExecutorMode::Ssh => {}
+    }
 }
 
 #[test]

@@ -7,7 +7,7 @@ pub mod pod_connection;
 pub mod protocol;
 pub mod reconnect;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -377,6 +377,25 @@ pub struct DaemonServer {
     /// outlive any single client connection so the user can detach
     /// (Ctrl-a d) and reattach to the same TUI process.
     pty_sessions: crate::pty_session::PtySessions,
+    /// Backend container ids served by plain `list` (no --sync).
+    container_ids: Arc<Mutex<ContainerIdCache>>,
+}
+
+/// Cache of backend container ids, keyed by (repo path, pod name).
+///
+/// Docker assigns container ids at creation and nothing persists
+/// them, so after a daemon restart they can only be recovered by
+/// querying the backend.  The cache is filled at launch and by the
+/// per-host queries in `list_pods`, and entries are dropped when the
+/// daemon deletes the container.  `warmed_hosts` records (repo path,
+/// host json) pairs that have been reconciled against a successful
+/// backend query once this daemon lifetime, so pods whose containers
+/// are gone show no id instead of triggering a backend query on
+/// every list.
+#[derive(Default)]
+struct ContainerIdCache {
+    ids: HashMap<(PathBuf, String), String>,
+    warmed_hosts: HashSet<(PathBuf, String)>,
 }
 
 /// Sanitize a string for use as a container hostname (RFC 1123):
@@ -2618,9 +2637,13 @@ impl DaemonServer {
         progress_tx
             .send(OutputLine::Stderr("creating container...".into()))
             .ok();
-        executor
+        let backend_container_id = executor
             .launch(&exec_pod_id, spec)
             .map_err(|e| mark_error(e.context("creating k8s pod")))?;
+        self.container_ids.lock().unwrap().ids.insert(
+            (repo_path.to_path_buf(), pod_name.0.clone()),
+            backend_container_id,
+        );
 
         // Start exec tunnel so the container can reach the git HTTP
         // server on a loopback port.  Must be up before container-serve
@@ -2789,6 +2812,11 @@ impl DaemonServer {
                     ReconnectPodResult::Gone(e) => {
                         log::warn!("existing pod is gone, will recreate: {e:#}");
                         self.cleanup_codex_runtime(&repo_path, &pod_name.0);
+                        self.container_ids
+                            .lock()
+                            .unwrap()
+                            .ids
+                            .remove(&(repo_path.clone(), pod_name.0.clone()));
                         let conn = self.db.lock().unwrap();
                         db::delete_pod(&conn, &repo_path, &pod_name.0)?;
                     }
@@ -3130,7 +3158,11 @@ impl DaemonServer {
                 &publish_ports,
                 &progress_tx,
             )?;
-            executor.launch(&exec_pod_id, spec)?;
+            let backend_container_id = executor.launch(&exec_pod_id, spec)?;
+            self.container_ids.lock().unwrap().ids.insert(
+                (repo_path.clone(), pod_name.0.clone()),
+                backend_container_id,
+            );
             let container_id = ContainerId(exec_pod_id.as_str().to_string());
 
             // Start exec tunnel so the container can reach the git HTTP
@@ -3199,6 +3231,11 @@ impl DaemonServer {
                 if let Err(e) = executor.delete(&exec_pod_id) {
                     error!("failed to remove broken container {exec_pod_id}: {e}");
                 }
+                self.container_ids
+                    .lock()
+                    .unwrap()
+                    .ids
+                    .remove(&(repo_path.clone(), pod_name.0.clone()));
                 do_create_and_setup().map_err(|e| {
                     mark_error(e.context(
                         "container setup failed again after retry; this is a known \
@@ -4042,6 +4079,11 @@ impl Daemon for DaemonServer {
         if is_k8s || wait {
             let result = executor.delete(&pod_id);
             if result.is_ok() {
+                self.container_ids
+                    .lock()
+                    .unwrap()
+                    .ids
+                    .remove(&(repo_path.clone(), pod_name.0.clone()));
                 cleanup_pod_refs(&repo_path, &pod_name);
                 let conn = self.db.lock().unwrap();
                 db::delete_pod(&conn, &repo_path, &pod_name.0)?;
@@ -4049,6 +4091,7 @@ impl Daemon for DaemonServer {
             result?;
         } else {
             let db = self.db.clone();
+            let container_ids = self.container_ids.clone();
             let repo_path = repo_path.clone();
             let pod_name = pod_name.clone();
             std::thread::spawn(move || {
@@ -4059,6 +4102,11 @@ impl Daemon for DaemonServer {
                     }
                     match executor.delete(&pod_id) {
                         Ok(()) => {
+                            container_ids
+                                .lock()
+                                .unwrap()
+                                .ids
+                                .remove(&(repo_path.clone(), pod_name.0.clone()));
                             cleanup_pod_refs(&repo_path, &pod_name);
                             let conn = db.lock().unwrap();
                             let _ = db::delete_pod(&conn, &repo_path, &pod_name.0);
@@ -4097,10 +4145,25 @@ impl Daemon for DaemonServer {
 
         let mut status_maps: HashMap<String, Option<HashMap<String, PodBackendInfo>>> =
             HashMap::new();
-        if sync {
+        {
             // Local Docker and local Podman have separate stores, so
             // the stored host JSON is part of the key.
+            //
+            // Without --sync, hosts whose container ids are already
+            // cached are skipped; only hosts not reconciled since the
+            // daemon started (typically right after a restart) are
+            // queried, so ids survive restarts without being persisted.
             for pod in &db_pods {
+                if !sync
+                    && self
+                        .container_ids
+                        .lock()
+                        .unwrap()
+                        .warmed_hosts
+                        .contains(&(repo_path.clone(), pod.host.clone()))
+                {
+                    continue;
+                }
                 let host = serde_json::from_str::<Host>(&pod.host).ok();
                 match &host {
                     Some(h @ Host::Localhost { .. }) if !status_maps.contains_key(&pod.host) => {
@@ -4134,6 +4197,33 @@ impl Daemon for DaemonServer {
                     Some(Host::Ssh { .. }) => {}
                     None => {}
                 }
+            }
+        }
+
+        // A successful backend query is authoritative for all of that
+        // host's pods: record ids for containers that exist, drop ids
+        // for containers that are gone, and mark the host warmed so
+        // gone containers do not trigger a re-query on every list.
+        {
+            let mut cache = self.container_ids.lock().unwrap();
+            for pod in &db_pods {
+                let Some(Some(status_map)) = status_maps.get(&pod.host) else {
+                    continue;
+                };
+                match status_map.get(&pod.name) {
+                    Some(info) => {
+                        cache.ids.insert(
+                            (repo_path.clone(), pod.name.clone()),
+                            info.container_id.clone(),
+                        );
+                    }
+                    None => {
+                        cache.ids.remove(&(repo_path.clone(), pod.name.clone()));
+                    }
+                }
+                cache
+                    .warmed_hosts
+                    .insert((repo_path.clone(), pod.host.clone()));
             }
         }
 
@@ -4178,13 +4268,13 @@ impl Daemon for DaemonServer {
                 cached_pod_status(pod.status, connection_status)
             };
 
-            // The backend id is a pure function of the repo path and
-            // pod name.  db::list_pods matches rows on the exact
-            // repo_path, so deriving from the request path reproduces
-            // the launch-time id without querying the backend and
-            // stays correct across daemon restarts.
-            let container_id =
-                crate::executor::pod_id_for(&PodName(pod.name.clone()), &repo_path).to_string();
+            let container_id = self
+                .container_ids
+                .lock()
+                .unwrap()
+                .ids
+                .get(&(repo_path.clone(), pod.name.clone()))
+                .cloned();
 
             let git_info = compute_git_info(&repo_path, &pod.name);
 
@@ -4237,7 +4327,14 @@ impl Daemon for DaemonServer {
             let pod_id = crate::executor::pod_id_for(&logical, repo_path);
             let result = self.host_executor(&host).and_then(|e| e.delete(&pod_id));
             match result {
-                Ok(()) => deleted += 1,
+                Ok(()) => {
+                    self.container_ids
+                        .lock()
+                        .unwrap()
+                        .ids
+                        .remove(&(repo_path.to_path_buf(), pod.name.clone()));
+                    deleted += 1;
+                }
                 Err(e) => eprintln!("warning: failed to delete pod '{pod_name}': {e}"),
             }
         }
@@ -4521,6 +4618,7 @@ pub fn run_daemon() -> Result<()> {
         host_connections,
         pod_connections,
         pty_sessions: crate::pty_session::PtySessions::new(),
+        container_ids: Arc::new(Mutex::new(ContainerIdCache::default())),
     };
 
     // Re-establish connections to pods that were running before we
