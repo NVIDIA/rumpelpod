@@ -1,0 +1,149 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build and test the release binaries, then publish them on tags. The
+# linux jobs run the full pipeline inside the devcontainer under sysbox
+# (via ci/run-pipeline.sh) and stage the very binary the tests ran
+# against; macos builds release-only because its runners have no docker
+# daemon for the pod tests. The release job assembles those staged
+# binaries into a GitHub release. Jobs are kept flat (not a matrix) so
+# each platform shows up on its own in the checks UI.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      # The devcontainer image plus its build cache exceed the free
+      # space on a stock runner.
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost
+          sudo docker image prune --all --force
+
+      - name: Install sysbox
+        run: |
+          arch=$(dpkg --print-architecture)
+          curl -fsSL \
+            "https://github.com/nestybox/sysbox/releases/download/v0.7.0/sysbox-ce_0.7.0.linux_${arch}.deb" \
+            -o /tmp/sysbox-ce.deb
+          sudo apt-get install --yes /tmp/sysbox-ce.deb
+
+      - name: Run pipeline and stage binary
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          STAGING_DIR: ${{ github.workspace }}/staging
+        run: ci/run-pipeline.sh
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rumpel-linux-amd64
+          path: staging/rumpel-linux-amd64
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost
+          sudo docker image prune --all --force
+
+      - name: Install sysbox
+        run: |
+          arch=$(dpkg --print-architecture)
+          curl -fsSL \
+            "https://github.com/nestybox/sysbox/releases/download/v0.7.0/sysbox-ce_0.7.0.linux_${arch}.deb" \
+            -o /tmp/sysbox-ce.deb
+          sudo apt-get install --yes /tmp/sysbox-ce.deb
+
+      - name: Run pipeline and stage binary
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          STAGING_DIR: ${{ github.workspace }}/staging
+        run: ci/run-pipeline.sh
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rumpel-linux-arm64
+          path: staging/rumpel-linux-arm64
+
+  # Build-only: GitHub's arm64 macos runners are VMs with no docker
+  # daemon, and the pod tests need one. macos test coverage stays on the
+  # dev macbook workflow.
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # build.rs embeds version info from git history.
+          fetch-depth: 0
+
+      - name: Build release binary
+        run: cargo build --release --bin rumpel --target aarch64-apple-darwin
+
+      - name: Stage binary
+        run: |
+          mkdir -p staging
+          cp target/aarch64-apple-darwin/release/rumpel staging/rumpel-darwin-arm64
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: rumpel-darwin-arm64
+          path: staging/rumpel-darwin-arm64
+
+  release:
+    needs: [linux-amd64, linux-arm64, macos-arm64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: rumpel-*
+          path: staging/
+          merge-multiple: true
+
+      - name: Create tarball
+        run: |
+          chmod +x staging/*
+          tar -C staging -czf "rumpel-${{ github.ref_name }}.tar.gz" \
+            rumpel-linux-amd64 rumpel-linux-arm64 rumpel-darwin-arm64
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" "rumpel-${{ github.ref_name }}.tar.gz" \
+            --title "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}"

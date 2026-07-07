@@ -125,6 +125,12 @@ struct Cli {
     #[arg(long, hide = true)]
     skip_file: Option<PathBuf>,
 
+    /// Build the tests and the rumpel binary under test in release mode.
+    /// The default dev build is faster to compile; CI uses this to
+    /// exercise the optimized binaries that ship.
+    #[arg(long)]
+    release: bool,
+
     /// Arguments passed through to cargo test.
     #[arg(allow_hyphen_values = true)]
     cargo_args: Vec<String>,
@@ -453,12 +459,14 @@ fn split_at_dash(args: &[String]) -> (Vec<String>, Vec<String>) {
 /// Build test binaries and return their paths.
 ///
 /// Uses `--message-format=json` to discover executable paths.
-fn build_test_binaries(before_dash: &[String]) -> Result<Vec<PathBuf>> {
-    let json_output = tools::output(
-        cargo_cmd()
-            .args(["test", "--no-run", "--message-format=json"])
-            .args(before_dash),
-    )?;
+fn build_test_binaries(before_dash: &[String], release: bool) -> Result<Vec<PathBuf>> {
+    let mut cmd = cargo_cmd();
+    cmd.args(["test", "--no-run", "--message-format=json"]);
+    if release {
+        cmd.arg("--release");
+    }
+    cmd.args(before_dash);
+    let json_output = tools::output(&mut cmd)?;
 
     let mut binaries = Vec::new();
     for line in json_output.lines() {
@@ -1185,19 +1193,23 @@ fn run() -> Result<ExitCode> {
 
     for (triple, _) in &targets {
         eprint!("Building rumpel for {triple}... ");
-        cargo_cmd()
-            .args(["build", "--bin", "rumpel", "--target", triple])
-            .success()
+        let mut cmd = cargo_cmd();
+        cmd.args(["build", "--bin", "rumpel", "--target", triple]);
+        if cli.release {
+            cmd.arg("--release");
+        }
+        cmd.success()
             .with_context(|| format!("building rumpel for {triple}"))?;
         eprintln!("ok");
     }
 
     let tmp = tempfile::tempdir().context("creating temp dir")?;
 
+    let profile_dir = if cli.release { "release" } else { "debug" };
     for (triple, name) in &targets {
         let src = Path::new("target")
             .join(triple)
-            .join("debug")
+            .join(profile_dir)
             .join("rumpel");
         let dst = tmp.path().join(name);
         std::fs::copy(&src, &dst).with_context(|| {
@@ -1248,7 +1260,7 @@ fn run() -> Result<ExitCode> {
 
     let (before_dash, after_dash) = split_at_dash(&cli.cargo_args);
 
-    let test_binaries = build_test_binaries(&before_dash)?;
+    let test_binaries = build_test_binaries(&before_dash, cli.release)?;
     if test_binaries.is_empty() {
         eprintln!("No test binaries found");
         return Ok(ExitCode::SUCCESS);

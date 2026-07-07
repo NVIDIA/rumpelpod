@@ -135,6 +135,9 @@ fn is_environment_context(item: &serde_json::Value) -> bool {
 /// array.  grok injects a volatile system prompt (working directory,
 /// date, available tools) that would otherwise make the cache key unique
 /// per run; keying on the user turns alone keeps it stable.
+///
+/// The injected skills reminder is a user turn but lists the installed
+/// skills in a non-deterministic on-disk order, so it is dropped too.
 fn strip_non_user_messages(value: &mut serde_json::Value) {
     let Some(messages) = value
         .get_mut("messages")
@@ -143,7 +146,18 @@ fn strip_non_user_messages(value: &mut serde_json::Value) {
         return;
     };
 
-    messages.retain(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"));
+    messages.retain(|item| {
+        item.get("role").and_then(serde_json::Value::as_str) == Some("user")
+            && !is_skills_reminder(item)
+    });
+}
+
+/// True when a message is the injected reminder that lists the available
+/// skills, whose ordering varies run to run.
+fn is_skills_reminder(item: &serde_json::Value) -> bool {
+    item.get("content")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|content| content.contains("The following skills are available for use"))
 }
 
 /// Extract only the fields that determine API response semantics.
@@ -180,7 +194,38 @@ fn extract_cache_fields(provider: &str, body: &[u8], fields: &[&str]) -> Vec<u8>
 fn normalize_cache_fields(data: Vec<u8>) -> Vec<u8> {
     let data = replace_dates_between(data, b"<current_date>", b"</current_date>");
     let data = replace_dates_between(data, b"Today's date is ", b".");
-    replace_dates_between(data, b"Today's date: ", b"\\n")
+    let data = replace_dates_between(data, b"Today's date: ", b"\\n");
+    replace_localhost_port(data)
+}
+
+/// Replace the port in every `127.0.0.1:<port>` with a fixed
+/// placeholder.  The pod git HTTP server binds a random port each run;
+/// that port leaks into tool output such as `git remote -v`, which the
+/// agent echoes back as a tool result, and would otherwise make the
+/// cache key unique per run.
+fn replace_localhost_port(data: Vec<u8>) -> Vec<u8> {
+    const PREFIX: &[u8] = b"127.0.0.1:";
+
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let Some(rel) = data[i..].windows(PREFIX.len()).position(|w| w == PREFIX) else {
+            out.extend_from_slice(&data[i..]);
+            break;
+        };
+        let num_start = i + rel + PREFIX.len();
+        out.extend_from_slice(&data[i..num_start]);
+        let mut j = num_start;
+        while j < data.len() && data[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > num_start {
+            // At least one digit followed the prefix: collapse the port.
+            out.push(b'0');
+        }
+        i = j;
+    }
+    out
 }
 
 /// Replace every `YYYY-MM-DD` that sits between `prefix` and `suffix`
@@ -522,6 +567,18 @@ mod tests {
         assert_eq!(
             normalized,
             br#"{"content":"<user_info>\nToday's date: 0000-00-00\n</user_info>"}"#
+        );
+    }
+
+    #[test]
+    fn normalizes_random_localhost_port() {
+        let normalized = normalize_cache_fields(
+            br#"{"content":"host\thttp://127.0.0.1:33049/rumpelpod.git (fetch)"}"#.to_vec(),
+        );
+
+        assert_eq!(
+            normalized,
+            br#"{"content":"host\thttp://127.0.0.1:0/rumpelpod.git (fetch)"}"#
         );
     }
 }

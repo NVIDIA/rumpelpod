@@ -3,11 +3,13 @@
 
 //! Local CI pipeline: format, build, lint, test, and check git status.
 //!
-//! Usage: cargo pipeline [--continue] [args for cargo xtest...]
+//! Usage: cargo pipeline [--continue] [--release] [args for cargo xtest...]
 //!
 //! Test output is recorded to `target/xtest/<timestamp>.log`.
 //! Use `--continue` to resume a previous run, skipping tests that
 //! already passed.
+//! Use `--release` to build and test the optimized binaries (CI does
+//! this); the default dev build is faster to compile.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -167,6 +169,15 @@ fn run() -> Result<ExitCode> {
         false
     };
 
+    // Consumed here rather than passed through so it also applies to
+    // the build and clippy steps, then re-added for xtest below.
+    let release = if let Some(pos) = args.iter().position(|a| a == "--release") {
+        args.remove(pos);
+        true
+    } else {
+        false
+    };
+
     let log_dir = PathBuf::from("target/xtest");
     std::fs::create_dir_all(&log_dir).context("creating target/xtest")?;
 
@@ -188,10 +199,13 @@ fn run() -> Result<ExitCode> {
     eprintln!("=== Checking formatting ===");
     run_cmd(tools::cargo_cmd().args(["fmt", "--", "--check"]))?;
 
+    let profile_args: &[&str] = if release { &["--release"] } else { &[] };
+
     eprintln!("\n=== Building (with tests, no warnings) ===");
     run_cmd(
         tools::cargo_cmd()
             .args(["build", "--all-targets"])
+            .args(profile_args)
             .env("RUSTFLAGS", "-D warnings"),
     )?;
 
@@ -199,6 +213,7 @@ fn run() -> Result<ExitCode> {
     run_cmd(
         tools::cargo_cmd()
             .args(["clippy", "--all-targets"])
+            .args(profile_args)
             .env("RUSTFLAGS", "-D warnings"),
     )?;
 
@@ -214,6 +229,9 @@ fn run() -> Result<ExitCode> {
 
     let mut xtest_cmd = tools::cargo_cmd();
     xtest_cmd.arg("xtest");
+    if release {
+        xtest_cmd.arg("--release");
+    }
 
     // --skip-file must come before positional args because clap's
     // trailing_var_arg treats everything after the first positional

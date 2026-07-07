@@ -1,0 +1,43 @@
+{"status":200,"path":"/v1/messages?beta=true","headers":{"anthropic-organization-id":"3fd0c5c4-8e2b-46b5-bc86-860fcbb2881e","anthropic-ratelimit-input-tokens-limit":"10000000","anthropic-ratelimit-input-tokens-remaining":"9985000","anthropic-ratelimit-input-tokens-reset":"2026-07-05T18:46:49Z","anthropic-ratelimit-output-tokens-limit":"2000000","anthropic-ratelimit-output-tokens-remaining":"2000000","anthropic-ratelimit-output-tokens-reset":"2026-07-05T18:46:49Z","anthropic-ratelimit-requests-limit":"10000","anthropic-ratelimit-requests-remaining":"9999","anthropic-ratelimit-requests-reset":"2026-07-05T18:46:49Z","anthropic-ratelimit-tokens-limit":"12000000","anthropic-ratelimit-tokens-remaining":"11985000","anthropic-ratelimit-tokens-reset":"2026-07-05T18:46:49Z","cache-control":"no-cache","cf-cache-status":"DYNAMIC","cf-ray":"a16888dfed793d5d-CDG","content-security-policy":"default-src 'none'; frame-ancestors 'none'","content-type":"text/event-stream; charset=utf-8","date":"Sun, 05 Jul 2026 18:46:51 GMT","request-id":"req_011CcjQdM4JMjbhTHoWr9Kx1","server":"cloudflare","strict-transport-security":"max-age=31536000; includeSubDomains; preload","traceresponse":"00-9a4e8f31b349402b8e313f3a6834bb59-08cd361485a94353-01","vary":"Accept-Encoding","x-robots-tag":"none"}}
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-haiku-4-5-20251001","id":"msg_01GdaWbsq4wuudU9G15x6ZVa","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":8,"cache_creation_input_tokens":25691,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":25691,"ephemeral_1h_input_tokens":0},"output_tokens":5,"service_tier":"standard","inference_geo":"not_available"}}      }
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}     }
+
+event: ping
+data: {"type": "ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The command executed successfully and"}         }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" output \"rumpelpod-cmd-ok\" as expected. The echo command printed \"rumpelpod cmd ok\" and tr"}               }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" replaced all spaces with hyphens."}      }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EvECCm0IDxgCKkAy0BgG2Hb64YeUQdKFEoFgyQXLs+f2a/y7AIkXH9NdE+rHv9Adt/PuajLSql42wd62oM8mO6sbEWB8655yBRAlMhljbGF1ZGUtaGFpa3UtNC01LTIwMjUxMDAxOABCCHRoaW5raW5nEgw4LhOO8BJ+O+3AcMoaDJceJhE0b7WH4S8kqyIw4L+oMSN25fyRIsaPfeu5msb57KQ1p/PfrloADZoVfkOhqiqkfzomXWUaZ+kyU6cTKrEB9roClx88a5aB0THtsoZAonNKVLmy6fYPPVgtQPXLExz457MvwvDqrKRgd7RmCyZ5ER53KCIoSx1InnJNDR2IhQ1h6mTA2velzsl4dPpgwww+tHOnRgdh0v7eZ4Qe0t9sV1bI+nfTGvEVeR6/wSFnamcy7p71TTLBxnZVTTRQG/wnqjLKez5B87hZeodmF0NXZI8lsUX+uT60W/QDU71uiY2J2dHwmcLHDRJLhL6vIJdVGAE="}    }
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}  }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Done! The command worked and output: `rumpelpod-cmd-"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok`"}      }
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1     }
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null},"usage":{"input_tokens":8,"cache_creation_input_tokens":25691,"cache_read_input_tokens":0,"output_tokens":70,"output_tokens_details":{"thinking_tokens":46}},"context_management":{"applied_edits":[]}    }
+
+event: message_stop
+data: {"type":"message_stop"      }
+
