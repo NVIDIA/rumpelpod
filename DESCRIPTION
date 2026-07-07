@@ -1,0 +1,6 @@
+Regenerate THIRD-PARTY-NOTICES after version bump
+
+The 0.4.0 version bump (18c40a2) updated the workspace crate versions
+in Cargo.lock but left THIRD-PARTY-NOTICES pointing at rumpelpod/tools
+0.3.0, so the pipeline's third_party_notices_is_up_to_date test
+failed. Regenerate it to match.
