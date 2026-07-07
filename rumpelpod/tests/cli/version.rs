@@ -23,8 +23,13 @@ fn version_output_format() {
 
     assert_eq!(fields[0], "rumpelpod");
 
-    let version_parts: Vec<&str> = fields[1].split('.').collect();
-    assert_eq!(version_parts.len(), 3, "version not semver: {}", fields[1]);
+    // The version is the release tag name, which carries a leading v by
+    // convention (v0.4.0); untagged builds embed v0.0.0.
+    let version = fields[1]
+        .strip_prefix('v')
+        .unwrap_or_else(|| panic!("version missing v prefix: {}", fields[1]));
+    let version_parts: Vec<&str> = version.split('.').collect();
+    assert_eq!(version_parts.len(), 3, "version not semver: {version}");
     for part in &version_parts {
         part.parse::<u32>()
             .unwrap_or_else(|_| panic!("version component not a number: {part}"));

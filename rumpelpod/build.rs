@@ -36,7 +36,7 @@ fn main() {
             .trim()
             .to_string()
     } else {
-        "0.0.0".to_string()
+        "v0.0.0".to_string()
     };
 
     let diff = git_output(&["diff", "HEAD"]);
