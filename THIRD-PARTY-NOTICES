@@ -5591,8 +5591,8 @@ License: Apache-2.0
 --------------------------------------------------------------------------------
 
 Used by:
-  - rumpelpod 0.3.0
-  - tools 0.3.0
+  - rumpelpod 0.4.0
+  - tools 0.4.0
   - android_system_properties 0.1.5  (https://github.com/nical/android_system_properties)
   - anyhow 1.0.102  (https://github.com/dtolnay/anyhow)
   - arraydeque 0.5.1  (https://github.com/andylokandy/arraydeque)
