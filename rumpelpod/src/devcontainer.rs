@@ -6,7 +6,7 @@
 //! This module implements types according to the Dev Container specification.
 //! See <https://containers.dev/implementors/json_reference/> for details.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -872,7 +872,7 @@ impl DevContainer {
     /// Must be called on the client side before sending to the daemon, since
     /// the daemon doesn't know the devcontainer.json directory.
     /// No-op if no build is configured (image-based container).
-    pub fn resolve_build_paths(&mut self, devcontainer_dir: &Path, repo_root: &Path) {
+    pub fn resolve_build_paths(&mut self, devcontainer_dir: &Path, repo_root: &Path) -> Result<()> {
         // Merge legacy top-level dockerfile into build.dockerfile
         let dockerfile = self
             .dockerfile
@@ -881,7 +881,7 @@ impl DevContainer {
 
         let dockerfile = match dockerfile {
             Some(d) => d,
-            None => return, // No build configured
+            None => return Ok(()), // No build configured
         };
 
         let context = self
@@ -894,19 +894,30 @@ impl DevContainer {
         let resolved_dockerfile = devcontainer_dir
             .join(&dockerfile)
             .strip_prefix(repo_root)
-            .expect("dockerfile must be under repo_root")
+            .map_err(|_| {
+                anyhow!(
+                    "devcontainer dockerfile path must stay under the repo root: {}",
+                    devcontainer_dir.join(&dockerfile).display()
+                )
+            })?
             .to_string_lossy()
             .to_string();
         let resolved_context = devcontainer_dir
             .join(&context)
             .strip_prefix(repo_root)
-            .expect("context must be under repo_root")
+            .map_err(|_| {
+                anyhow!(
+                    "devcontainer build context path must stay under the repo root: {}",
+                    devcontainer_dir.join(&context).display()
+                )
+            })?
             .to_string_lossy()
             .to_string();
 
         let build = self.build.get_or_insert_with(BuildOptions::default);
         build.dockerfile = Some(resolved_dockerfile);
         build.context = Some(resolved_context);
+        Ok(())
     }
 
     /// Whether this devcontainer uses a Dockerfile build (vs a pre-built image).

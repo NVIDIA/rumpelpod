@@ -169,7 +169,7 @@ pub fn load_for_image_cmd(
     let (mut devcontainer, devcontainer_dir) = DevContainer::find_and_load(repo_root)?
         .unwrap_or_else(|| (DevContainer::default(), repo_root.to_path_buf()));
 
-    devcontainer.resolve_build_paths(&devcontainer_dir, repo_root);
+    devcontainer.resolve_build_paths(&devcontainer_dir, repo_root)?;
 
     let local_env_vars = collect_local_env(repo_root)?;
 
