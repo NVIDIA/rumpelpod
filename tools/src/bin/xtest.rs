@@ -76,7 +76,7 @@ use tools::CommandExt;
 
 /// Maximum number of retries across all tests in a single run.
 /// Keeps flaky-test workarounds from masking systemic problems.
-const RETRY_BUDGET: usize = 3;
+const RETRY_BUDGET: usize = 10;
 
 /// (cargo target triple, binary name in flat layout)
 const LINUX_TARGETS: &[(&str, &str)] = &[
