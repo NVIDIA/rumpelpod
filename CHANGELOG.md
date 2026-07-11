@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed  
+- The reference-transaction hook has been updated to use the new OID of the ref instead of `HEAD` when pushing the primary branch shortcut (`refs/rumpelpod/<pod>`). This change helps avoid any silent corruption that could occur if the primary branch gets updated while you're working on a different branch.
+
+
 ## [0.1.0] - TBD
 
 ### Added
