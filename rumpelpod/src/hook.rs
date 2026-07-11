@@ -154,7 +154,7 @@ pub fn reference_transaction(cmd: &ReferenceTransactionCommand) -> Result<()> {
                     &[
                         "push",
                         "rumpelpod",
-                        &format!("HEAD:refs/rumpelpod/{branch}"),
+                        &format!("{newvalue}:refs/rumpelpod/{branch}"),
                         "--force",
                         "--quiet",
                     ],
