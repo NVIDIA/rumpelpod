@@ -488,7 +488,7 @@ fn load_and_resolve_devcontainer(
     // `launch_pod_impl`, past the reentry check: a reconnect does
     // not need the embedded Dockerfile staged at all.
     if !used_default_image {
-        devcontainer.resolve_build_paths(&devcontainer_dir, repo_path);
+        devcontainer.resolve_build_paths(&devcontainer_dir, repo_path)?;
     }
 
     devcontainer
