@@ -53,6 +53,11 @@ interface MultiDiffResource {
   readonly originalUri: vscode.Uri;
 }
 
+interface MultiDiffTabInput {
+  readonly modified: vscode.Uri;
+  readonly original: vscode.Uri;
+}
+
 interface OpenMultiDiffEditorOptions {
   readonly multiDiffSourceUri: vscode.Uri;
   readonly resources: readonly MultiDiffResource[];
@@ -254,8 +259,9 @@ export class ReviewDocuments implements vscode.TextDocumentContentProvider, vsco
     );
     let tab: vscode.Tab | undefined = snapshot.resources.length === 0
       ? vscode.window.tabGroups.activeTabGroup.activeTab
-      : await waitForActiveTab((candidate) =>
-        isSnapshotReviewTab(candidate, snapshot)
+      : await waitForActiveTab(
+        (candidate) => isSnapshotReviewTab(candidate, snapshot),
+        `VS Code did not publish the review tab for pod '${snapshot.pod}'`,
       );
     // Editor commands act on the active editor, which another operation can
     // replace between awaits, so only change a tab proven to be this review.
@@ -489,8 +495,9 @@ async function changeReviewTab(
 ): Promise<vscode.Tab | undefined> {
   await vscode.commands.executeCommand(command);
   if (snapshot.resources.length > 0) {
-    return await waitForActiveTab((candidate) =>
-      isSnapshotReviewTab(candidate, snapshot) && settled(candidate)
+    return await waitForActiveTab(
+      (candidate) => isSnapshotReviewTab(candidate, snapshot) && settled(candidate),
+      `VS Code did not publish the updated review tab for pod '${snapshot.pod}'`,
     );
   }
   const changed = group.activeTab;
@@ -520,14 +527,13 @@ function isSnapshotReviewTab(tab: vscode.Tab, snapshot: ReviewSnapshot): boolean
   if (diffs.length === 0) {
     return true;
   }
-  return diffs.every(
-    (diff, index) => {
-      const resource = snapshot.resources[index];
-      return resource !== undefined &&
-        diff.original.toString() === resource.originalUri.toString() &&
-        diff.modified.toString() === resource.modifiedUri.toString();
-    },
-  );
+  const actual = diffs
+    .map((diff) => diffIdentity(diff.original, diff.modified))
+    .sort();
+  const expected = snapshot.resources
+    .map((resource) => diffIdentity(resource.originalUri, resource.modifiedUri))
+    .sort();
+  return actual.every((identity, index) => identity === expected[index]);
 }
 
 function isPodReviewTab(tab: vscode.Tab, repository: string, pod: string): boolean {
@@ -549,17 +555,39 @@ function reviewKey(repository: string, pod: string): string {
   return JSON.stringify([repository, pod]);
 }
 
-function multiDiffs(input: unknown): readonly vscode.TabInputTextDiff[] | undefined {
+function multiDiffs(input: unknown): readonly MultiDiffTabInput[] | undefined {
   if (
     typeof input !== "object" ||
     input === null ||
     !("textDiffs" in input) ||
     !Array.isArray(input.textDiffs) ||
-    !input.textDiffs.every((diff) => diff instanceof vscode.TabInputTextDiff)
+    !input.textDiffs.every(isMultiDiffTabInput)
   ) {
     return undefined;
   }
   return input.textDiffs;
+}
+
+function isMultiDiffTabInput(value: unknown): value is MultiDiffTabInput {
+  return typeof value === "object" &&
+    value !== null &&
+    "original" in value &&
+    isUri(value.original) &&
+    "modified" in value &&
+    isUri(value.modified);
+}
+
+function isUri(value: unknown): value is vscode.Uri {
+  return typeof value === "object" &&
+    value !== null &&
+    "scheme" in value &&
+    typeof value.scheme === "string" &&
+    "toString" in value &&
+    typeof value.toString === "function";
+}
+
+function diffIdentity(original: vscode.Uri, modified: vscode.Uri): string {
+  return JSON.stringify([original.toString(), modified.toString()]);
 }
 
 function reviewRepository(uri: vscode.Uri): string | undefined {

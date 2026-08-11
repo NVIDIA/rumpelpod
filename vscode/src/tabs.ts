@@ -33,7 +33,10 @@ async function moveActiveTab(
   matches: (tab: vscode.Tab) => boolean,
   destination: MoveActiveEditorArguments,
 ): Promise<vscode.Tab> {
-  const active = await waitForActiveTab(matches);
+  const active = await waitForActiveTab(
+    matches,
+    "VS Code did not activate the tab before moving it",
+  );
   let group = vscode.window.tabGroups.activeTabGroup;
   let destinationIndex = tabDestinationIndex(group, destination);
   if (group.tabs[destinationIndex] === active) {
@@ -78,6 +81,7 @@ function tabDestinationIndex(
 
 export async function waitForActiveTab(
   matches: (tab: vscode.Tab) => boolean,
+  timeoutMessage = "VS Code did not activate the expected tab",
 ): Promise<vscode.Tab> {
   const active = vscode.window.tabGroups.activeTabGroup.activeTab;
   if (active !== undefined && matches(active)) {
@@ -87,7 +91,7 @@ export async function waitForActiveTab(
   return await new Promise<vscode.Tab>((resolve, reject) => {
     const timeout = setTimeout(() => {
       subscription.dispose();
-      reject(new Error("VS Code did not activate the tab before moving it"));
+      reject(new Error(timeoutMessage));
     }, 5_000);
     const subscription = vscode.window.tabGroups.onDidChangeTabs(() => {
       const changed = vscode.window.tabGroups.activeTabGroup.activeTab;

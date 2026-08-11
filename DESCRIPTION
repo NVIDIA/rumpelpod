@@ -15,7 +15,9 @@ resources. Keep external browser opening explicit and offer both
 destinations from the pod menu and Command Palette.
 Wait for VS Code's tab registry before validating newly opened populated
 reviews so desktop extension hosts do not report successful opens as
-failures.
+failures. Recognize desktop multi-diff tab inputs by their URI data
+rather than JavaScript class identity, and tolerate VS Code reordering
+the files.
 Resolve preview attributes from each pod's stored Dev Container
 snapshot so the forwarded-port database schema stays unchanged.
 
