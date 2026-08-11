@@ -6,7 +6,11 @@ import * as vscode from "vscode";
 import type { ReviewFile, ReviewPlan } from "./generated/protocol";
 import type { Repository } from "./model";
 import { runProcess } from "./process";
-import { moveActiveTabToEnd, moveActiveTabToPosition } from "./tabs";
+import {
+  moveActiveTabToEnd,
+  moveActiveTabToPosition,
+  waitForActiveTab,
+} from "./tabs";
 
 const REVIEW_SCHEME = "rumpelpod-review";
 const BINARY_FILE_MESSAGE = "Binary file cannot be displayed by the text diff editor.\n";
@@ -248,14 +252,28 @@ export class ReviewDocuments implements vscode.TextDocumentContentProvider, vsco
         title: snapshot.pod,
       } satisfies OpenMultiDiffEditorOptions,
     );
-    let tab = vscode.window.tabGroups.activeTabGroup.activeTab;
+    let tab: vscode.Tab | undefined = snapshot.resources.length === 0
+      ? vscode.window.tabGroups.activeTabGroup.activeTab
+      : await waitForActiveTab((candidate) =>
+        isSnapshotReviewTab(candidate, snapshot)
+      );
     // Editor commands act on the active editor, which another operation can
     // replace between awaits, so only change a tab proven to be this review.
     if (tab?.isPinned === true && isSnapshotReviewTab(tab, snapshot)) {
-      tab = await changeReviewTab("workbench.action.unpinEditor", snapshot, tab.group);
+      tab = await changeReviewTab(
+        "workbench.action.unpinEditor",
+        snapshot,
+        tab.group,
+        (candidate) => !candidate.isPinned,
+      );
     }
     if (tab?.isPreview === true && isSnapshotReviewTab(tab, snapshot)) {
-      tab = await changeReviewTab("workbench.action.keepEditor", snapshot, tab.group);
+      tab = await changeReviewTab(
+        "workbench.action.keepEditor",
+        snapshot,
+        tab.group,
+        (candidate) => !candidate.isPreview,
+      );
     }
     if (
       tab === undefined ||
@@ -467,10 +485,18 @@ async function changeReviewTab(
   command: string,
   snapshot: ReviewSnapshot,
   group: vscode.TabGroup,
+  settled: (tab: vscode.Tab) => boolean,
 ): Promise<vscode.Tab | undefined> {
   await vscode.commands.executeCommand(command);
+  if (snapshot.resources.length > 0) {
+    return await waitForActiveTab((candidate) =>
+      isSnapshotReviewTab(candidate, snapshot) && settled(candidate)
+    );
+  }
   const changed = group.activeTab;
-  return changed !== undefined && isSnapshotReviewTab(changed, snapshot)
+  return changed !== undefined &&
+      isSnapshotReviewTab(changed, snapshot) &&
+      settled(changed)
     ? changed
     : undefined;
 }

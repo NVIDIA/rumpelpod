@@ -76,7 +76,7 @@ function tabDestinationIndex(
   }
 }
 
-async function waitForActiveTab(
+export async function waitForActiveTab(
   matches: (tab: vscode.Tab) => boolean,
 ): Promise<vscode.Tab> {
   const active = vscode.window.tabGroups.activeTabGroup.activeTab;
