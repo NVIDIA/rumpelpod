@@ -822,7 +822,10 @@ async function waitForForwardedPreviewTabs(page, previews, podName) {
             .count()) >= previews.length + 1,
         "the forwarded previews did not open as tabs in the active group",
     );
-    const reviewTab = page.locator(".tab:visible").filter({ hasText: `${podName} (` }).first();
+    const reviewTab = page
+        .locator(".tab:visible")
+        .filter({ hasText: `${podName}: diff` })
+        .first();
     await reviewTab.waitFor({ state: "visible", timeout: 30_000 });
     assert.equal(
         await reviewTab.evaluate((element) => element.classList.contains("active")),
@@ -942,7 +945,10 @@ async function verifyReviewFocusAndCloseLifecycle(
     await selectPopoverOption(morePopover, "View diff");
     await waitForReview(page, podName, changedFile, originalContent, closedPodContent);
     await assertOpenReviews(page, podName, [podName]);
-    const reopenedReviewTab = page.locator(".tab:visible").filter({ hasText: podName }).first();
+    const reopenedReviewTab = page
+        .locator(".tab:visible")
+        .filter({ hasText: `${podName}: diff` })
+        .first();
     await reopenedReviewTab.waitFor({ state: "visible", timeout: 30_000 });
 }
 
@@ -985,7 +991,9 @@ async function openEditorLabels(page, expectedLabel) {
 async function assertOpenReviews(page, activePodName, openPodNames) {
     const labels = await openEditorLabels(page, activePodName);
     for (const openPodName of openPodNames) {
-        const matches = labels.filter((label) => label.startsWith(`${openPodName} (`));
+        const matches = labels.filter((label) =>
+            label.startsWith(`${openPodName}: diff`)
+        );
         assert(
             matches.length === 1,
             `expected one ${openPodName} review editor: ${JSON.stringify(labels)}`,
@@ -1578,7 +1586,7 @@ async function main() {
         );
         const activeRestoredReview = page
             .locator(".tab.active:visible")
-            .filter({ hasText: podName });
+            .filter({ hasText: `${podName}: diff` });
         assert(
             (await activeRestoredReview.count()) === 1,
             "switching pods did not focus its review tab",
@@ -1633,7 +1641,7 @@ async function main() {
         await waitForCodexPrompt(page, restoredView.terminal, false);
         const restoredReviewTab = page
             .locator(".tab:visible")
-            .filter({ hasText: `${podName} (` })
+            .filter({ hasText: `${podName}: diff` })
             .first();
         await restoredReviewTab.waitFor({ state: "visible", timeout: 30_000 });
         await restoredReviewTab.click();

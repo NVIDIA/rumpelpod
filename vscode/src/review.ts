@@ -111,7 +111,7 @@ export class ReviewDocuments implements vscode.TextDocumentContentProvider, vsco
       repository: repository.root,
       resources: plan.files.map((file) => reviewResource(repository, plan, file)),
       source: source.toString(),
-      title: reviewTitle(repository, pod),
+      title: reviewTitle(pod),
     } satisfies ReviewSnapshot;
     await this.updateNow(snapshot, refreshOnly);
   }
@@ -202,7 +202,7 @@ export class ReviewDocuments implements vscode.TextDocumentContentProvider, vsco
       repository: repository.root,
       resources: [],
       source: source.toString(),
-      title: reviewTitle(repository, pod),
+      title: reviewTitle(pod),
     } satisfies ReviewSnapshot;
     await this.updateNow(snapshot, refreshOnly);
   }
@@ -456,8 +456,8 @@ function reviewKey(repository: string, pod: string): string {
   return JSON.stringify([repository, pod]);
 }
 
-function reviewTitle(repository: Repository, pod: string): string {
-  return `${pod} (Review - ${repository.root})`;
+function reviewTitle(pod: string): string {
+  return `${pod}: diff`;
 }
 
 function multiDiffs(input: unknown): readonly MultiDiffTabInput[] | undefined {

@@ -20,10 +20,12 @@ while two or more sessions are open. Launching Claude while Codex is open keeps
 both independent PTYs alive instead of replacing one with the other. Selecting
 a pod restores its launched agents and focuses every changed file on the right
 in one vertically stacked review. The review remains an ordinary closable VS
-Code editor. Selecting the pod again or choosing `View diff` from the actions
-menu focuses the current review, reopening it through VS Code's public changes
-editor command when necessary. Background daemon events refresh the active
-review without stealing focus from another editor or resurrecting a closed one.
+Code editor titled `<pod>: diff`, matching the `<pod>: <port>` titles used
+for forwarded pages. Selecting the pod again or choosing `View diff` from the
+actions menu focuses the current review, reopening it through VS Code's public
+changes editor command when necessary. Background daemon events refresh the
+active review without stealing focus from another editor or resurrecting a
+closed one.
 Switching pods focuses that pod's review, or opens one if needed. The extension
 does not pin, unpin, retain, or reposition review tabs, and does not change VS
 Code's editor-tab settings. Tab placement and preview replacement therefore

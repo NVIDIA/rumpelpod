@@ -15,8 +15,10 @@ resources. Keep external browser opening explicit and offer both
 destinations from the pod menu and Command Palette.
 Open reviews through VS Code's public changes editor command. Track the
 resulting tabs by their URI data rather than JavaScript class identity,
-and tolerate VS Code reordering the files. Refresh inactive reviews only
-after the user returns to them so daemon updates do not steal focus.
+and tolerate VS Code reordering the files. Title reviews `<pod>: diff`
+to match the `<pod>: <port>` convention used by forwarded pages. Refresh
+inactive reviews only after the user returns to them so daemon updates
+do not steal focus.
 Resolve preview attributes from each pod's stored Dev Container
 snapshot so the forwarded-port database schema stays unchanged.
 
