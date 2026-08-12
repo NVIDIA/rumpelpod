@@ -39,6 +39,7 @@ export function activate(context: vscode.ExtensionContext): void {
     reviews,
     previews,
     status,
+    controller,
     events,
     terminals.onDidShow(() => {
       void runCommand(model, "opening the Rumpelpod view", () => controller.enterMode());

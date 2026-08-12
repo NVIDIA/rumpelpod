@@ -7,17 +7,16 @@ packaged node-pty binding. Pod creation, lifecycle output, and
 interactive sessions share the CLI's established terminal behavior.
 Expose forwarded ports through the extension. Open Dev Container
 `openPreview` ports automatically in a restricted VS Code preview tab
-in the pod review's editor group. Prefix preview tabs with the pod name
-and append each new pod's tabs to keep existing pod tab blocks intact.
-Keep replacement review tabs at their prior position. The preview gives
+in the active editor group. Prefix preview tabs with the pod name and
+let VS Code honor the user's editor placement, preview, and pinning
+behavior without rearranging tabs. The preview gives
 untrusted pages an opaque origin and no access to VS Code or workspace
 resources. Keep external browser opening explicit and offer both
 destinations from the pod menu and Command Palette.
-Wait for VS Code's tab registry before validating newly opened populated
-reviews so desktop extension hosts do not report successful opens as
-failures. Recognize desktop multi-diff tab inputs by their URI data
-rather than JavaScript class identity, and tolerate VS Code reordering
-the files.
+Open reviews through VS Code's public changes editor command. Track the
+resulting tabs by their URI data rather than JavaScript class identity,
+and tolerate VS Code reordering the files. Refresh inactive reviews only
+after the user returns to them so daemon updates do not steal focus.
 Resolve preview attributes from each pod's stored Dev Container
 snapshot so the forwarded-port database schema stays unchanged.
 
@@ -47,7 +46,7 @@ Provide a loopback-only live code-server workspace backed by a small
 anyhow demo repository and lingering user services. Run demo pods as a
 non-root user because Claude rejects its permission bypass under root.
 Give the demo two Python-served preview pages whose declared HTTP ports
-open automatically as tabs in the review's editor group.
+open automatically as background tabs in the active editor group.
 Persist only allowlisted agent credentials for those services. Install
 no daemon service in the image: the first pipeline run installs its
 freshly built native daemon and cross-architecture pod payloads after

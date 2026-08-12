@@ -814,13 +814,13 @@ async function waitForForwardedPreviewTabs(page, previews, podName) {
     assert.equal(
         await page.locator(".editor-group-container:visible").count(),
         1,
-        "the forwarded previews split the review into another editor group",
+        "the forwarded previews split the active editor group",
     );
     assert(
         (await page
             .locator(".editor-group-container:visible .tabs-container .tab:visible")
             .count()) >= previews.length + 1,
-        "the forwarded previews did not open as review-group tabs",
+        "the forwarded previews did not open as tabs in the active group",
     );
     const reviewTab = page.locator(".tab:visible").filter({ hasText: `${podName} (` }).first();
     await reviewTab.waitFor({ state: "visible", timeout: 30_000 });
@@ -944,9 +944,6 @@ async function verifyReviewFocusAndCloseLifecycle(
     await assertOpenReviews(page, podName, [podName]);
     const reopenedReviewTab = page.locator(".tab:visible").filter({ hasText: podName }).first();
     await reopenedReviewTab.waitFor({ state: "visible", timeout: 30_000 });
-    const reopenedReviewTabHandle = await reopenedReviewTab.elementHandle();
-    assert(reopenedReviewTabHandle, "reopened review had no tab element handle");
-    return reopenedReviewTabHandle;
 }
 
 async function waitForEmptyReview(page, podName) {
@@ -994,32 +991,6 @@ async function assertOpenReviews(page, activePodName, openPodNames) {
             `expected one ${openPodName} review editor: ${JSON.stringify(labels)}`,
         );
     }
-}
-
-async function assertPodTabsAppended(page, previousPodName, appendedPodName) {
-    const labels = await page
-        .locator(".editor-group-container:visible .tabs-container .tab:visible")
-        .allTextContents();
-    const previousIndexes = labels
-        .map((label, index) => ({ index, label }))
-        .filter(({ label }) =>
-            label.startsWith(`${previousPodName} (`) ||
-            label.startsWith(`${previousPodName}: `),
-        )
-        .map(({ index }) => index);
-    const appendedIndexes = labels
-        .map((label, index) => ({ index, label }))
-        .filter(({ label }) =>
-            label.startsWith(`${appendedPodName} (`) ||
-            label.startsWith(`${appendedPodName}: `),
-        )
-        .map(({ index }) => index);
-    assert(previousIndexes.length > 0, `previous pod tabs were missing: ${JSON.stringify(labels)}`);
-    assert(appendedIndexes.length > 0, `appended pod tabs were missing: ${JSON.stringify(labels)}`);
-    assert(
-        Math.min(...appendedIndexes) > Math.max(...previousIndexes),
-        `new pod tabs split the previous pod's tab block: ${JSON.stringify(labels)}`,
-    );
 }
 
 async function assertNoNativeAgentEditor(page, podName) {
@@ -1190,7 +1161,7 @@ async function main() {
             "review kept the redundant file selector",
         );
         await capture(page, artifacts, "02-live-review.png");
-        const retainedReviewTab = await verifyReviewFocusAndCloseLifecycle(
+        await verifyReviewFocusAndCloseLifecycle(
             page,
             liveView,
             podName,
@@ -1451,6 +1422,20 @@ async function main() {
             2,
             "pod action menu did not group secondary and lifecycle actions",
         );
+        await selectPopoverOption(morePopover, "Open port in VS Code");
+        await selectQuickPick(page, "Browser fixture");
+        const explicitPreview = page
+            .locator(".tab.active:visible")
+            .filter({ hasText: `${podName}: Browser fixture` });
+        await explicitPreview.waitFor({ state: "visible", timeout: 30_000 });
+        assert.equal(
+            await explicitPreview.count(),
+            1,
+            "explicitly opening a forwarded preview did not focus its tab",
+        );
+
+        await moreActions.click();
+        await morePopover.waitFor({ state: "visible", timeout: 30_000 });
         const externalPagePromise = context.waitForEvent("page", { timeout: 30_000 });
         await selectPopoverOption(morePopover, "Open port in browser");
         await selectQuickPick(page, "Browser fixture");
@@ -1517,12 +1502,7 @@ async function main() {
             ],
             createdPodName,
         );
-        await assertPodTabsAppended(page, podName, createdPodName);
-        await assertOpenReviews(page, createdPodName, [podName, createdPodName]);
-        assert(
-            await retainedReviewTab.evaluate((element) => element.isConnected),
-            "creating another pod replaced the existing review tab",
-        );
+        await assertOpenReviews(page, createdPodName, [createdPodName]);
         assert(
             !(await page.title()).includes("-review.txt"),
             "creating a pod opened a synthetic review document",
@@ -1596,16 +1576,14 @@ async function main() {
             originalContent,
             refreshedPodContent,
         );
-        await assertPodTabsAppended(page, podName, createdPodName);
         const activeRestoredReview = page
             .locator(".tab.active:visible")
             .filter({ hasText: podName });
         assert(
             (await activeRestoredReview.count()) === 1,
-            "switching pods did not focus its existing review tab",
+            "switching pods did not focus its review tab",
         );
-        await assertOpenReviews(page, podName, [podName, createdPodName]);
-        await retainedReviewTab.dispose();
+        await assertOpenReviews(page, podName, [podName]);
         await assertSidebarAndDiffGeometry(page, switchedView.terminal, switchedDiff);
         assert.equal(
             await switchedView.body.getAttribute("data-rumpelpod-pod"),

@@ -29,15 +29,17 @@ interface PortPick extends vscode.QuickPickItem {
   readonly port: PortInfo;
 }
 
-export class RumpelpodController {
+export class RumpelpodController implements vscode.Disposable {
   private active: ActivePod | undefined;
   private agentLaunches = Promise.resolve();
+  private automaticPreviewAttemptGeneration: number | undefined;
   private automaticPreviewGeneration: number | undefined;
   private modeEntries = Promise.resolve();
   private podOperations = Promise.resolve();
   private reviewUpdates = Promise.resolve();
   private selectionGeneration = 0;
   private statusUpdates = Promise.resolve();
+  private readonly tabSubscription: vscode.Disposable;
 
   public constructor(
     private readonly model: RumpelpodModel,
@@ -45,7 +47,29 @@ export class RumpelpodController {
     private readonly reviewDocuments: ReviewDocuments,
     private readonly portPreviews: PortPreviews,
     private readonly status: vscode.StatusBarItem,
-  ) {}
+  ) {
+    this.tabSubscription = vscode.window.tabGroups.onDidChangeTabs((event) => {
+      const selected = this.active;
+      if (selected === undefined) {
+        return;
+      }
+      const reviewTab = this.reviewDocuments.activeReviewTab(
+        selected.repository,
+        selected.pod,
+      );
+      if (
+        reviewTab === undefined ||
+        ![...event.opened, ...event.changed].some((tab) => tab === reviewTab)
+      ) {
+        return;
+      }
+      void this.tryAutomaticPortPreview(selected);
+    });
+  }
+
+  public dispose(): void {
+    this.tabSubscription.dispose();
+  }
 
   public async showPodSwitcher(request?: number): Promise<void> {
     const menuRequest = await this.terminals.beginMenu("pod", request);
@@ -445,23 +469,99 @@ export class RumpelpodController {
   private async tryAutomaticPortPreview(selected: ActivePod): Promise<void> {
     if (
       selected.info?.status !== "Running" ||
+      this.automaticPreviewAttemptGeneration === selected.generation ||
       this.automaticPreviewGeneration === selected.generation ||
       this.currentSelection(selected) === undefined
     ) {
       return;
     }
+    this.automaticPreviewAttemptGeneration = selected.generation;
     try {
+      await this.reviewUpdates;
+      if (this.currentSelection(selected) === undefined) {
+        return;
+      }
       const ports = await this.model.listPorts(selected.repository, selected.pod);
       if (this.currentSelection(selected) === undefined) {
         return;
       }
       const previews = ports.filter((port) => port.on_auto_forward === "openPreview");
-      let opened = false;
+      const resolvedPreviews: { readonly port: PortInfo; readonly uri: vscode.Uri }[] = [];
       for (const preview of previews) {
-        opened = await this.openPortPreview(selected, preview, true) || opened;
+        const uri = await vscode.env.asExternalUri(localPortUri(preview));
+        if (this.currentSelection(selected) === undefined) {
+          return;
+        }
+        resolvedPreviews.push({ port: preview, uri });
       }
-      if (opened && this.currentSelection(selected) !== undefined) {
-        await this.reviewDocuments.focus(selected.repository, selected.pod);
+      const reviewTab = this.reviewDocuments.activeReviewTab(
+        selected.repository,
+        selected.pod,
+      );
+      if (reviewTab === undefined) {
+        // Do not risk replacing an editor the user chose while the pod started.
+        return;
+      }
+      const previousTabs = new Set(
+        vscode.window.tabGroups.all.flatMap((group) => group.tabs),
+      );
+      const previewTitles = new Set(
+        resolvedPreviews.map(({ port }) => `${selected.pod}: ${portDisplayName(port)}`),
+      );
+      let unrelatedEditorActivated = false;
+      const focusSubscription = vscode.window.tabGroups.onDidChangeTabs((event) => {
+        if (
+          event.closed.some((tab) =>
+            this.reviewDocuments.isReviewTab(selected.repository, selected.pod, tab)
+          )
+        ) {
+          unrelatedEditorActivated = true;
+        }
+        const active = [...event.opened, ...event.changed].find((tab) => tab.isActive);
+        if (
+          active !== undefined &&
+          active !== reviewTab &&
+          active.label !== reviewTab?.label &&
+          !previewTitles.has(active.label)
+        ) {
+          unrelatedEditorActivated = true;
+        }
+      });
+      const opened: vscode.WebviewPanel[] = [];
+      try {
+        for (const { port, uri } of resolvedPreviews) {
+          const panel = this.portPreviews.open(
+            selected.repository.root,
+            selected.pod,
+            portTarget(port),
+            `${selected.pod}: ${portDisplayName(port)}`,
+            uri,
+            true,
+          );
+          if (panel !== undefined) {
+            opened.push(panel);
+          }
+        }
+        await settleOpenedPreviewTabs(opened, previousTabs);
+        if (
+          opened.some((panel) => panel.active) &&
+          !unrelatedEditorActivated &&
+          this.currentSelection(selected) !== undefined
+        ) {
+          // Web extension hosts can ignore preserveFocus while creating a panel.
+          // Restore only the still-open review that creation displaced.
+          await this.reviewDocuments.restoreFocus(
+            selected.repository,
+            selected.pod,
+            reviewTab,
+            () =>
+              opened.some((panel) => panel.active) &&
+              !unrelatedEditorActivated &&
+              this.currentSelection(selected) !== undefined,
+          );
+        }
+      } finally {
+        focusSubscription.dispose();
       }
       this.automaticPreviewGeneration = selected.generation;
     } catch (error) {
@@ -470,6 +570,10 @@ export class RumpelpodController {
       void vscode.window.showWarningMessage(
         `The ${selected.pod} pod is open, but its port preview is not available: ${message}`,
       );
+    } finally {
+      if (this.automaticPreviewAttemptGeneration === selected.generation) {
+        this.automaticPreviewAttemptGeneration = undefined;
+      }
     }
   }
 
@@ -477,20 +581,18 @@ export class RumpelpodController {
     selected: ActivePod,
     port: PortInfo,
     preserveFocus: boolean,
-  ): Promise<boolean> {
+  ): Promise<void> {
     const resolved = await vscode.env.asExternalUri(localPortUri(port));
     if (this.currentSelection(selected) === undefined) {
-      return false;
+      return;
     }
-    return this.portPreviews.open(
+    this.portPreviews.open(
       selected.repository.root,
       selected.pod,
       portTarget(port),
       `${selected.pod}: ${portDisplayName(port)}`,
       resolved,
       preserveFocus,
-      this.reviewDocuments.viewColumn(selected.repository, selected.pod) ??
-        vscode.ViewColumn.Active,
     );
   }
 
@@ -900,4 +1002,50 @@ function portTarget(port: PortInfo): string {
   return port.service.length === 0
     ? String(port.container_port)
     : `${port.service}:${port.container_port}`;
+}
+
+async function settleOpenedPreviewTabs(
+  panels: readonly vscode.WebviewPanel[],
+  previousTabs: ReadonlySet<vscode.Tab>,
+): Promise<void> {
+  if (panels.length === 0) {
+    return;
+  }
+  const published = (): boolean => {
+    const remaining = panels.map((panel) => panel.title);
+    for (const tab of vscode.window.tabGroups.all.flatMap((group) => group.tabs)) {
+      if (previousTabs.has(tab)) {
+        continue;
+      }
+      const index = remaining.indexOf(tab.label);
+      if (index >= 0) {
+        remaining.splice(index, 1);
+      }
+    }
+    return remaining.length === 0;
+  };
+
+  await new Promise<void>((resolve) => {
+    let settle: NodeJS.Timeout | undefined;
+    const finish = (): void => {
+      clearTimeout(timeout);
+      if (settle !== undefined) {
+        clearTimeout(settle);
+      }
+      subscription.dispose();
+      resolve();
+    };
+    const check = (): void => {
+      if (!published()) {
+        return;
+      }
+      if (settle !== undefined) {
+        clearTimeout(settle);
+      }
+      settle = setTimeout(finish, 250);
+    };
+    const timeout = setTimeout(finish, 2_000);
+    const subscription = vscode.window.tabGroups.onDidChangeTabs(check);
+    check();
+  });
 }

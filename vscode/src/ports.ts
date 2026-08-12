@@ -3,8 +3,6 @@
 
 import * as vscode from "vscode";
 
-import { moveActiveTabToEnd } from "./tabs";
-
 interface PortPreview {
   readonly panel: vscode.WebviewPanel;
   readonly podKey: string;
@@ -13,31 +11,30 @@ interface PortPreview {
 export class PortPreviews implements vscode.Disposable {
   private readonly previews = new Map<string, PortPreview>();
 
-  public async open(
+  public open(
     repositoryRoot: string,
     pod: string,
     portKey: string,
     title: string,
     uri: vscode.Uri,
     preserveFocus: boolean,
-    viewColumn: vscode.ViewColumn,
-  ): Promise<boolean> {
+  ): vscode.WebviewPanel | undefined {
     const key = JSON.stringify([repositoryRoot, pod, portKey]);
     const existing = this.previews.get(key);
     if (existing !== undefined) {
       if (preserveFocus) {
-        return false;
+        return undefined;
       }
       existing.panel.title = title;
       existing.panel.webview.html = previewHtml(title, uri);
       existing.panel.reveal(undefined, preserveFocus);
-      return false;
+      return undefined;
     }
 
     const panel = vscode.window.createWebviewPanel(
       "rumpelpod.portPreview",
       title,
-      { preserveFocus: false, viewColumn },
+      { preserveFocus, viewColumn: vscode.ViewColumn.Active },
       {
         enableForms: true,
         enableScripts: true,
@@ -48,31 +45,7 @@ export class PortPreviews implements vscode.Disposable {
     this.previews.set(key, { panel, podKey });
     panel.onDidDispose(() => this.previews.delete(key));
     panel.webview.html = previewHtml(title, uri);
-    if (!panel.active) {
-      await new Promise<void>((resolve, reject) => {
-        const viewSubscription = panel.onDidChangeViewState(() => {
-          if (panel.active) {
-            viewSubscription.dispose();
-            disposeSubscription.dispose();
-            resolve();
-          }
-        });
-        const disposeSubscription = panel.onDidDispose(() => {
-          viewSubscription.dispose();
-          disposeSubscription.dispose();
-          reject(new Error(`port preview '${title}' closed before it became active`));
-        });
-        if (panel.active) {
-          viewSubscription.dispose();
-          disposeSubscription.dispose();
-          resolve();
-        }
-      });
-    }
-    // panel.active establishes the tab's identity here. Remote extension hosts
-    // may expose its Tab.input as unknown instead of TabInputWebview.
-    await moveActiveTabToEnd((tab) => tab.label === panel.title);
-    return true;
+    return panel;
   }
 
   public close(repositoryRoot: string, pod: string): void {

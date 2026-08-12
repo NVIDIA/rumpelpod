@@ -19,40 +19,39 @@ A single session uses the whole sidebar; named agent and shell tabs appear only
 while two or more sessions are open. Launching Claude while Codex is open keeps
 both independent PTYs alive instead of replacing one with the other. Selecting
 a pod restores its launched agents and focuses every changed file on the right
-in one vertically stacked review. The review remains an ordinary unpinned,
-closable VS Code editor. Selecting the pod again or choosing `View diff`
-from the actions menu focuses the existing review, or reopens it if it was
-closed. Background daemon events refresh the active review without stealing
-focus from another editor or resurrecting a closed one. Switching pods focuses
-that pod's existing review, or opens one if needed, while leaving other pod
-reviews open. Review editors are ordinary non-preview tabs, so they remain
-closable without being replaced when another pod opens. The extension does not
-change VS Code's editor-tab settings, so ordinary files retain the user's
-normal tab behavior. Pods without changed files still open a native empty
-review surface instead of leaving the previous editor visible. VS Code restores
-ordinary review editors across browser reloads; the extension restores the last
-active pod and its launched agent set, then reopens that pod's current review.
+in one vertically stacked review. The review remains an ordinary closable VS
+Code editor. Selecting the pod again or choosing `View diff` from the actions
+menu focuses the current review, reopening it through VS Code's public changes
+editor command when necessary. Background daemon events refresh the active
+review without stealing focus from another editor or resurrecting a closed one.
+Switching pods focuses that pod's review, or opens one if needed. The extension
+does not pin, unpin, retain, or reposition review tabs, and does not change VS
+Code's editor-tab settings. Tab placement and preview replacement therefore
+follow the user's editor preferences, including
+`workbench.editor.openPositioning`. Pods without changed files still open a
+native empty review surface instead of leaving the previous editor visible. VS
+Code restores ordinary review editors across browser reloads; the extension
+restores the last active pod and its launched agent set, then reopens that pod's
+current review.
 
 Forwarded ports are available from the pod actions menu and the Command
-Palette. `Open port in VS Code...` uses a restricted webview tab in the same
-editor group as the pod review and prefixes the tab with the pod name. New
-review and preview tabs are appended at the end of that editor group so opening
-another pod does not split an existing pod's tabs. Review refreshes retain their
-existing tab position. The nested page has an opaque origin and cannot navigate
-the VS Code tab, open
-popups, download files, or access VS Code and workspace
-resources. Sites that need cookies, browser storage, or those blocked features
-can instead use `Open port in browser...`, which is always an explicit action.
+Palette. `Open port in VS Code...` uses a restricted webview tab in the active
+editor group and prefixes the tab with the pod name. VS Code and the user's
+editor settings decide the tab position. The nested page has an opaque origin
+and cannot navigate the VS Code tab, open popups, download files, or access VS
+Code and workspace resources. Sites that need cookies, browser storage, or
+those blocked features can instead use `Open port in browser...`, which is
+always an explicit action.
 A Dev Container port marked with
-`"onAutoForward": "openPreview"` opens automatically in the review's editor
+`"onAutoForward": "openPreview"` opens automatically in the active editor
 group without taking focus; `"protocol": "https"` selects HTTPS, otherwise
 HTTP is used.
 The `openBrowser` and `openBrowserOnce` actions do not launch an external
 browser automatically. Each forwarded port gets its own preview tab.
 
 Merging, stopping, or deleting the selected pod clears the sidebar selection,
-detaches its sessions, forgets it as the last active pod, and closes its review
-wherever that tab is open.
+detaches its sessions, forgets it as the last active pod, and closes the review
+tracked by the extension.
 
 Pod lists, review plans, and live invalidations come directly from the local
 rumpelpod daemon over its Unix socket. The configured `rumpel` executable is
