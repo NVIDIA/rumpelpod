@@ -109,3 +109,81 @@ fn devcontainer_defers_daemon_install_to_pipeline() {
         "CI did not report a failed devcontainer boot"
     );
 }
+
+#[test]
+fn devcontainer_keeps_pinned_codex_out_of_the_interactive_path() {
+    let root = workspace_root();
+    let dockerfile =
+        fs::read_to_string(root.join(".devcontainer/Dockerfile")).expect("read Dockerfile");
+    assert!(
+        dockerfile.contains("ARG CODEX_VERSION=0.147.0")
+            && dockerfile
+                .contains("ENV RUMPELPOD_TEST_CODEX_BIN_DIR=/opt/rumpelpod-test-codex/bin")
+            && !dockerfile.contains("/usr/local/bin/codex"),
+        "the development image did not isolate its pinned Codex test package"
+    );
+
+    let pipeline =
+        fs::read_to_string(root.join("tools/src/bin/pipeline.rs")).expect("read Cargo pipeline");
+    assert!(
+        pipeline.contains("const TEST_CODEX_BIN_DIR_ENV: &str = \"RUMPELPOD_TEST_CODEX_BIN_DIR\"")
+            && pipeline.contains("use_pinned_test_codex(&mut xtest_cmd)?"),
+        "the test pipeline did not select the isolated Codex package"
+    );
+}
+
+#[test]
+fn xtest_timeouts_file_is_the_only_non_default_timeout_source() {
+    let root = workspace_root();
+    let path = root.join("tools/xtest-timeouts.json5");
+    let contents = fs::read_to_string(&path).expect("read xtest timeouts file");
+    let parsed: serde_json::Map<String, serde_json::Value> =
+        json5::from_str(&contents).expect("parse xtest timeouts file");
+    assert!(!parsed.is_empty(), "xtest timeouts file is empty");
+    for (name, value) in &parsed {
+        let Some(multiplier) = value.as_u64() else {
+            panic!("{name} is not an integer multiplier");
+        };
+        assert!(
+            multiplier >= 2,
+            "{name} multiplier {multiplier} must be omitted if it is the default"
+        );
+    }
+
+    for dir in ["rumpelpod/tests", "tools/src/bin"] {
+        for entry in rust_files_under(root.join(dir)) {
+            let path = entry.display();
+            let text =
+                fs::read_to_string(&entry).unwrap_or_else(|error| panic!("read {path}: {error}"));
+            assert!(
+                !text.contains("println!(\"xtest:timeout="),
+                "{path} still prints an xtest timeout"
+            );
+        }
+    }
+}
+
+#[test]
+fn xtest_reports_an_immediate_skip() {
+    println!("xtest:skip");
+}
+
+fn rust_files_under(dir: PathBuf) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(dir) = stack.pop() {
+        let dir_display = dir.display();
+        for entry in
+            fs::read_dir(&dir).unwrap_or_else(|error| panic!("read {dir_display}: {error}"))
+        {
+            let entry = entry.unwrap_or_else(|error| panic!("dir entry: {error}"));
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files
+}

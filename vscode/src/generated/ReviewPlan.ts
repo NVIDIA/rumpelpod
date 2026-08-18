@@ -2,6 +2,6 @@
 import type { ReviewFile } from "./ReviewFile";
 
 /**
- * Revisions and files required to reproduce `rumpel review` in an editor.
+ * Revisions and files required to reproduce a pod review in an editor.
  */
 export type ReviewPlan = { base: string, target: string, files: Array<ReviewFile>, };

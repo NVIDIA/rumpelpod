@@ -251,10 +251,14 @@ fn small_blob_ids(repo_path: &Path, object_ids: &[String]) -> Result<Vec<String>
         return Ok(Vec::new());
     }
 
+    // cat-file --batch-check interpolates %(atom) only. Unlike
+    // for-each-ref, it copies pretty-format hex escapes such as %09
+    // through as literal text, so a tab-separated format never
+    // actually contains tabs. Object name/type/size are space-safe.
     let mut child = Command::new("git")
         .args([
             "cat-file",
-            "--batch-check=%(objectname)%09%(objecttype)%09%(objectsize)",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
         ])
         .current_dir(repo_path)
         .stdin(Stdio::piped())
@@ -286,7 +290,7 @@ fn small_blob_ids(repo_path: &Path, object_ids: &[String]) -> Result<Vec<String>
     let listing = String::from_utf8(output.stdout).context("cat-file output was not UTF-8")?;
     let mut blob_ids = Vec::new();
     for line in listing.lines() {
-        let mut parts = line.split('\t');
+        let mut parts = line.split(' ');
         let Some(object_id) = parts.next() else {
             return Err(anyhow::anyhow!(
                 "git cat-file returned malformed line: {line}"

@@ -468,12 +468,16 @@ fn build_remote_docker_image() -> Result<String> {
         # "administratively prohibited".  AllowTcpForwarding stays at
         # its default (yes) because devcontainer `forwardPorts` uses
         # `direct-tcpip`, which Teleport also allows.
+        # MaxSessions is raised because one ControlMaster carries every
+        # pod route (dial-stdio, git tunnel, exec proxy).
         RUN mkdir -p /run/sshd \
             && ssh-keygen -A \
             && sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config \
             && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
             && sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
-            && echo 'AllowStreamLocalForwarding no' >> /etc/ssh/sshd_config
+            && echo 'AllowStreamLocalForwarding no' >> /etc/ssh/sshd_config \
+            && echo 'MaxSessions 50' >> /etc/ssh/sshd_config \
+            && echo 'MaxStartups 50:30:100' >> /etc/ssh/sshd_config
 
         # Startup script that runs both SSH and Docker.
         # After a container restart, stale PID and socket files from the previous
@@ -574,6 +578,8 @@ fn build_remote_podman_image() -> Result<String> {
             && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
             && sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
             && echo 'AllowStreamLocalForwarding no' >> /etc/ssh/sshd_config \
+            && echo 'MaxSessions 50' >> /etc/ssh/sshd_config \
+            && echo 'MaxStartups 50:30:100' >> /etc/ssh/sshd_config \
             && echo 'SetEnv CONTAINER_HOST=unix:///run/podman/podman.sock' >> /etc/ssh/sshd_config
 
         # Startup script that runs both the Podman API service and SSH.
@@ -738,6 +744,8 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+mod reconnect;
+
 // Tests
 // Note: These tests require privileged Docker containers, which may not be
 // available in all CI environments.
@@ -823,7 +831,6 @@ fn ssh_smoke_test() {
 
 #[test]
 fn ssh_uses_user_config_for_omitted_port() {
-    println!("xtest:timeout=185");
     if !matches!(
         crate::executor::executor_mode(),
         crate::executor::ExecutorMode::Docker | crate::executor::ExecutorMode::Ssh
@@ -861,7 +868,6 @@ fn ssh_uses_user_config_for_omitted_port() {
 /// through Colima's VM networking layer.
 #[test]
 fn ssh_reconnect_test() {
-    println!("xtest:timeout=300");
     if cfg!(target_os = "macos") {
         crate::executor::skip_test();
         return;
@@ -1029,9 +1035,86 @@ fn ssh_reconnect_test() {
     assert_eq!(stdout.trim(), "hello again");
 }
 
+/// All pod routes sharing an SSH host must recover after the host disconnects.
+/// A single pod does not reproduce the stalled route seen after laptop resume.
+#[test]
+fn multiple_pods_reconnect_after_ssh_transport_stall() {
+    if cfg!(target_os = "macos") {
+        crate::executor::skip_test();
+        return;
+    }
+    if !matches!(
+        crate::executor::executor_mode(),
+        crate::executor::ExecutorMode::Docker | crate::executor::ExecutorMode::Ssh
+    ) {
+        crate::executor::skip_test();
+        return;
+    }
+
+    let home = TestHome::new();
+    let remote = SshRemoteHost::start();
+    write_ssh_config(&home, &[&remote]);
+    let ssh_config = home.path().join(".ssh/config");
+    let mut ssh_config_content = std::fs::read_to_string(&ssh_config).unwrap();
+    let control_path = home.path().join("ssh-control-%C");
+    ssh_config_content.push_str(&formatdoc! {r#"
+        Host *
+            ControlMaster auto
+            ControlPath {control_path}
+            ControlPersist 10m
+            ServerAliveInterval 1
+            ServerAliveCountMax 2
+            TCPKeepAlive yes
+
+    "#, control_path = control_path.display()});
+    std::fs::write(&ssh_config, ssh_config_content).unwrap();
+    let daemon = TestDaemon::start(&home);
+
+    let repo = TestRepo::new();
+    write_test_devcontainer(&repo, "", "");
+    let config = serde_json::to_string(&serde_json::json!({"host": remote.ssh_spec()})).unwrap();
+    std::fs::write(repo.path().join(".rumpelpod.json"), config).unwrap();
+
+    let pod_names = ["shared-a", "shared-b", "shared-c", "shared-d", "foo-bar"];
+    for pod_name in pod_names {
+        pod_command(&repo, &daemon)
+            .args(["enter", "--create", pod_name, "--", "true"])
+            .success()
+            .unwrap_or_else(|e| panic!("creating pod {pod_name} failed: {e:#}"));
+    }
+
+    reconnect::wait_for_mux(
+        &home,
+        &remote,
+        reconnect::MuxState::Alive,
+        "mux after setup",
+    );
+    Command::new("docker")
+        .args(["pause", &remote.container_id])
+        .success()
+        .expect("pausing the SSH host failed");
+    reconnect::wait_for_mux(
+        &home,
+        &remote,
+        reconnect::MuxState::Dead,
+        "mux while paused",
+    );
+
+    Command::new("docker")
+        .args(["unpause", &remote.container_id])
+        .success()
+        .expect("resuming the SSH host failed");
+    remote.wait_for_ssh_connectivity(&ssh_config);
+
+    let stdout = pod_command(&repo, &daemon)
+        .args(["enter", "foo-bar", "--", "echo", "reconnected"])
+        .success()
+        .expect("entering a pod after SSH resumed failed");
+    assert_eq!(String::from_utf8_lossy(&stdout).trim(), "reconnected");
+}
+
 #[test]
 fn ssh_unavailable_reentry_preserves_pod_record() {
-    println!("xtest:timeout=215");
     if !matches!(
         crate::executor::executor_mode(),
         crate::executor::ExecutorMode::Docker

@@ -3,7 +3,7 @@
 
 [package]
 name = "rumpelpod"
-version = "0.4.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -29,6 +29,7 @@ sha2 = ">= 0"
 hex = ">= 0"
 serde = { version = ">= 0", features = ["derive"] }
 serde_json = { version = ">= 0", features = ["preserve_order"] }
+semver = ">= 0"
 json5 = ">= 0"
 notify = ">= 0"
 tokio = { version = ">= 0", features = ["full"] }

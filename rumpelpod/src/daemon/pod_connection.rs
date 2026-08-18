@@ -6,7 +6,8 @@
 //! A `PodConnection` owns the host-side resources that make a running
 //! pod reachable from the daemon: the pod-server exec proxy, the git
 //! tunnel, user-facing forwarded ports, the optional ssh-agent, and
-//! the codex proxy.  It also owns the pod event stream reconnect loop.
+//! the codex proxy.  It does not hold a `HostConnection`; loops that
+//! need both live on `Connections`.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -18,12 +19,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use log::debug;
-use tokio::sync::{broadcast, watch};
+use log::info;
+use tokio::sync::broadcast;
 
-use crate::async_runtime::RUNTIME;
 use crate::config::Host;
-use crate::daemon::host_connection::{HostConnection, HostConnectionRegistry, HostKey, HostStatus};
+use crate::daemon::host_connection::HostKey;
 use crate::daemon::protocol::DaemonEvent;
 use crate::daemon::reconnect::ReconnectEvent;
 use crate::daemon::{ssh_agent_dir, CodexProxyEndpoint, CodexProxyHandle, SshAgentHandle};
@@ -35,7 +35,7 @@ const POD_REPAIR_MAX_DELAY: Duration = Duration::from_secs(30);
 const POD_REPAIR_FAILURE_LIMIT: usize = 10;
 
 pub(super) struct PodRepairBackoff {
-    failures: usize,
+    pub(super) failures: usize,
     delay: Duration,
 }
 
@@ -129,7 +129,7 @@ impl PodConnectionKey {
     }
 }
 
-fn replace_and_emit<T>(
+pub(super) fn replace_and_emit<T>(
     value: &Mutex<T>,
     replacement: T,
     events_tx: &broadcast::Sender<DaemonEvent>,
@@ -195,14 +195,13 @@ impl PodConnectionResources {
 
 struct EventLoopHandle {
     stop: Arc<AtomicBool>,
-    _thread: JoinHandle<()>,
+    _thread: Option<JoinHandle<()>>,
 }
 
 pub struct PodConnection {
     key: PodConnectionKey,
     host: Mutex<Host>,
     host_key: Mutex<HostKey>,
-    host_conn: Mutex<Arc<HostConnection>>,
     token: Mutex<String>,
     status: Arc<Mutex<PodConnectionStatus>>,
     tx: broadcast::Sender<ReconnectEvent>,
@@ -213,33 +212,25 @@ pub struct PodConnection {
     git_tunnel_repair_scheduled: AtomicBool,
     repair_state: Arc<PodRepairState>,
     event_loop: Mutex<Option<EventLoopHandle>>,
-    host_connections: Arc<HostConnectionRegistry>,
     events_tx: broadcast::Sender<DaemonEvent>,
 }
 
 impl PodConnection {
     fn new(
-        host_connections: Arc<HostConnectionRegistry>,
         events_tx: broadcast::Sender<DaemonEvent>,
         key: PodConnectionKey,
         host: Host,
         token: String,
-    ) -> Result<Self> {
-        let host_conn = host_connections.get_or_create(&host)?;
+        status: PodConnectionStatus,
+    ) -> Self {
         let host_key = HostKey::from_host(&host);
-        let initial_status = if host_conn.status() == HostStatus::Connected {
-            PodConnectionStatus::PodDisconnected
-        } else {
-            PodConnectionStatus::HostDisconnected
-        };
         let (tx, _) = broadcast::channel(64);
-        Ok(Self {
+        Self {
             key,
             host: Mutex::new(host),
             host_key: Mutex::new(host_key),
-            host_conn: Mutex::new(host_conn),
             token: Mutex::new(token),
-            status: Arc::new(Mutex::new(initial_status)),
+            status: Arc::new(Mutex::new(status)),
             tx,
             claude_state: Arc::new(Mutex::new(None)),
             codex_state: Arc::new(Mutex::new(None)),
@@ -248,27 +239,23 @@ impl PodConnection {
             git_tunnel_repair_scheduled: AtomicBool::new(false),
             repair_state: Arc::new(PodRepairState::default()),
             event_loop: Mutex::new(None),
-            host_connections,
             events_tx,
-        })
+        }
     }
 
     pub fn key(&self) -> &PodConnectionKey {
         &self.key
     }
 
-    pub fn update_host_and_token(&self, host: Host, token: String) -> Result<()> {
+    pub fn update_host_and_token(&self, host: Host, token: String) {
         let host_key = HostKey::from_host(&host);
         let should_update = *self.host_key.lock().unwrap() != host_key;
         if should_update {
-            let host_conn = self.host_connections.get_or_create(&host)?;
             *self.host.lock().unwrap() = host;
             *self.host_key.lock().unwrap() = host_key;
-            *self.host_conn.lock().unwrap() = host_conn;
             self.stop_event_loop();
         }
         *self.token.lock().unwrap() = token;
-        Ok(())
     }
 
     pub fn status(&self) -> PodConnectionStatus {
@@ -342,7 +329,7 @@ impl PodConnection {
         token: String,
         handle: crate::exec_proxy::ExecProxyHandle,
     ) -> Result<PodEndpoint> {
-        self.update_host_and_token(host, token)?;
+        self.update_host_and_token(host, token);
         if self.resources.lock().unwrap().pod_server.is_some() {
             self.stop_event_loop();
         }
@@ -354,57 +341,25 @@ impl PodConnection {
         })
     }
 
-    pub fn ensure_event_loop(&self) {
-        if self.endpoint().is_none() {
-            return;
-        }
+    /// Reserve the event-loop slot. Returns the stop flag for the
+    /// thread `Connections` will spawn.
+    pub(super) fn begin_event_loop(&self) -> Option<Arc<AtomicBool>> {
         let mut event_loop = self.event_loop.lock().unwrap();
         if event_loop.is_some() {
-            return;
+            return None;
         }
-
-        let endpoint = self.endpoint().expect("endpoint checked above");
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = stop.clone();
-        let host_conn = self.host_conn.lock().unwrap().clone();
-        let tx = self.tx.clone();
-        let status = self.status.clone();
-        let claude_state = self.claude_state.clone();
-        let codex_state = self.codex_state.clone();
-        let key = self.key.clone();
-        let events_tx = self.events_tx.clone();
-        let pod_name = key.pod_name.clone();
-        let repair_state = self.repair_state.clone();
-
-        replace_and_emit(
-            &self.status,
-            PodConnectionStatus::Connecting,
-            &self.events_tx,
-            &self.key,
-        );
-        let thread = std::thread::Builder::new()
-            .name(format!("pod-connection-{pod_name}"))
-            .spawn(move || {
-                pod_event_loop(PodEventLoop {
-                    pod_name,
-                    host_conn,
-                    container_url: endpoint.url,
-                    token: endpoint.token,
-                    stop: thread_stop,
-                    tx,
-                    status,
-                    claude_state,
-                    codex_state,
-                    events_tx,
-                    key,
-                    repair_state,
-                });
-            })
-            .expect("failed to spawn pod connection event loop");
         *event_loop = Some(EventLoopHandle {
-            stop,
-            _thread: thread,
+            stop: stop.clone(),
+            _thread: None,
         });
+        Some(stop)
+    }
+
+    pub(super) fn finish_event_loop(&self, thread: JoinHandle<()>) {
+        if let Some(handle) = self.event_loop.lock().unwrap().as_mut() {
+            handle._thread = Some(thread);
+        }
     }
 
     pub fn git_tunnel_is_alive(&self) -> bool {
@@ -516,9 +471,15 @@ impl PodConnection {
         self.repair_state.wait_for_change(epoch, delay)
     }
 
-    pub fn install_repaired_git_tunnel(&self, handle: crate::tunnel::TunnelHandle) {
+    pub fn install_repaired_git_tunnel(
+        &self,
+        handle: crate::tunnel::TunnelHandle,
+        repair_epoch: u64,
+    ) {
         let mut resources = self.resources.lock().unwrap();
-        if resources.supervise_git_tunnel {
+        // Host transitions cannot wait for a stalled repair. Reject its late
+        // result instead so it cannot overwrite the transition's cleanup.
+        if resources.supervise_git_tunnel && self.repair_state.epoch() == repair_epoch {
             resources.git_tunnel = Some(handle);
             resources.validate_pod_before_git_tunnel_repair = false;
         }
@@ -528,58 +489,29 @@ impl PodConnection {
         self.host.lock().unwrap().clone()
     }
 
-    pub fn host_is_connected(&self) -> bool {
-        self.host_conn.lock().unwrap().status() == HostStatus::Connected
+    pub(super) fn set_status(&self, status: PodConnectionStatus) {
+        replace_and_emit(&self.status, status, &self.events_tx, &self.key);
     }
 
-    /// A failed pod probe invalidates the server route without proving that
-    /// independent resources such as git tunnels and port forwards are dead.
-    pub fn prepare_pod_server_repair(&self) {
-        self.remove_pod_server();
-        self.repair_state.resume();
-        let status = if self.host_is_connected() {
-            PodConnectionStatus::PodDisconnected
-        } else {
-            PodConnectionStatus::HostDisconnected
-        };
-        replace_and_emit(&self.status, status, &self.events_tx, &self.key);
-        let _ = self.tx.send(ReconnectEvent::Attempting);
-    }
-
-    /// A host reset must release the old monitor from each pod while preserving
-    /// endpoint listeners that can reconnect through the replacement.
-    pub fn replace_host_connection(&self, host_conn: Arc<HostConnection>) {
-        let _setup = self.git_tunnel_setup.lock().unwrap();
-        self.stop_event_loop();
-        self.repair_state.resume();
-        let connected = host_conn.status() == HostStatus::Connected;
-        *self.host_conn.lock().unwrap() = host_conn;
-
-        if self.status() == PodConnectionStatus::Stopped {
-            return;
-        }
-
-        let mut resources = self.resources.lock().unwrap();
-        if resources.supervise_git_tunnel {
-            resources.git_tunnel = None;
-            resources.validate_pod_before_git_tunnel_repair = true;
-        }
-        drop(resources);
-
-        let (status, event) = if connected {
-            (
-                PodConnectionStatus::Connecting,
-                ReconnectEvent::HostConnected,
-            )
-        } else {
-            (
-                PodConnectionStatus::HostDisconnected,
-                ReconnectEvent::Attempting,
-            )
-        };
-        replace_and_emit(&self.status, status, &self.events_tx, &self.key);
+    pub(super) fn emit_reconnect(&self, event: ReconnectEvent) {
         let _ = self.tx.send(event);
-        self.ensure_event_loop();
+    }
+
+    pub(super) fn apply_greeting(&self, greeting: GreetingState) {
+        self.set_claude_state(greeting.claude);
+        self.set_codex_state(greeting.codex);
+    }
+
+    pub(super) fn set_claude_state(&self, state: Option<ClaudeState>) {
+        replace_and_emit(&self.claude_state, state, &self.events_tx, &self.key);
+    }
+
+    pub(super) fn set_codex_state(&self, state: Option<CodexState>) {
+        replace_and_emit(&self.codex_state, state, &self.events_tx, &self.key);
+    }
+
+    pub(super) fn resume_repair(&self) {
+        self.repair_state.resume();
     }
 
     pub fn has_forwarded_ports(&self) -> bool {
@@ -744,46 +676,40 @@ impl PodConnection {
             return;
         }
         self.repair_state.resume();
-        replace_and_emit(
-            &self.status,
-            PodConnectionStatus::Connecting,
-            &self.events_tx,
-            &self.key,
+        info!(
+            "pod connection for '{}' is reconnecting after host recovery",
+            self.key.pod_name
         );
-        let _ = self.tx.send(ReconnectEvent::HostConnected);
+        self.set_status(PodConnectionStatus::Connecting);
+        self.emit_reconnect(ReconnectEvent::HostConnected);
     }
 
     pub fn notify_host_disconnected(&self) {
         if self.status() == PodConnectionStatus::Stopped {
             return;
         }
-        let _setup = self.git_tunnel_setup.lock().unwrap();
+        // A repair may be queued behind another pod's SSH probe. The host
+        // transition must invalidate every pod without waiting for that work.
         self.repair_state.signal();
-        replace_and_emit(
-            &self.status,
-            PodConnectionStatus::HostDisconnected,
-            &self.events_tx,
-            &self.key,
+        info!(
+            "pod connection for '{}' lost its host; resetting active transports",
+            self.key.pod_name
         );
+        self.set_status(PodConnectionStatus::HostDisconnected);
         let mut resources = self.resources.lock().unwrap();
         if resources.supervise_git_tunnel {
             resources.git_tunnel = None;
             resources.validate_pod_before_git_tunnel_repair = true;
         }
         drop(resources);
-        let _ = self.tx.send(ReconnectEvent::Attempting);
+        self.emit_reconnect(ReconnectEvent::Attempting);
     }
 
     pub fn stop_events(&self) {
         self.stop_event_loop();
-        replace_and_emit(
-            &self.status,
-            PodConnectionStatus::Stopped,
-            &self.events_tx,
-            &self.key,
-        );
+        self.set_status(PodConnectionStatus::Stopped);
         self.disable_git_tunnel_supervision();
-        let _ = self.tx.send(ReconnectEvent::Stopped);
+        self.emit_reconnect(ReconnectEvent::Stopped);
     }
 
     pub fn drop_all(&self) {
@@ -807,18 +733,13 @@ impl PodConnection {
 }
 
 pub struct PodConnectionRegistry {
-    host_connections: Arc<HostConnectionRegistry>,
     pods: Mutex<HashMap<PodConnectionKey, Arc<PodConnection>>>,
     events_tx: broadcast::Sender<DaemonEvent>,
 }
 
 impl PodConnectionRegistry {
-    pub fn new(
-        host_connections: Arc<HostConnectionRegistry>,
-        events_tx: broadcast::Sender<DaemonEvent>,
-    ) -> Self {
+    pub fn new(events_tx: broadcast::Sender<DaemonEvent>) -> Self {
         Self {
-            host_connections,
             pods: Mutex::new(HashMap::new()),
             events_tx,
         }
@@ -830,22 +751,27 @@ impl PodConnectionRegistry {
         pod_name: &str,
         host: Host,
         token: String,
-    ) -> Result<Arc<PodConnection>> {
+        initial_status: PodConnectionStatus,
+    ) -> Arc<PodConnection> {
         let key = PodConnectionKey::new(repo_path.to_path_buf(), pod_name.to_string());
         let mut pods = self.pods.lock().unwrap();
         if let Some(connection) = pods.get(&key) {
-            connection.update_host_and_token(host, token)?;
-            return Ok(connection.clone());
+            connection.update_host_and_token(host, token);
+            return connection.clone();
         }
         let connection = Arc::new(PodConnection::new(
-            self.host_connections.clone(),
             self.events_tx.clone(),
             key.clone(),
             host,
             token,
-        )?);
+            initial_status,
+        ));
         pods.insert(key, connection.clone());
-        Ok(connection)
+        connection
+    }
+
+    pub fn all(&self) -> Vec<Arc<PodConnection>> {
+        self.pods.lock().unwrap().values().cloned().collect()
     }
 
     pub fn get(&self, repo_path: &Path, pod_name: &str) -> Option<Arc<PodConnection>> {
@@ -919,40 +845,14 @@ impl PodConnectionRegistry {
             }
         }
     }
-
-    pub fn replace_host_connection(&self, host: &HostKey, host_conn: Arc<HostConnection>) {
-        let connections: Vec<_> = self
-            .pods
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|connection| &*connection.host_key.lock().unwrap() == host)
-            .cloned()
-            .collect();
-        for connection in connections {
-            connection.replace_host_connection(host_conn.clone());
-        }
-    }
-
-    pub fn git_tunnels_needing_repair(&self) -> Vec<Arc<PodConnection>> {
-        self.pods
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|connection| {
-                connection.host_is_connected() && connection.try_schedule_git_tunnel_repair()
-            })
-            .cloned()
-            .collect()
-    }
 }
 
-struct GreetingState {
-    claude: Option<ClaudeState>,
-    codex: Option<CodexState>,
+pub(super) struct GreetingState {
+    pub(super) claude: Option<ClaudeState>,
+    pub(super) codex: Option<CodexState>,
 }
 
-fn connect_pod_events(
+pub(super) fn connect_pod_events(
     url: &str,
     token: &str,
 ) -> Result<(BufReader<reqwest::blocking::Response>, GreetingState), anyhow::Error> {
@@ -1020,190 +920,9 @@ fn parse_greeting_state(data_line: &str) -> GreetingState {
     GreetingState { claude, codex }
 }
 
-struct PodEventLoop {
-    pod_name: String,
-    host_conn: Arc<HostConnection>,
-    container_url: String,
-    token: String,
-    stop: Arc<AtomicBool>,
-    tx: broadcast::Sender<ReconnectEvent>,
-    status: Arc<Mutex<PodConnectionStatus>>,
-    claude_state: Arc<Mutex<Option<ClaudeState>>>,
-    codex_state: Arc<Mutex<Option<CodexState>>>,
-    events_tx: broadcast::Sender<DaemonEvent>,
-    key: PodConnectionKey,
-    repair_state: Arc<PodRepairState>,
-}
-
-fn pod_event_loop(ctx: PodEventLoop) {
-    let PodEventLoop {
-        pod_name,
-        host_conn,
-        container_url,
-        token,
-        stop,
-        tx,
-        status,
-        claude_state,
-        codex_state,
-        events_tx,
-        key,
-        repair_state,
-    } = ctx;
-
-    let apply_greeting = |g: GreetingState| {
-        replace_and_emit(&claude_state, g.claude, &events_tx, &key);
-        replace_and_emit(&codex_state, g.codex, &events_tx, &key);
-    };
-
-    let mut host_rx = host_conn.subscribe();
-    let mut backoff = PodRepairBackoff::new();
-    let mut repair_epoch = repair_state.epoch();
-
-    loop {
-        if !wait_for_pod_repair_resume(&repair_state, &stop, &mut repair_epoch) {
-            return;
-        }
-
-        let _ = tx.send(ReconnectEvent::Attempting);
-        host_conn.request_probe();
-        let host_was_disconnected = host_conn.status() == HostStatus::Disconnected;
-        if !wait_for_host(&mut host_rx, &stop, &status, &events_tx, &key) {
-            return;
-        }
-        if host_was_disconnected {
-            backoff.reset();
-            repair_epoch = repair_state.epoch();
-        }
-        replace_and_emit(&status, PodConnectionStatus::Connecting, &events_tx, &key);
-        let _ = tx.send(ReconnectEvent::HostConnected);
-
-        let mut reader = match connect_pod_events(&container_url, &token) {
-            Ok((reader, greeting)) => {
-                apply_greeting(greeting);
-                replace_and_emit(&status, PodConnectionStatus::Connected, &events_tx, &key);
-                let _ = tx.send(ReconnectEvent::Connected);
-                backoff.reset();
-                reader
-            }
-            Err(e) => {
-                debug!("pod event connection failed: {e:#}");
-                replace_and_emit(
-                    &status,
-                    PodConnectionStatus::PodDisconnected,
-                    &events_tx,
-                    &key,
-                );
-                let _ = tx.send(ReconnectEvent::Failed {
-                    error: format!("{e:#}"),
-                });
-                host_conn.request_probe();
-                let Some(delay) = backoff.next_delay() else {
-                    log::warn!(
-                        "pod connection repair for '{pod_name}' paused after repeated failures"
-                    );
-                    repair_state.pause();
-                    continue;
-                };
-                let next_epoch = repair_state.wait_for_change(repair_epoch, delay);
-                if next_epoch != repair_epoch {
-                    repair_epoch = next_epoch;
-                    backoff.reset();
-                }
-                continue;
-            }
-        };
-
-        let mut pending_event: Option<String> = None;
-        loop {
-            if stop.load(Ordering::SeqCst) {
-                return;
-            }
-            if host_conn.status() == HostStatus::Disconnected {
-                replace_and_emit(
-                    &status,
-                    PodConnectionStatus::HostDisconnected,
-                    &events_tx,
-                    &key,
-                );
-                let _ = tx.send(ReconnectEvent::Attempting);
-                break;
-            }
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if let Some(event_type) = trimmed.strip_prefix("event: ") {
-                        pending_event = Some(event_type.to_string());
-                    } else if let Some(data) = trimmed.strip_prefix("data: ") {
-                        match pending_event.as_deref() {
-                            Some("claude_state") => {
-                                if let Ok(cs) = serde_json::from_str::<Option<ClaudeState>>(data) {
-                                    replace_and_emit(&claude_state, cs, &events_tx, &key);
-                                }
-                            }
-                            Some("codex_state") => {
-                                if let Ok(xs) = serde_json::from_str::<Option<CodexState>>(data) {
-                                    replace_and_emit(&codex_state, xs, &events_tx, &key);
-                                }
-                            }
-                            Some("state") | None => {}
-                            Some(_) => {}
-                        }
-                        pending_event = None;
-                    } else if trimmed.is_empty() {
-                        pending_event = None;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn wait_for_pod_repair_resume(
-    repair_state: &PodRepairState,
-    stop: &AtomicBool,
-    repair_epoch: &mut u64,
-) -> bool {
-    while repair_state.is_paused() {
-        if stop.load(Ordering::SeqCst) {
-            return false;
-        }
-        *repair_epoch = repair_state.wait_for_change(*repair_epoch, Duration::from_secs(1));
-    }
-    !stop.load(Ordering::SeqCst)
-}
-
-fn wait_for_host(
-    host_rx: &mut watch::Receiver<HostStatus>,
-    stop: &AtomicBool,
-    status: &Mutex<PodConnectionStatus>,
-    events_tx: &broadcast::Sender<DaemonEvent>,
-    key: &PodConnectionKey,
-) -> bool {
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return false;
-        }
-        if *host_rx.borrow() == HostStatus::Connected {
-            return true;
-        }
-        replace_and_emit(
-            status,
-            PodConnectionStatus::HostDisconnected,
-            events_tx,
-            key,
-        );
-        let _ = RUNTIME.block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), host_rx.changed()).await
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::broadcast;
 
     use super::*;
     use crate::config::ContainerEngine;
@@ -1238,34 +957,6 @@ mod tests {
     }
 
     #[test]
-    fn manual_repairs_and_host_replacements_emit_status_invalidations() {
-        let (host_events_tx, _host_events_rx) = mpsc::unbounded_channel();
-        let host_connections = Arc::new(HostConnectionRegistry::new(host_events_tx));
-        let (daemon_events_tx, mut daemon_events_rx) = broadcast::channel(2);
-        let registry = PodConnectionRegistry::new(host_connections.clone(), daemon_events_tx);
-        let host = Host::Localhost {
-            engine: ContainerEngine::Docker,
-        };
-        let connection = registry
-            .get_or_create(Path::new("/repo"), "test", host.clone(), "token".into())
-            .expect("create pod connection");
-        *connection.status.lock().unwrap() = PodConnectionStatus::Connected;
-        let expected = DaemonEvent::PodStatusChanged {
-            repository: "/repo".to_string(),
-            pod: "test".to_string(),
-        };
-
-        connection.prepare_pod_server_repair();
-        assert_eq!(daemon_events_rx.try_recv(), Ok(expected.clone()));
-
-        let replacement = host_connections
-            .get_or_create(&host)
-            .expect("create replacement host connection");
-        connection.replace_host_connection(replacement);
-        assert_eq!(daemon_events_rx.try_recv(), Ok(expected));
-    }
-
-    #[test]
     fn pod_repair_backoff_eventually_pauses() {
         let mut backoff = PodRepairBackoff::new();
 
@@ -1279,93 +970,31 @@ mod tests {
     }
 
     #[test]
-    fn host_reconnect_resumes_every_pod_on_that_host() {
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let host_connections = Arc::new(HostConnectionRegistry::new(events_tx));
-        let (daemon_events_tx, mut daemon_events_rx) = broadcast::channel(4);
-        let registry = PodConnectionRegistry::new(host_connections, daemon_events_tx);
-        let docker_host = Host::Localhost {
-            engine: ContainerEngine::Docker,
-        };
-        let podman_host = Host::Localhost {
-            engine: ContainerEngine::Podman,
-        };
-        let docker_a = registry
-            .get_or_create(Path::new("/repo-a"), "a", docker_host.clone(), "a".into())
-            .unwrap();
-        let docker_b = registry
-            .get_or_create(Path::new("/repo-b"), "b", docker_host, "b".into())
-            .unwrap();
-        let podman = registry
-            .get_or_create(Path::new("/repo-c"), "c", podman_host, "c".into())
-            .unwrap();
-
-        for connection in [&docker_a, &docker_b, &podman] {
-            connection.enable_git_tunnel_supervision();
-            connection.mark_pod_validated_for_git_tunnel_repair();
-            connection.pause_pod_repair();
-        }
-
-        let docker_key = HostKey::Localhost {
-            engine: ContainerEngine::Docker,
-        };
-        registry.notify_host_disconnected(&docker_key);
-
-        assert!(docker_a.validate_pod_before_git_tunnel_repair());
-        assert!(docker_b.validate_pod_before_git_tunnel_repair());
-        assert!(!podman.validate_pod_before_git_tunnel_repair());
-        let mut disconnected_pods = Vec::new();
-        for _ in 0..2 {
-            match daemon_events_rx
-                .try_recv()
-                .expect("receive disconnect event")
-            {
-                DaemonEvent::PodStatusChanged { pod, .. } => disconnected_pods.push(pod),
-                event => panic!("unexpected disconnect event: {event:?}"),
-            }
-        }
-        disconnected_pods.sort();
-        assert_eq!(disconnected_pods, ["a", "b"]);
-
-        registry.notify_host_connected(&docker_key);
-
-        assert!(!docker_a.pod_repair_is_paused());
-        assert!(!docker_b.pod_repair_is_paused());
-        assert!(podman.pod_repair_is_paused());
-        assert!(docker_a.try_schedule_git_tunnel_repair());
-        assert!(docker_b.try_schedule_git_tunnel_repair());
-        assert!(!podman.try_schedule_git_tunnel_repair());
-        let mut connected_pods = Vec::new();
-        for _ in 0..2 {
-            match daemon_events_rx.try_recv().expect("receive connect event") {
-                DaemonEvent::PodStatusChanged { pod, .. } => connected_pods.push(pod),
-                event => panic!("unexpected connect event: {event:?}"),
-            }
-        }
-        connected_pods.sort();
-        assert_eq!(connected_pods, ["a", "b"]);
-    }
-
-    #[test]
     fn removing_pod_connection_discards_cached_codex_state() {
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
-        let host_connections = Arc::new(HostConnectionRegistry::new(events_tx));
         let (daemon_events_tx, _daemon_events_rx) = broadcast::channel(1);
-        let registry = PodConnectionRegistry::new(host_connections, daemon_events_tx);
+        let registry = PodConnectionRegistry::new(daemon_events_tx);
         let repo_path = Path::new("/repo");
         let host = Host::Localhost {
             engine: ContainerEngine::Docker,
         };
 
-        let old = registry
-            .get_or_create(repo_path, "test", host.clone(), "old-token".to_string())
-            .unwrap();
+        let old = registry.get_or_create(
+            repo_path,
+            "test",
+            host.clone(),
+            "old-token".to_string(),
+            PodConnectionStatus::HostDisconnected,
+        );
         *old.codex_state.lock().unwrap() = Some(CodexState::Idle);
 
         registry.remove(repo_path, "test").unwrap();
-        let replacement = registry
-            .get_or_create(repo_path, "test", host, "new-token".to_string())
-            .unwrap();
+        let replacement = registry.get_or_create(
+            repo_path,
+            "test",
+            host,
+            "new-token".to_string(),
+            PodConnectionStatus::HostDisconnected,
+        );
 
         assert!(!Arc::ptr_eq(&old, &replacement));
         assert_eq!(replacement.codex_state(), None);

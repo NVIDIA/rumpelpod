@@ -52,6 +52,7 @@ pub fn fork(cmd: &ForkCommand) -> Result<()> {
         new_name: cmd.new_name.clone(),
         repo_path: repo_root,
         allow_processing,
+        client_env: crate::enter::collect_client_env()?,
     })?;
     for line in &mut progress {
         match line {

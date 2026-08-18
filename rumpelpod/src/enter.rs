@@ -153,6 +153,24 @@ pub fn collect_local_env(repo_root: &Path) -> Result<HashMap<String, String>> {
     Ok(crate::devcontainer::collect_local_env_vars(&raw))
 }
 
+/// Capture the invoking client's environment for commands whose behavior is
+/// defined in the client context, such as Docker Compose interpolation and
+/// environment-backed secrets.
+pub fn collect_client_env() -> Result<HashMap<String, String>> {
+    let mut env = HashMap::new();
+    for (key, value) in std::env::vars_os() {
+        let key = key.into_string().map_err(|key| {
+            let key = key.to_string_lossy();
+            anyhow::anyhow!("environment variable name '{key}' is not valid UTF-8")
+        })?;
+        let value = value
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("environment variable '{key}' is not valid UTF-8"))?;
+        env.insert(key, value);
+    }
+    Ok(env)
+}
+
 /// Client-side helper for commands that build or pull an image outside
 /// the daemon (`rumpel image build` / `rumpel image fetch`).
 ///
@@ -276,6 +294,7 @@ pub fn launch_pod(pod_name: &str, host_override: Option<Host>) -> Result<LaunchR
     let repo_root = get_repo_root()?;
     let docker_host = determine_host(&repo_root, host_override)?;
     let local_env_vars = collect_local_env(&repo_root)?;
+    let client_env = collect_client_env()?;
     let elapsed = t.elapsed();
     trace!("launch_pod config: {elapsed:?}");
 
@@ -310,6 +329,7 @@ pub fn launch_pod(pod_name: &str, host_override: Option<Host>) -> Result<LaunchR
         grok_cli_path,
         description_file,
         local_env_vars,
+        client_env,
         ssh_auth_sock,
     })?;
     for line in &mut progress {

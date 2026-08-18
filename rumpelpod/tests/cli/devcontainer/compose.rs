@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use indoc::formatdoc;
 use rumpelpod::CommandExt;
+use rusqlite::Connection;
 
 use crate::common::{pod_command, TestDaemon, TestHome, TestRepo, TEST_REPO_PATH, TEST_USER};
 use crate::executor::{ExecutorMode, ExecutorResources};
@@ -178,7 +179,6 @@ fn compose_service_container(project: &str, service: &str) -> String {
 
 #[test]
 fn compose_build_cache_reuses_images_and_tracks_context_content() {
-    println!("xtest:timeout=300");
     if !require_local_compose() {
         return;
     }
@@ -272,8 +272,69 @@ fn compose_build_cache_reuses_images_and_tracks_context_content() {
 }
 
 #[test]
+fn compose_environment_secret_uses_client_command_environment() {
+    if !require_local_compose() {
+        return;
+    }
+
+    let repo = TestRepo::new();
+    write_compose_devcontainer(
+        &repo,
+        r#"["sleep", "infinity"]"#,
+        r#"    secrets:
+      - api_key"#,
+        r#"secrets:
+  api_key:
+    environment: RUMPELPOD_TEST_COMPOSE_SECRET"#,
+        "",
+    );
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    let output = pod_command(&repo, &daemon)
+        .env("RUMPELPOD_TEST_COMPOSE_SECRET", "client-only-secret")
+        .args([
+            "enter",
+            "--create",
+            "compose-secret",
+            "--",
+            "cat",
+            "/run/secrets/api_key",
+        ])
+        .success()
+        .expect("create Compose pod with an environment-backed secret");
+    assert_eq!(
+        String::from_utf8_lossy(&output).lines().last(),
+        Some("client-only-secret")
+    );
+
+    let database = home.path().join("state/rumpelpod/db.sqlite");
+    let connection = Connection::open(database).expect("open pod database");
+    let stored: (String, String, String) = connection
+        .query_row(
+            "SELECT devcontainer_json, compose_config, local_env FROM pods WHERE name = 'compose-secret'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read stored Compose pod configuration");
+    assert!(
+        !stored.0.contains("client-only-secret")
+            && !stored.1.contains("client-only-secret")
+            && !stored.2.contains("client-only-secret"),
+        "client environment secret was persisted in the pod database"
+    );
+    drop(connection);
+
+    pod_command(&repo, &daemon)
+        .args(["delete", "--force", "--wait", "compose-secret"])
+        .success()
+        .expect("delete Compose secret project");
+}
+
+#[test]
 fn compose_no_cache_builds_every_project() {
-    println!("xtest:timeout=300");
     if !require_local_compose() {
         return;
     }
@@ -324,7 +385,6 @@ fn compose_no_cache_builds_every_project() {
 
 #[test]
 fn compose_sidecar_forward_survives_project_restart() {
-    println!("xtest:timeout=240");
     if !require_local_compose() {
         return;
     }
@@ -411,7 +471,6 @@ fn compose_sidecar_forward_survives_project_restart() {
 
 #[test]
 fn compose_reenter_recreates_project_after_agent_removal() {
-    println!("xtest:timeout=240");
     if !require_local_compose() {
         return;
     }
@@ -467,7 +526,6 @@ fn compose_reenter_recreates_project_after_agent_removal() {
 
 #[test]
 fn compose_runtime_sidecar_forward_persists() {
-    println!("xtest:timeout=240");
     if !require_local_compose() {
         return;
     }
@@ -532,7 +590,6 @@ fn compose_runtime_sidecar_forward_persists() {
 
 #[test]
 fn compose_remote_docker_launches_sidecars_and_rejects_bind_mounts() {
-    println!("xtest:timeout=300");
     if !matches!(crate::executor::executor_mode(), ExecutorMode::Docker) {
         crate::executor::skip_test();
         return;
@@ -547,14 +604,19 @@ fn compose_remote_docker_launches_sidecars_and_rejects_bind_mounts() {
         &repo,
         r#"["sleep", "infinity"]"#,
         r#"    volumes:
-      - compose-data:/tmp/compose-data"#,
+      - compose-data:/tmp/compose-data
+    secrets:
+      - api_key"#,
         r#"  db:
     build:
       context: ..
       dockerfile: .devcontainer/Dockerfile
     command: ["socat", "TCP-LISTEN:19881,fork,reuseaddr", "EXEC:cat"]
 volumes:
-  compose-data:"#,
+  compose-data:
+secrets:
+  api_key:
+    environment: RUMPELPOD_TEST_REMOTE_COMPOSE_SECRET"#,
         r#",
                 "forwardPorts": ["db:19881"]"#,
     );
@@ -575,10 +637,25 @@ volumes:
     fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
     fs::write(bind_repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
 
-    pod_command(&repo, &daemon)
-        .args(["enter", "--create", "compose-remote", "--", "true"])
+    let output = pod_command(&repo, &daemon)
+        .env(
+            "RUMPELPOD_TEST_REMOTE_COMPOSE_SECRET",
+            "remote-client-only-secret",
+        )
+        .args([
+            "enter",
+            "--create",
+            "compose-remote",
+            "--",
+            "cat",
+            "/run/secrets/api_key",
+        ])
         .success()
         .expect("create remote Compose project");
+    assert_eq!(
+        String::from_utf8_lossy(&output).lines().last(),
+        Some("remote-client-only-secret")
+    );
     let local_port = forwarded_local_port(&repo, &daemon, "compose-remote", "db:19881");
     assert_eq!(
         try_echo(local_port, "remote sidecar forward"),
@@ -604,7 +681,6 @@ volumes:
 
 #[test]
 fn compose_build_forwards_client_ssh_agent() {
-    println!("xtest:timeout=300");
     if !require_local_compose() {
         return;
     }
@@ -688,7 +764,6 @@ fn compose_build_forwards_client_ssh_agent() {
 
 #[test]
 fn compose_override_command_and_run_services_are_applied() {
-    println!("xtest:timeout=240");
     if !require_local_compose() {
         return;
     }
@@ -755,7 +830,6 @@ fn compose_override_command_and_run_services_are_applied() {
 
 #[test]
 fn compose_default_command_exit_has_actionable_error() {
-    println!("xtest:timeout=240");
     if !require_local_compose() {
         return;
     }
@@ -784,7 +858,6 @@ fn compose_default_command_exit_has_actionable_error() {
 
 #[test]
 fn compose_service_user_is_used_when_devcontainer_has_no_user() {
-    println!("xtest:timeout=240");
     if !require_local_compose() {
         return;
     }
@@ -826,7 +899,6 @@ fn compose_service_user_is_used_when_devcontainer_has_no_user() {
 
 #[test]
 fn compose_fork_gets_independent_project_resources() {
-    println!("xtest:timeout=240");
     if !require_local_compose() {
         return;
     }

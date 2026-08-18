@@ -639,7 +639,6 @@ fn ssh_remote_pod_list() {
         crate::executor::skip_test();
         return;
     }
-    println!("xtest:timeout=185");
     let repo = TestRepo::new();
     let home = TestHome::new();
     let remote = SshRemoteHost::start();
@@ -705,7 +704,6 @@ fn list_shows_host_column_for_mixed_hosts() {
         crate::executor::skip_test();
         return;
     }
-    println!("xtest:timeout=215");
     let repo = TestRepo::new();
     let home = TestHome::new();
     let remote = SshRemoteHost::start();

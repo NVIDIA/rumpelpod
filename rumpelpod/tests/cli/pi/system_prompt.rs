@@ -8,9 +8,6 @@ use super::common::{setup_pi_test_repo, PiSession};
 
 #[test]
 fn pi_system_prompt_describes_remotes() {
-    // See pi_smoke: pi's Node toolchain makes cold image build + TUI
-    // startup slower than the 120s default under high parallelism.
-    println!("xtest:timeout=240");
     let (home, repo, _executor, daemon) = setup_pi_test_repo();
 
     let mut session = PiSession::spawn(

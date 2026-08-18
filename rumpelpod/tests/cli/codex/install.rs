@@ -21,7 +21,6 @@ use rumpelpod::CommandExt;
 /// depend on when and where they were built.
 #[test]
 fn image_includes_codex_from_client_path() {
-    println!("xtest:timeout=145");
     let host_output = Command::new("codex")
         .arg("--version")
         .output()

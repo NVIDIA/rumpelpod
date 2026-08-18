@@ -3,8 +3,10 @@
 
 //! Smoke test: verify that the codex TUI on the local machine can communicate
 //! with the codex app-server inside the container through the pod
-//! server's WebSocket proxy, with API requests cached via the LLM
-//! cache proxy.
+//! server's WebSocket proxy and execute a shell tool through code mode,
+//! with API requests cached via the LLM cache proxy.
+
+use std::time::Duration;
 
 use super::common::{setup_codex_test_repo, CodexSession};
 
@@ -20,6 +22,6 @@ fn codex_smoke() {
     // by pressing Enter whenever the TUI is waiting.
     session.dismiss_dialogs();
 
-    session.send("What is the capital of France? Reply with just the city name, nothing else.");
-    session.wait_for("Paris");
+    session.send("Run `printf %x 3735928559`.");
+    session.wait_for_with_timeout("deadbeef", Duration::from_secs(30));
 }

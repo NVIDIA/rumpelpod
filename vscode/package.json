@@ -2,7 +2,7 @@
   "name": "rumpelpod-vscode",
   "displayName": "Rumpelpod",
   "description": "Switch between rumpelpod agents and review their changes.",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "publisher": "nvidia",
   "license": "Apache-2.0",
   "private": true,

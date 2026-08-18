@@ -190,9 +190,6 @@ pub fn run() -> Result<()> {
             ImageSubcommand::Build(ref cmd) => image_cmd::build(cmd)?,
             ImageSubcommand::Fetch(ref cmd) => image_cmd::fetch(cmd)?,
         },
-        Command::Review(ref cmd) => {
-            review::review(cmd)?;
-        }
         Command::Merge(ref cmd) => {
             merge::merge(cmd)?;
         }

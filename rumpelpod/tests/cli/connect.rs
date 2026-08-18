@@ -84,7 +84,6 @@ fn stop_container_server(container_id: &str) {
 
 #[test]
 fn connect_preserves_healthy_transport_and_repairs_a_failed_pod() {
-    println!("xtest:timeout=300");
     if !matches!(executor::executor_mode(), executor::ExecutorMode::Docker) {
         executor::skip_test();
         return;
@@ -220,7 +219,6 @@ fn connect_does_not_start_a_stopped_pod() {
 
 #[test]
 fn connect_rejects_and_recreate_waits_for_stop_in_progress() {
-    println!("xtest:timeout=300");
     if !matches!(executor::executor_mode(), executor::ExecutorMode::Docker) {
         executor::skip_test();
         return;

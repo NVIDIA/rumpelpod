@@ -31,7 +31,7 @@ Typical workflow:
 
 1. Launch Claude Code in a pod with `rumpel claude my-task`, typically several in parallel on different tasks.
 2. Each agent works autonomously inside its own container.
-3. Review changes via git difftool with `rumpel review my-task`.
+3. Review changes with `git diff ...rumpelpod/my-task` or `git difftool ...rumpelpod/my-task`.
 4. Merge results back with `rumpel merge my-task`.
 
 Both Claude Code and OpenAI Codex are supported as first-class agents via `rumpel claude` and `rumpel codex`.

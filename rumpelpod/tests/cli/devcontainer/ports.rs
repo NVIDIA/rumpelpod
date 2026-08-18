@@ -647,7 +647,6 @@ fn forward_port_subcommand_explicit_local_port() {
 
 #[test]
 fn forward_port_remote_ssh() {
-    println!("xtest:timeout=240");
     if !matches!(
         crate::executor::executor_mode(),
         crate::executor::ExecutorMode::Docker

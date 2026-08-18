@@ -33,7 +33,6 @@ fn last_stdout_line(stdout: &[u8]) -> String {
 
 #[test]
 fn podman_auto_fallback_and_explicit_engine_smoke() {
-    println!("xtest:timeout=300");
     if !skip_unless_podman_executor() {
         return;
     }
@@ -95,9 +94,6 @@ fn podman_auto_fallback_and_explicit_engine_smoke() {
 
 #[test]
 fn podman_ssh_smoke() {
-    // Remote image build plus base image pull on the nested Podman can
-    // exceed the default timeout.
-    println!("xtest:timeout=600");
     // The daemon side needs a local podman client; the fixture needs
     // local Docker to host the remote container.
     if !skip_unless_podman_executor() {

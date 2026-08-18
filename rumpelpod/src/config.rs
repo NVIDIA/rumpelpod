@@ -526,9 +526,9 @@ pub struct JsonConfig {
     /// Inject a system prompt describing the rumpelpod environment
     /// (devcontainer layout, git remotes, push/fetch behavior) into
     /// each installed agent's system-prompt location (CLAUDE.md,
-    /// AGENTS.md, pi's SYSTEM.md).  The description is the same for
-    /// every agent, so this is a single pod-level knob rather than a
-    /// per-agent one.  Defaults to true.
+    /// AGENTS.md, pi's SYSTEM.md, grok's ~/.grok/rules/).  The
+    /// description is the same for every agent, so this is a single
+    /// pod-level knob rather than a per-agent one.  Defaults to true.
     #[serde(default = "default_true")]
     pub inject_system_prompt: bool,
 

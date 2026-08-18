@@ -308,6 +308,7 @@ fn daemon_serializes_concurrent_initialize_commands() {
                 inject_system_prompt: false,
                 description_file: None,
                 local_env_vars: HashMap::new(),
+                client_env: HashMap::new(),
                 ssh_auth_sock: None,
             })?;
             for _line in &mut progress {}

@@ -224,7 +224,6 @@ fn mount_bind_remote_copies_content() {
         crate::executor::skip_test();
         return;
     }
-    println!("xtest:timeout=340");
     let repo = TestRepo::new();
 
     // Create a source directory with test content on the host.

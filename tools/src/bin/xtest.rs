@@ -16,8 +16,10 @@
 //! process.  That gives us:
 //!
 //! - **Timeouts** -- each test process is killed (via process-group
-//!   SIGKILL) if it exceeds a deadline.  Tests can lower or raise
-//!   their own timeout with `println!("xtest:timeout=SECS")`.
+//!   SIGKILL) if it exceeds a deadline.  `--timeout` / `XTEST_TIMEOUT`
+//!   set the default.  Non-default tests are listed in
+//!   `tools/xtest-timeouts.json5` as integer multiples of that default,
+//!   and the suite is started in descending timeout order.
 //!
 //! - **Retries** -- failed tests are re-run up to N times (default 1),
 //!   subject to a global retry budget (RETRY_BUDGET) that prevents
@@ -50,8 +52,8 @@
 //! cargo xtest [flags] [filter] [-- [test-binary-flags]]
 //!
 //! Flags:
-//!   --test-threads N   parallel tests (env: XTEST_JOBS, default: min(ncpus, 16))
-//!   --timeout SECS     per-test kill deadline  (env: XTEST_TIMEOUT, default: 120)
+//!   --test-threads N   parallel tests (env: XTEST_JOBS, default: min(ncpus, 32))
+//!   --timeout SECS     default per-test kill deadline  (env: XTEST_TIMEOUT, default: 120)
 //!   --retries N        retry count on failure  (env: XTEST_RETRIES, default: 1)
 //!   --executor NAME    run against podman or a k8s cluster (podman|eks|hetzner|k3d)
 //! ```
@@ -108,11 +110,12 @@ struct Cli {
     #[arg(long)]
     runtime: Option<String>,
 
-    /// Maximum parallel tests (default: min(ncpus, 16), env: XTEST_JOBS).
+    /// Maximum parallel tests (default: min(ncpus, 32), env: XTEST_JOBS).
     #[arg(long = "test-threads")]
     jobs: Option<usize>,
 
-    /// Per-test timeout in seconds (default: 120, env: XTEST_TIMEOUT).
+    /// Default per-test timeout in seconds (env: XTEST_TIMEOUT, default: 120).
+    /// Entries in tools/xtest-timeouts.json5 are multiples of this value.
     #[arg(long)]
     timeout: Option<u64>,
 
@@ -429,6 +432,7 @@ enum Outcome {
 struct TestCase {
     binary: PathBuf,
     name: String,
+    timeout: Duration,
 }
 
 fn load_skip_file(path: &Path) -> Result<HashSet<String>> {
@@ -492,13 +496,17 @@ fn build_test_binaries(before_dash: &[String], release: bool) -> Result<Vec<Path
     Ok(binaries)
 }
 
-/// List tests from all test binaries, applying the user's filter.
-fn list_tests(config: &RunConfig) -> Result<Vec<TestCase>> {
+/// List tests from all test binaries.
+fn list_tests(
+    config: &RunConfig,
+    filter_args: &[String],
+    flags: &[String],
+) -> Result<Vec<(PathBuf, String)>> {
     let mut cases = Vec::new();
     for binary in &config.test_binaries {
         let mut cmd = Command::new(binary);
-        cmd.args(&config.filter_args)
-            .args(&config.test_flags)
+        cmd.args(filter_args)
+            .args(flags)
             .arg("--list")
             .env("PATH", &config.path_var);
         for (k, v) in &config.env_vars {
@@ -508,13 +516,46 @@ fn list_tests(config: &RunConfig) -> Result<Vec<TestCase>> {
             .with_context(|| format!("listing tests from {}", binary.display()))?;
         for line in stdout.lines() {
             if let Some(name) = line.strip_suffix(": test") {
-                cases.push(TestCase {
-                    binary: binary.clone(),
-                    name: name.to_string(),
-                });
+                cases.push((binary.clone(), name.to_string()));
             }
         }
     }
+    Ok(cases)
+}
+
+/// Every test name the binaries know about, including `#[ignore]`.
+///
+/// User `--list` flags such as `--ignored` are omitted so a filtered
+/// run still validates the full timeouts file.
+fn list_known_test_names(config: &RunConfig) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    let empty: [String; 0] = [];
+    let ignored = ["--ignored".to_string()];
+    for flags in [&empty[..], ignored.as_slice()] {
+        for (_, name) in list_tests(config, &empty, flags)? {
+            names.insert(name);
+        }
+    }
+    Ok(names)
+}
+
+fn apply_timeouts_and_sort(
+    listed: Vec<(PathBuf, String)>,
+    overrides: &tools::xtest_timeouts::TimeoutOverrides,
+    default: Duration,
+) -> Result<Vec<TestCase>> {
+    let mut cases = Vec::with_capacity(listed.len());
+    for (binary, name) in listed {
+        let timeout = overrides.timeout_for(&name, default)?;
+        cases.push(TestCase {
+            binary,
+            name,
+            timeout,
+        });
+    }
+    // Longest budget first so the suite's tail is not a single slow test
+    // started after everything else has finished.
+    cases.sort_by(|a, b| b.timeout.cmp(&a.timeout).then_with(|| a.name.cmp(&b.name)));
     Ok(cases)
 }
 
@@ -523,17 +564,17 @@ struct SingleTestResult {
     duration: Duration,
 }
 
+enum ChildFinish {
+    Exited(std::process::ExitStatus),
+    Interrupted,
+    TimedOut,
+    WaitFailed,
+}
+
 /// Run a single test with a timeout.
 ///
-/// Tests can override the default timeout by printing directives to
-/// stdout before doing any real work:
-///
-///     println!("xtest:timeout=300");
-///     println!("xtest:skip");
-///
-/// Directives are stripped from the captured output.  The timeout
-/// takes effect immediately (the reader thread updates an atomic that
-/// the poll loop checks every 100 ms).
+/// Tests can skip themselves by printing `xtest:skip` before doing
+/// any real work.  Directives are stripped from the captured output.
 fn run_single_test(
     case: &TestCase,
     config: &RunConfig,
@@ -597,17 +638,13 @@ fn run_single_test(
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
 
-    // Shared atomics so the reader thread can adjust the timeout
-    // as soon as it sees an xtest: directive.
-    let timeout_secs = Arc::new(AtomicU64::new(config.timeout.as_secs()));
     let skip_directive = Arc::new(AtomicBool::new(false));
 
     // Drain output in a background thread to avoid blocking the pipe
-    // buffer.  Recognises xtest: directives and strips them from the
-    // output.  Writes to the shared output_buf so the main thread can
-    // dump partial output on interrupt.
+    // buffer.  Recognises xtest:skip and strips it from the output.
+    // Writes to the shared output_buf so the main thread can dump
+    // partial output on interrupt.
     let reader_handle = {
-        let timeout_secs = Arc::clone(&timeout_secs);
         let skip_directive = Arc::clone(&skip_directive);
         let output_buf = Arc::clone(output_buf);
         std::thread::spawn(move || {
@@ -621,7 +658,7 @@ fn run_single_test(
                             if let Some((before, directive)) =
                                 tools::split_xtest_directive_line(&line)
                             {
-                                if parse_directive(directive, &timeout_secs, &skip_directive) {
+                                if parse_directive(directive, &skip_directive) {
                                     if !before.is_empty() {
                                         out.push_str(before);
                                         out.push('\n');
@@ -644,53 +681,47 @@ fn run_single_test(
         })
     };
 
-    let outcome = loop {
+    let finish = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                break if status.success() {
-                    if skip_directive.load(Relaxed) {
-                        Outcome::Skipped
-                    } else {
-                        Outcome::Passed
-                    }
-                } else {
-                    Outcome::Failed
-                };
-            }
+            Ok(Some(status)) => break ChildFinish::Exited(status),
             Ok(None) => {
                 if interrupted.load(Relaxed) {
                     let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
                     let _ = child.wait();
-                    break Outcome::Failed;
+                    break ChildFinish::Interrupted;
                 }
-                let deadline = start + Duration::from_secs(timeout_secs.load(Relaxed));
-                if Instant::now() >= deadline {
+                if start.elapsed() >= case.timeout {
                     let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
                     let _ = child.wait();
-                    break Outcome::TimedOut;
+                    break ChildFinish::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(_) => {
-                break Outcome::Failed;
-            }
+            Err(_) => break ChildFinish::WaitFailed,
         }
     };
 
+    // xtest:skip is just a stdout line. An instant skip can exit before
+    // this thread has read that line; classify only after EOF.
     let _ = reader_handle.join();
+
+    let outcome = match finish {
+        ChildFinish::Exited(status) if status.success() && skip_directive.load(Relaxed) => {
+            Outcome::Skipped
+        }
+        ChildFinish::Exited(status) if status.success() => Outcome::Passed,
+        ChildFinish::Exited(_) => Outcome::Failed,
+        ChildFinish::Interrupted | ChildFinish::WaitFailed => Outcome::Failed,
+        ChildFinish::TimedOut => Outcome::TimedOut,
+    };
     SingleTestResult {
         outcome,
         duration: start.elapsed(),
     }
 }
 
-fn parse_directive(directive: &str, timeout_secs: &AtomicU64, skip: &AtomicBool) -> bool {
-    if let Some(val) = directive.strip_prefix("timeout=") {
-        if let Ok(secs) = val.parse::<u64>() {
-            timeout_secs.store(secs, Relaxed);
-            return true;
-        }
-    } else if directive.trim() == "skip" {
+fn parse_directive(directive: &str, skip: &AtomicBool) -> bool {
+    if directive.trim() == "skip" {
         skip.store(true, Relaxed);
         return true;
     }
@@ -1185,6 +1216,11 @@ fn run() -> Result<ExitCode> {
     let timeout_secs = cli
         .timeout
         .unwrap_or_else(|| env_var_or("XTEST_TIMEOUT", 120));
+    if timeout_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "--timeout / XTEST_TIMEOUT must be greater than 0"
+        ));
+    }
     let retries = cli
         .retries
         .unwrap_or_else(|| env_var_or("XTEST_RETRIES", 1));
@@ -1295,7 +1331,12 @@ fn run() -> Result<ExitCode> {
         jobs,
     };
 
-    let mut cases = list_tests(&config)?;
+    let timeout_file = tools::repo_root()?.join(tools::xtest_timeouts::XTEST_TIMEOUTS_REL);
+    let overrides = tools::xtest_timeouts::TimeoutOverrides::load(&timeout_file)?;
+    overrides.validate(&list_known_test_names(&config)?)?;
+
+    let listed = list_tests(&config, &config.filter_args, &config.test_flags)?;
+    let mut cases = apply_timeouts_and_sort(listed, &overrides, config.timeout)?;
 
     if let Some(ref skip_file) = cli.skip_file {
         let skip_names = load_skip_file(skip_file)?;

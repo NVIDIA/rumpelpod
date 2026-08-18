@@ -256,6 +256,11 @@ pub struct PodLaunchParams {
     /// `${env:...}` in the raw devcontainer.json. Collected by the client and
     /// forwarded to the daemon for substitution.
     pub local_env_vars: HashMap<String, String>,
+    /// Environment of the client command that requested the launch. The daemon
+    /// applies it to Docker Compose commands because Compose resolves
+    /// interpolation and environment-backed secrets in the client context.
+    /// These values are not passed into the pod or persisted in its database row.
+    pub client_env: HashMap<String, String>,
     /// `SSH_AUTH_SOCK` from the client's environment, if set.  The daemon
     /// forwards it verbatim as `SSH_AUTH_SOCK` on every `docker buildx
     /// build` it spawns; buildx itself decides whether to use it (e.g.
@@ -274,6 +279,9 @@ pub struct ForkPodRequest {
     /// codex is mid-turn.  False errors out instead of prompting; the
     /// CLI handles the TTY prompt before forwarding the request.
     pub allow_processing: bool,
+    /// Environment of the client command, used when creating a forked Compose
+    /// project. These values are not passed into the pod or persisted.
+    pub client_env: HashMap<String, String>,
 }
 
 /// Response body for launch/recreate pod endpoints.
@@ -519,7 +527,8 @@ pub trait Daemon: Send + Sync + 'static {
     fn list_pods(&self, repo_path: PathBuf, sync: bool, sync_refs: bool) -> Result<Vec<PodInfo>>;
 
     // POST /review
-    // Computes immutable revisions and changed paths for reviewing a pod.
+    // Temporary: the unpublished VS Code extension still POSTs here.
+    // Remove once that client diffs `rumpelpod/<pod>` itself.
     fn review_plan(
         &self,
         repo_path: PathBuf,

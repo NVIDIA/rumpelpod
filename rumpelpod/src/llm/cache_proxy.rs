@@ -116,6 +116,11 @@ fn strip_openai_non_user_input(value: &mut serde_json::Value) {
         item.get("role").and_then(serde_json::Value::as_str) == Some("user")
             && !is_environment_context(item)
     });
+    for item in input {
+        if let Some(item) = item.as_object_mut() {
+            item.remove("id");
+        }
+    }
 }
 
 /// True when a Codex input item is the injected `<environment_context>`
@@ -556,7 +561,35 @@ pub async fn handle_llm_cache_proxy(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_cache_fields;
+    use super::{compute_cache_key, normalize_cache_fields};
+
+    #[test]
+    fn openai_cache_key_ignores_generated_message_ids() {
+        let first = br#"{
+            "input": [{
+                "type": "message",
+                "id": "msg-random-one",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "stream": true
+        }"#;
+        let second = br#"{
+            "input": [{
+                "type": "message",
+                "id": "msg-random-two",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "stream": true
+        }"#;
+        let fields = &["input", "stream"];
+
+        assert_eq!(
+            compute_cache_key("openai", "POST", "/v1/responses", first, fields),
+            compute_cache_key("openai", "POST", "/v1/responses", second, fields)
+        );
+    }
 
     #[test]
     fn normalizes_grok_user_info_date() {

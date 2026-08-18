@@ -10,8 +10,8 @@ use crate::config::load_json_config;
 use crate::daemon;
 use crate::daemon::protocol::{Daemon, DaemonClient, LaunchProgress, PodLaunchParams, PodName};
 use crate::enter::{
-    collect_local_env, determine_host, find_local_claude_cli, find_local_codex_cli,
-    find_local_grok_cli, find_local_pi_cli,
+    collect_client_env, collect_local_env, determine_host, find_local_claude_cli,
+    find_local_codex_cli, find_local_grok_cli, find_local_pi_cli,
 };
 use crate::git::{get_current_branch, get_git_user_config, get_repo_root};
 use crate::image::OutputLine;
@@ -29,6 +29,7 @@ pub fn recreate(cmd: &RecreateCommand) -> Result<()> {
 
     let docker_host = determine_host(&repo_root, cmd.host_args.resolve()?)?;
     let local_env_vars = collect_local_env(&repo_root)?;
+    let client_env = collect_client_env()?;
 
     let host_branch = get_current_branch(&repo_root);
     let git_identity = get_git_user_config(&repo_root);
@@ -57,6 +58,7 @@ pub fn recreate(cmd: &RecreateCommand) -> Result<()> {
         grok_cli_path,
         description_file,
         local_env_vars,
+        client_env,
         ssh_auth_sock,
     })?;
     for line in &mut progress {

@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use chrono::Local;
 
 const DEVCONTAINER_ENV: &str = "RUMPELPOD_DEVCONTAINER";
+const TEST_CODEX_BIN_DIR_ENV: &str = "RUMPELPOD_TEST_CODEX_BIN_DIR";
 const LINUX_RUMPEL_TARGETS: [(&str, &str); 2] = [
     ("x86_64-unknown-linux-musl", "rumpel-linux-amd64"),
     ("aarch64-unknown-linux-musl", "rumpel-linux-arm64"),
@@ -117,6 +118,30 @@ fn pipeline_cargo_cmd() -> Command {
     // extending it, which can make the musl payloads fail before main.
     command.env_remove("RUSTFLAGS");
     command
+}
+
+/// Put the devcontainer's pinned Codex ahead of interactive developer tools
+/// only for integration tests that detect a local Codex through PATH.
+fn use_pinned_test_codex(command: &mut Command) -> Result<()> {
+    let Some(bin_dir) = std::env::var_os(TEST_CODEX_BIN_DIR_ENV) else {
+        return Ok(());
+    };
+    let bin_dir = PathBuf::from(bin_dir);
+    let codex = bin_dir.join("codex");
+    if !codex.is_file() {
+        let codex = codex.display();
+        return Err(anyhow::anyhow!(
+            "{TEST_CODEX_BIN_DIR_ENV} does not contain a Codex binary at {codex}"
+        ));
+    }
+
+    let mut path_entries = vec![bin_dir];
+    if let Some(path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(path_entries).context("constructing integration test PATH")?;
+    command.env("PATH", path);
+    Ok(())
 }
 
 fn wait_for_devcontainer_user_manager() -> Result<()> {
@@ -344,6 +369,7 @@ fn run() -> Result<ExitCode> {
 
     let mut xtest_cmd = pipeline_cargo_cmd();
     xtest_cmd.arg("xtest");
+    use_pinned_test_codex(&mut xtest_cmd)?;
     if release {
         xtest_cmd.arg("--release");
     }

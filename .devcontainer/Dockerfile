@@ -92,6 +92,9 @@ RUN printf 'd /run/podman 0755 root root -\n' \
 # - insecure-registries: the k3d built-in registry speaks HTTP. The
 #   .localhost suffix resolves to ::1 (IPv6), which falls outside
 #   Docker's default insecure range (127.0.0.0/8).
+# - default-address-pools: parallel tests create many short-lived bridge
+#   networks. /24 allocations leave ample room for each fixture while
+#   preventing the daemon's subnet allocator from becoming the bottleneck.
 # No "dns" override: k3d nodes inherit the pod's resolver from
 # /etc/resolv.conf, which already forwards to the real host upstreams.
 # The collision that used to break this (the nested k3s service CIDR
@@ -100,7 +103,10 @@ RUN printf 'd /run/podman 0755 root root -\n' \
 # provision-k3d.sh.
 RUN mkdir -p /etc/docker && printf '%s\n' \
     '{' \
-    '  "insecure-registries": ["rumpelpod-registry.localhost:5000"]' \
+    '  "insecure-registries": ["rumpelpod-registry.localhost:5000"],' \
+    '  "default-address-pools": [' \
+    '    {"base": "172.16.0.0/12", "size": 24}' \
+    '  ]' \
     '}' > /etc/docker/daemon.json
 
 RUN dpkg_arch=$(dpkg --print-architecture) && \
@@ -253,17 +259,29 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.219
 
 USER root
 
-# Install Codex CLI from GitHub releases.
-# musl build is static, so it runs on any base image.
-RUN ARCH=$(uname -m) && \
-    case "$ARCH" in \
-        x86_64) CODEX_ARCH="x86_64-unknown-linux-musl" ;; \
-        aarch64) CODEX_ARCH="aarch64-unknown-linux-musl" ;; \
+# Keep the Codex used by CI outside the interactive PATH so developers can use
+# a different release without changing the test baseline. Download both
+# release executables because code mode resolves its host next to the CLI.
+ARG CODEX_VERSION=0.147.0
+ENV RUMPELPOD_TEST_CODEX_BIN_DIR=/opt/rumpelpod-test-codex/bin
+RUN case "$(uname -m)" in \
+        x86_64) CODEX_TARGET=x86_64-unknown-linux-musl ;; \
+        aarch64) CODEX_TARGET=aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported Codex architecture: $(uname -m)" >&2; exit 1 ;; \
     esac && \
-    curl -fsSL "https://github.com/openai/codex/releases/download/rust-v0.145.0/codex-$CODEX_ARCH.tar.gz" \
-    | tar xz -C /tmp && \
-    mv "/tmp/codex-$CODEX_ARCH" /usr/local/bin/codex && \
-    chmod +x /usr/local/bin/codex
+    mkdir -p "${RUMPELPOD_TEST_CODEX_BIN_DIR}" && \
+    for binary in codex codex-code-mode-host; do \
+        curl -fsSL \
+            "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${binary}-${CODEX_TARGET}.tar.gz" \
+        | tar xz -C "${RUMPELPOD_TEST_CODEX_BIN_DIR}" && \
+        mv \
+            "${RUMPELPOD_TEST_CODEX_BIN_DIR}/${binary}-${CODEX_TARGET}" \
+            "${RUMPELPOD_TEST_CODEX_BIN_DIR}/${binary}"; \
+    done && \
+    chmod +x \
+        "${RUMPELPOD_TEST_CODEX_BIN_DIR}/codex" \
+        "${RUMPELPOD_TEST_CODEX_BIN_DIR}/codex-code-mode-host" && \
+    "${RUMPELPOD_TEST_CODEX_BIN_DIR}/codex" --version
 
 # Install the xAI Grok Build coding agent: a single statically-linked binary served
 # per (version, platform), pinned for reproducibility.

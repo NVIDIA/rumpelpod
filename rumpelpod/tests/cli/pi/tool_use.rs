@@ -14,9 +14,6 @@ use crate::common::{create_commit, pod_command};
 
 #[test]
 fn pi_read_file() {
-    // See pi_smoke: pi's Node toolchain makes cold image build + TUI
-    // startup slower than the 120s default under high parallelism.
-    println!("xtest:timeout=240");
     let (home, repo, _executor, daemon) = setup_pi_test_repo();
 
     // Commit a file so the gateway syncs it into the container.
@@ -46,9 +43,6 @@ fn pi_read_file() {
 
 #[test]
 fn pi_write_file() {
-    // See pi_smoke: pi's Node toolchain makes cold image build + TUI
-    // startup slower than the 120s default under high parallelism.
-    println!("xtest:timeout=240");
     let (home, repo, _executor, daemon) = setup_pi_test_repo();
 
     let mut session = PiSession::spawn(

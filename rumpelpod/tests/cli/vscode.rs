@@ -915,8 +915,6 @@ fn vscode_demo_workspace_uses_standard_runtime() {
 #[test]
 #[ignore = "slow and timing-sensitive browser coverage; run explicitly"]
 fn vscode_browser_lists_creates_and_reviews_pods() {
-    println!("xtest:timeout=360");
-
     let root = workspace_root();
     let code_server = executable_on_path("code-server");
     let chromium = executable_on_path("chromium");

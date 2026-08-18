@@ -18,8 +18,6 @@ use crate::executor::ExecutorResources;
 
 #[test]
 fn codex_app_server_starts_in_workspace() {
-    println!("xtest:timeout=180");
-
     let repo = TestRepo::new();
     write_test_devcontainer(&repo, "", "");
 

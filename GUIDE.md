@@ -39,10 +39,15 @@ Once the commit lands, rumpelpod automatically pushes it to your local repositor
 Detach from the session with `Ctrl-a d` and inspect the changes locally:
 
 ```sh
-rumpel review my-pod
+git diff ...rumpelpod/my-pod
 ```
 
-This opens your configured `git difftool` on each changed file, comparing the pod branch against the point where it diverged from your working branch.
+The three-dot form compares the pod branch against the point where it diverged from your working branch.
+To open each changed file in your configured `git difftool` instead:
+
+```sh
+git difftool ...rumpelpod/my-pod
+```
 
 When you are satisfied, merge the pod branch into your current branch:
 
@@ -293,7 +298,8 @@ On Kubernetes, rumpelpod maps the `--runtime` flag to the pod's `runtimeClassNam
 ### Git synchronization
 
 Each pod has its own branch, named after the pod and checked out in the container.
-`rumpel review` and `rumpel merge` operate on that branch, and every commit inside the pod is automatically pushed to the local repository, where it appears as `rumpelpod/<pod>`.
+`rumpel merge` operates on that branch, and every commit inside the pod is automatically pushed to the local repository, where it appears as `rumpelpod/<pod>`.
+Review it with `git diff ...rumpelpod/<pod>` or `git difftool ...rumpelpod/<pod>`.
 Secondary branches (any branch whose name differs from the pod name) are available as `rumpelpod/<branch>@<pod>`.
 
 Inside a pod, the local repository's branches are visible as the `host` remote, and other pods' branches are visible as the `rumpelpod` remote under the same naming scheme as on the local machine.
@@ -498,7 +504,7 @@ The `pi` object configures the `rumpel pi` command.
 { "injectSystemPrompt": false }
 ```
 
-Whether to write a rumpelpod-aware system prompt into each installed agent's prompt location (`/etc/claude-code/CLAUDE.md` for Claude, `~/.codex/AGENTS.md` for codex, `~/.pi/agent/SYSTEM.md` for pi) so the agent knows about the devcontainer layout, git remotes, and the push-on-commit flow.
+Whether to write a rumpelpod-aware system prompt into each installed agent's prompt location (`/etc/claude-code/CLAUDE.md` for Claude, `~/.codex/AGENTS.md` for codex, `~/.pi/agent/SYSTEM.md` for pi, `~/.grok/rules/rumpelpod.md` for grok) so the agent knows about the devcontainer layout, git remotes, and the push-on-commit flow.
 The description is identical for every agent, so this is a single pod-level switch rather than a per-agent one.
 Defaults to `true`.
 

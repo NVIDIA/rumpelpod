@@ -31,8 +31,6 @@ fn skip_unless_docker() -> bool {
 
 #[test]
 fn codex_app_server_ports_are_isolated_on_host_network() {
-    println!("xtest:timeout=240");
-
     if skip_unless_docker() {
         return;
     }

@@ -9,10 +9,6 @@ use super::common::{setup_pi_test_repo, PiSession};
 
 #[test]
 fn pi_smoke() {
-    // pi runs on Node, so building the prepared image and starting the
-    // TUI is heavier than claude/codex; give it headroom over the 120s
-    // default for cold builds and high-parallelism runs.
-    println!("xtest:timeout=240");
     let (home, repo, _executor, daemon) = setup_pi_test_repo();
 
     let mut session = PiSession::spawn(

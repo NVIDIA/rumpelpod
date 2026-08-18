@@ -22,6 +22,8 @@ pub mod command_ext;
 
 pub use command_ext::CommandExt;
 
+pub mod xtest_timeouts;
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,7 +34,7 @@ use anyhow::{Context, Result};
 /// Cap automatic xtest parallelism without increasing it on smaller hosts.
 /// Explicit CLI and environment overrides are applied after this default.
 pub fn default_xtest_jobs(available: usize) -> usize {
-    available.min(16)
+    available.min(32)
 }
 
 /// Build a `cargo` Command with Cargo-injected env vars stripped.
@@ -254,7 +256,8 @@ mod tests {
         assert_eq!(default_xtest_jobs(1), 1);
         assert_eq!(default_xtest_jobs(8), 8);
         assert_eq!(default_xtest_jobs(16), 16);
-        assert_eq!(default_xtest_jobs(64), 16);
+        assert_eq!(default_xtest_jobs(32), 32);
+        assert_eq!(default_xtest_jobs(64), 32);
     }
 
     #[test]

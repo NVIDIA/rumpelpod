@@ -58,7 +58,7 @@ impl Source {
         host: &Host,
         docker_socket: Option<&Path>,
         ssh_auth_sock: Option<&Path>,
-        local_env: &HashMap<String, String>,
+        client_env: &HashMap<String, String>,
     ) -> Result<Model> {
         let mut command = docker_compose_command(host, docker_socket)?;
         self.apply(&mut command, project_name);
@@ -67,7 +67,7 @@ impl Source {
         // reuse its source pod's resources instead of getting its own.
         command.args(["config", "--no-normalize", "--format", "json"]);
         command.current_dir(&self.working_dir);
-        command.envs(local_env);
+        command.envs(client_env);
         if let Some(socket) = ssh_auth_sock {
             command.env("SSH_AUTH_SOCK", socket);
         }
@@ -86,7 +86,7 @@ impl Source {
         docker_socket: Option<&Path>,
         ssh_auth_sock: Option<&Path>,
         services: &[String],
-        local_env: &HashMap<String, String>,
+        client_env: &HashMap<String, String>,
         progress: &std::sync::mpsc::Sender<OutputLine>,
     ) -> Result<()> {
         let mut command = docker_compose_command(host, docker_socket)?;
@@ -94,7 +94,7 @@ impl Source {
         command.args(["build", "--with-dependencies"]);
         command.args(services);
         command.current_dir(&self.working_dir);
-        command.envs(local_env);
+        command.envs(client_env);
         if let Some(socket) = ssh_auth_sock {
             command.env("SSH_AUTH_SOCK", socket);
         }
@@ -631,6 +631,7 @@ pub struct Project {
     override_yaml: String,
     host: Host,
     docker_socket: Option<PathBuf>,
+    client_env: HashMap<String, String>,
 }
 
 impl Project {
@@ -647,6 +648,7 @@ impl Project {
         mounts: &[MountObject],
         host: &Host,
         docker_socket: Option<&Path>,
+        client_env: &HashMap<String, String>,
     ) -> Result<Self> {
         model.validate_service(agent_service)?;
         let override_yaml = generate_override(
@@ -665,6 +667,7 @@ impl Project {
             override_yaml,
             host: host.clone(),
             docker_socket: docker_socket.map(Path::to_path_buf),
+            client_env: client_env.clone(),
         })
     }
 
@@ -848,6 +851,7 @@ impl Project {
         apply_project_files(&mut command, &self.name, &materialized);
         command.args(args);
         command.args(services);
+        command.envs(&self.client_env);
         let output = command
             .output()
             .with_context(|| format!("running {label}"))?;
@@ -866,6 +870,7 @@ impl Project {
         apply_project_files(&mut command, &self.name, &materialized);
         command.args(args);
         command.args(services);
+        command.envs(&self.client_env);
         run_with_progress(&mut command, label, progress)
     }
 

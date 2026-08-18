@@ -240,6 +240,7 @@ fn service_unit_content() -> Result<String> {
         [Service]
         Type=simple
         ExecStart={exe_path} daemon
+        Environment=RUST_LOG=rumpelpod=info
         Restart=on-failure
         RestartSec=5
 
@@ -336,4 +337,16 @@ fn systemd_uninstall() -> Result<()> {
     println!("uninstalled rumpelpod daemon");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_service_enables_rumpelpod_info_logs() {
+        let content = service_unit_content().unwrap();
+
+        assert!(content.contains("Environment=RUST_LOG=rumpelpod=info"));
+    }
 }

@@ -56,7 +56,6 @@ fn claude_auto_install() {
 /// was built to handle.
 #[test]
 fn image_includes_claude_from_client_path() {
-    println!("xtest:timeout=145");
     assert!(
         Command::new("claude")
             .arg("--version")

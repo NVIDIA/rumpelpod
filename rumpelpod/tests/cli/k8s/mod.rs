@@ -152,7 +152,6 @@ struct K8sExecutor {
 
 #[test]
 fn k8s_unavailable_reentry_preserves_pod_record() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -201,7 +200,6 @@ fn k8s_unavailable_reentry_preserves_pod_record() {
 
 #[test]
 fn k8s_enter_smoke() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -238,7 +236,6 @@ fn k8s_enter_smoke() {
 
 #[test]
 fn k8s_initialize_command_runs_on_invoking_host() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -267,7 +264,6 @@ fn k8s_initialize_command_runs_on_invoking_host() {
 
 #[test]
 fn k8s_list_shows_pod() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -303,7 +299,6 @@ fn k8s_list_shows_pod() {
 /// CLAUDE column with the human-readable state.
 #[test]
 fn k8s_list_shows_claude_state() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -355,7 +350,6 @@ fn k8s_list_shows_claude_state() {
 
 #[test]
 fn k8s_delete_removes_pod() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -415,7 +409,6 @@ fn k8s_delete_removes_pod() {
 /// daemon-side state instead of erroring out with NotFound.
 #[test]
 fn k8s_delete_succeeds_when_pod_already_gone() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -508,7 +501,6 @@ fn k8s_image_build_no_registry() {
 
 #[test]
 fn k8s_image_build() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -550,7 +542,6 @@ fn k8s_image_build() {
 
 #[test]
 fn k8s_cp_to_pod() {
-    println!("xtest:timeout=300");
     if !has_k8s_executor() {
         return;
     }
@@ -594,7 +585,6 @@ fn k8s_cp_to_pod() {
 
 #[test]
 fn k8s_cp_from_pod() {
-    println!("xtest:timeout=300");
     if !has_k8s_executor() {
         return;
     }
@@ -634,7 +624,6 @@ fn k8s_cp_from_pod() {
 
 #[test]
 fn k8s_mount_volume() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -681,7 +670,6 @@ fn k8s_mount_volume() {
 
 #[test]
 fn k8s_mount_tmpfs() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -721,7 +709,6 @@ fn k8s_mount_tmpfs() {
 
 #[test]
 fn k8s_bind_mount_uploaded() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -763,7 +750,6 @@ fn k8s_bind_mount_uploaded() {
 
 #[test]
 fn k8s_privileged() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -791,7 +777,6 @@ fn k8s_privileged() {
 
 #[test]
 fn k8s_cap_add() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -812,7 +797,6 @@ fn k8s_cap_add() {
 
 #[test]
 fn k8s_override_command_false() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -853,7 +837,6 @@ fn k8s_override_command_false() {
 /// `command` (ENTRYPOINT).
 #[test]
 fn k8s_entrypoint_preserved_with_override_command() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -894,7 +877,6 @@ fn k8s_entrypoint_preserved_with_override_command() {
 
 #[test]
 fn k8s_host_requirements() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -947,7 +929,6 @@ fn k8s_host_requirements() {
 
 #[test]
 fn k8s_init_succeeds_despite_unsupported() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -975,7 +956,6 @@ fn k8s_init_succeeds_despite_unsupported() {
 
 #[test]
 fn k8s_runtime_class_name() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -1044,7 +1024,6 @@ fn k8s_runtime_class_name() {
 
 #[test]
 fn k8s_runtime_runc_omitted() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -1094,7 +1073,6 @@ fn k8s_runtime_runc_omitted() {
 
 #[test]
 fn k8s_run_args_dns() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -1243,7 +1221,6 @@ fn k8s_forward_port() {
 
 #[test]
 fn k8s_recreate() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -1296,7 +1273,6 @@ fn k8s_recreate() {
 
 #[test]
 fn k8s_fork_smoke() {
-    println!("xtest:timeout=300");
     if !has_k8s_executor() {
         return;
     }
@@ -1334,7 +1310,6 @@ fn k8s_fork_smoke() {
 
 #[test]
 fn k8s_node_selector_and_tolerations() {
-    println!("xtest:timeout=240");
     if !has_k8s_executor() {
         return;
     }
@@ -1428,7 +1403,6 @@ fn k8s_node_selector_and_tolerations() {
 // command or another client-side backend round trip.
 #[test]
 fn k8s_tunnel_reconnect() {
-    println!("xtest:timeout=300");
     if !has_k8s_executor() {
         return;
     }
@@ -1566,7 +1540,6 @@ fn k8s_tunnel_reconnect() {
 // tunnel supervision resumes, without another client command.
 #[test]
 fn k8s_gateway_reconnect_push() {
-    println!("xtest:timeout=300");
     if !has_k8s_executor() {
         return;
     }

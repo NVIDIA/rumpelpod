@@ -1,0 +1,51 @@
+{"status":200,"path":"/v1/chat/completions","headers":{"access-control-allow-origin":"*","access-control-expose-headers":"*","cache-control":"no-cache","cf-cache-status":"DYNAMIC","cf-ray":"a2ab12630bd2240f-FRA","content-type":"text/event-stream","date":"Thu, 13 Aug 2026 22:14:17 GMT","server":"cloudflare","set-cookie":"__cf_bm=KCQgt6zhgv7GBprlLtB67sMymSpMCR4EqPW2Hj8JuZQ-1786659256.8120675-1.0.1.1-wEI.uFXJCfB2ZMMN7oIB0vTfg29Dr0Cm.DFo7rX4gF7Wt27qPcty9k19pjC435xlEppigx4xTdN2YjmB59sUXQvs4oPwlq9Jq39DvSE0PVUU5jzGiBM0vWjT1twpONlY; HttpOnly; SameSite=None; Secure; Path=/; Domain=x.ai; Expires=Thu, 13 Aug 2026 22:44:17 GMT","strict-transport-security":"max-age=31536000","traceparent":"00-67b8620fb265432a1e85d171315071eb-360005450001a146-01","vary":"origin, access-control-request-method, access-control-request-headers","x-data-retention":"zdr","x-ratelimit-limit-requests":"7200","x-ratelimit-limit-tokens":"50000000","x-ratelimit-remaining-requests":"7200","x-ratelimit-remaining-tokens":"50000000","x-request-id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","x-zero-data-retention":"true"}}
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":"The","role":"assistant"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" user"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" is"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" asking"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" me"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" to"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" generate"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" a"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" session"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" title"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" for"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" their"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" query"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":"."}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" Let"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" me"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" look"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" at"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" the"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":" query"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659257,"model":"grok-4.5","choices":[{"index":0,"delta":{"reasoning_content":":\n"}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659258,"model":"grok-4.5","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call-4d9e52ca-7dbe-4de4-a1d7-4a3f4bf3b9c6-0","function":{"name":"session_title","arguments":"{\"session_title\":\"Git Remote With Other Pods\"}"},"index":0,"type":"function"}]}}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659258,"model":"grok-4.5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: {"id":"d60baf90-f5ac-970d-9bf0-fad48b3f9d8c","object":"chat.completion.chunk","created":1786659258,"model":"grok-4.5","choices":[],"usage":{"prompt_tokens":742,"completion_tokens":19,"total_tokens":820,"prompt_tokens_details":{"text_tokens":742,"audio_tokens":0,"image_tokens":0,"cached_tokens":640},"completion_tokens_details":{"reasoning_tokens":59,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0},"num_sources_used":0,"cost_in_usd_ticks":8640000},"system_fingerprint":"fp_a39489019fa99b6e","service_tier":"default"}
+
+data: [DONE]
+

@@ -39,8 +39,6 @@ fn write_fake_host_pi(home: &TestHome) -> PathBuf {
 
 #[test]
 fn image_includes_pi_from_client_path() {
-    println!("xtest:timeout=240");
-
     let repo = TestRepo::new();
     write_test_devcontainer(&repo, "", "");
     let home = TestHome::new();

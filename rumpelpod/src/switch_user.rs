@@ -14,8 +14,10 @@
 //! host only; `switch_user` is unreachable but must compile.
 
 #[cfg(not(target_os = "macos"))]
-use anyhow::Context;
-use anyhow::Result;
+use std::ffi::CString;
+
+use anyhow::{Context, Result};
+use nix::unistd::User;
 
 /// Path where `prepare-image` stores the resolved container user name.
 pub const USER_FILE: &str = "/opt/rumpelpod/user";
@@ -31,19 +33,14 @@ pub const USER_FILE: &str = "/opt/rumpelpod/user";
 /// supplementary groups are set correctly.
 #[cfg(not(target_os = "macos"))]
 pub fn switch_user() -> Result<()> {
-    use std::ffi::CString;
-
-    use nix::unistd;
-
     let name = std::fs::read_to_string(USER_FILE)
         .with_context(|| format!("reading container user from {USER_FILE}"))?;
-    let name = name.trim();
+    let user = resolve_user(name.trim())?;
+    let name = &user.name;
 
-    let user = resolve_user(name)?;
+    let cname = CString::new(name.as_str()).context("user name contains NUL")?;
 
-    let cname = CString::new(name).context("user name contains NUL")?;
-
-    if unistd::getuid() == user.uid {
+    if nix::unistd::getuid() == user.uid {
         // Already the target user.  The container runtime should
         // have set supplementary groups; verify they are correct.
         verify_groups(&cname, user.gid)?;
@@ -53,8 +50,8 @@ pub fn switch_user() -> Result<()> {
         // setuid before setgid would lose the privilege for setgid.
         nix::unistd::initgroups(&cname, user.gid)
             .with_context(|| format!("initgroups for '{name}' (gid {})", user.gid))?;
-        unistd::setgid(user.gid).with_context(|| format!("setgid to {}", user.gid))?;
-        unistd::setuid(user.uid).with_context(|| format!("setuid to {}", user.uid))?;
+        nix::unistd::setgid(user.gid).with_context(|| format!("setgid to {}", user.gid))?;
+        nix::unistd::setuid(user.uid).with_context(|| format!("setuid to {}", user.uid))?;
     }
 
     set_user_env(&user);
@@ -112,10 +109,7 @@ fn verify_groups(cname: &std::ffi::CString, primary_gid: nix::unistd::Gid) -> Re
 }
 
 /// Resolve a user by name, falling back to UID lookup for numeric strings.
-#[cfg(not(target_os = "macos"))]
-fn resolve_user(name: &str) -> Result<nix::unistd::User> {
-    use nix::unistd::User;
-
+pub(crate) fn resolve_user(name: &str) -> Result<nix::unistd::User> {
     if let Some(user) =
         User::from_name(name).with_context(|| format!("looking up user '{name}'"))?
     {

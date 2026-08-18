@@ -3373,6 +3373,46 @@ fn gateway_lfs_not_used() {
 }
 
 #[test]
+fn gateway_lfs_initial_push_with_leftover_image_branch() {
+    // First-enter recover_push walks every leftover image branch through
+    // prepare_lfs_for_rumpelpod_push.  An image-only commit makes that
+    // branch a strict descendant of the host remotes, so the LFS scan
+    // has to classify objects with cat-file --batch-check.
+    let repo = TestRepo::new();
+    std::fs::write(repo.path().join("plain.txt"), "hello\n").expect("write file");
+    Command::new("git")
+        .args(["add", "plain.txt"])
+        .current_dir(repo.path())
+        .success()
+        .expect("git add failed");
+    create_commit(repo.path(), "add plain file");
+
+    let extra_dockerfile = formatdoc! {r#"
+        RUN apk add --no-cache git-lfs
+        RUN git -C {TEST_REPO_PATH} commit --allow-empty -m 'image-only leftover commit'
+    "#};
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, &extra_dockerfile, "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let pod_name = "lfs-leftover";
+
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", pod_name, "--", "cat", "plain.txt"])
+        .success()
+        .expect(
+            "initial enter should succeed when leftover image branches are ahead of host remotes",
+        );
+
+    let expected_ref = format!("refs/rumpelpod/{pod_name}@{pod_name}");
+    assert!(
+        get_pod_ref_commit(repo.path(), &expected_ref).is_some(),
+        "initial recover_push should publish {expected_ref}"
+    );
+}
+
+#[test]
 fn pod_has_host_remotes() {
     // Remotes from the host repo (other than rumpelpod-managed ones)
     // should be present inside the pod.
@@ -3526,7 +3566,6 @@ fn pods_see_each_others_branches() {
 
 #[test]
 fn gateway_tunnel_recovers_without_reenter() {
-    println!("xtest:timeout=240");
     if !matches!(executor::executor_mode(), executor::ExecutorMode::Docker) {
         executor::skip_test();
         return;
