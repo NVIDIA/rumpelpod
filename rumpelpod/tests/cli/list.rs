@@ -4,16 +4,55 @@
 //! Integration tests for the `rumpel list` subcommand.
 
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use retry::delay::{Exponential, Fixed};
 use retry::OperationResult;
+use rusqlite::{Connection, TransactionBehavior};
 use serde_json::json;
 
 use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
 use crate::executor::{executor_mode, ExecutorMode, ExecutorResources};
 use crate::ssh::{write_ssh_config, SshRemoteHost, SSH_USER};
+
+#[test]
+fn list_stays_quiet_with_daemon_info_logging() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let daemon = TestDaemon::start_with_env(&home, &[("RUST_LOG", "rumpelpod=info")]);
+
+    // Keep the request in flight long enough to expose an eager status
+    // message even when the repository has no pods to list.
+    let mut conn = Connection::open(home.path().join("state/rumpelpod/db.sqlite"))
+        .expect("open daemon database");
+    let transaction = conn
+        .transaction_with_behavior(TransactionBehavior::Exclusive)
+        .expect("block pod listing");
+    let mut child = pod_command(&repo, &daemon)
+        .arg("list")
+        .env("RUST_LOG", "off")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start rumpel list");
+    thread::sleep(Duration::from_secs(1));
+    assert!(
+        child.try_wait().expect("check rumpel list").is_none(),
+        "listing should wait for the database lock"
+    );
+    transaction.commit().expect("unblock pod listing");
+
+    let output = child.wait_with_output().expect("wait for rumpel list");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "rumpel list failed: {stderr}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("NAME"));
+    assert!(
+        stderr.is_empty(),
+        "daemon info logging should not print status for a short listing: {stderr}"
+    );
+}
 
 #[test]
 fn list_empty_returns_header_only() {

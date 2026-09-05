@@ -1,0 +1,11 @@
+Keep status delays independent of logging
+
+The systemd daemon enables info logs for connection diagnostics. Using
+that setting to bypass SlowGuard's delay makes short CLI operations
+print status messages immediately. Preserve the ten-second initial
+delay regardless of logging verbosity.
+
+Add an integration test that enables daemon info logging and briefly
+blocks a real listing request, then checks that the CLI succeeds with
+empty stderr. This covers the daemon-to-client status path shared by
+pod listing and the pod creation checks used during agent startup.
