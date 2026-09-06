@@ -13,7 +13,7 @@ use crate::common::{
     create_commit, pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo,
     TEST_REPO_PATH, TEST_USER,
 };
-use crate::executor::{merge_config, ExecutorResources};
+use crate::executor::{executor_mode, merge_config, ExecutorMode, ExecutorResources};
 
 #[test]
 fn workspace_clone_modes_control_baking_without_changing_startup_sync() {
@@ -300,10 +300,16 @@ fn workspace_clone_skip_fork_inherits_repository_setup() {
         ),
     )
     .unwrap();
-    pod_command(&repo, &daemon)
-        .args(["stop", "source"])
-        .success()
-        .unwrap();
+    match executor_mode() {
+        ExecutorMode::Docker | ExecutorMode::Podman | ExecutorMode::Ssh => {
+            pod_command(&repo, &daemon)
+                .args(["stop", "source"])
+                .success()
+                .unwrap();
+        }
+        // Kubernetes has no stop operation; it still exercises the fork setup.
+        ExecutorMode::K8s => {}
+    }
     pod_command(&repo, &daemon)
         .args(["enter", "source", "--", "true"])
         .success()
