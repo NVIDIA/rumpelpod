@@ -23,6 +23,7 @@ use listenfd::ListenFd;
 use log::error;
 use rusqlite::Connection;
 use tokio::net::UnixListener;
+use tokio_util::sync::CancellationToken;
 
 use sha2::{Digest, Sha256};
 
@@ -459,8 +460,21 @@ type PodLifecycleKey = (PathBuf, String);
 
 #[derive(Default)]
 struct PodLifecycleLock {
-    held: Mutex<bool>,
+    state: Mutex<PodLifecycleState>,
     changed: Condvar,
+}
+
+#[derive(Default)]
+struct PodLifecycleState {
+    held: bool,
+    waiting_deletes: usize,
+    delete_generation: u64,
+    readiness_cancel: CancellationToken,
+}
+
+struct PodLifecycleRequest {
+    lifecycle_lock: Arc<PodLifecycleLock>,
+    delete_generation: u64,
 }
 
 struct PodLifecycleGuard {
@@ -468,25 +482,71 @@ struct PodLifecycleGuard {
 }
 
 impl PodLifecycleLock {
-    /// Return an owned lease so background stop/delete work can keep
-    /// the deterministic backend pod id reserved until it finishes.
-    fn acquire(self: &Arc<Self>) -> PodLifecycleGuard {
-        let mut held = self.held.lock().unwrap();
-        while *held {
-            held = self.changed.wait(held).unwrap();
+    fn queue(self: &Arc<Self>) -> Result<PodLifecycleRequest> {
+        let state = self.state.lock().unwrap();
+        if state.waiting_deletes > 0 || (state.held && state.readiness_cancel.is_cancelled()) {
+            return Err(anyhow::anyhow!("pod operation cancelled by delete"));
         }
-        *held = true;
+        Ok(PodLifecycleRequest {
+            lifecycle_lock: self.clone(),
+            delete_generation: state.delete_generation,
+        })
+    }
+
+    fn readiness_cancellation(&self) -> CancellationToken {
+        self.state.lock().unwrap().readiness_cancel.clone()
+    }
+
+    fn acquire_for_delete(self: &Arc<Self>) -> PodLifecycleGuard {
+        let mut state = self.state.lock().unwrap();
+        state.delete_generation += 1;
+        state.waiting_deletes += 1;
+        state.readiness_cancel.cancel();
+        self.changed.notify_all();
+        // Reserve deletion's place before waking the launch. Otherwise a
+        // queued enter could acquire the lock and begin another readiness wait.
+        while state.held {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.held = true;
+        state.waiting_deletes -= 1;
         PodLifecycleGuard {
             lifecycle_lock: self.clone(),
         }
     }
 }
 
+impl PodLifecycleRequest {
+    /// Keep a queued enter from resurrecting a pod that was deleted before
+    /// the enter could take its lifecycle lease.
+    fn acquire(self, on_wait: impl FnOnce()) -> Result<PodLifecycleGuard> {
+        let mut state = self.lifecycle_lock.state.lock().unwrap();
+        if state.held && state.delete_generation == self.delete_generation {
+            on_wait();
+        }
+        loop {
+            if state.delete_generation != self.delete_generation {
+                return Err(anyhow::anyhow!("pod operation cancelled by delete"));
+            }
+            if !state.held {
+                break;
+            }
+            state = self.lifecycle_lock.changed.wait(state).unwrap();
+        }
+        state.held = true;
+        state.readiness_cancel = CancellationToken::new();
+        Ok(PodLifecycleGuard {
+            lifecycle_lock: self.lifecycle_lock.clone(),
+        })
+    }
+}
+
 impl Drop for PodLifecycleGuard {
     fn drop(&mut self) {
-        let mut held = self.lifecycle_lock.held.lock().unwrap();
-        *held = false;
-        self.lifecycle_lock.changed.notify_one();
+        let mut state = self.lifecycle_lock.state.lock().unwrap();
+        state.held = false;
+        // A normal waiter cannot proceed while a delete is queued.
+        self.lifecycle_lock.changed.notify_all();
     }
 }
 
@@ -916,6 +976,7 @@ struct BindSource {
 struct ResolvedLaunch {
     pod_name: PodName,
     repo_path: PathBuf,
+    readiness_cancel: CancellationToken,
     docker_host: Host,
     devcontainer: DevContainer,
     raw_devcontainer_json: String,
@@ -2250,6 +2311,22 @@ impl protocol::LaunchProgress for ServerLaunchProgress {
 }
 
 impl DaemonServer {
+    fn readiness_cancellation(&self, repo_path: &Path, pod_name: &str) -> CancellationToken {
+        self.lifecycle_locks
+            .for_pod(repo_path, pod_name)
+            .readiness_cancellation()
+    }
+
+    fn check_readiness_cancellation(&self, repo_path: &Path, pod_name: &str) -> Result<()> {
+        if self
+            .readiness_cancellation(repo_path, pod_name)
+            .is_cancelled()
+        {
+            return Err(anyhow::anyhow!("pod readiness wait cancelled by delete"));
+        }
+        Ok(())
+    }
+
     fn emit_event(&self, event: DaemonEvent) {
         let _ = self.events_tx.send(event);
     }
@@ -2915,7 +2992,12 @@ impl DaemonServer {
         }
 
         // Readiness check: PodClient::new polls /events.
-        let _pod = PodClient::new(&container_url, &token, RetryPolicy::UserBlocking)?;
+        let _pod = PodClient::new_cancellable(
+            &container_url,
+            &token,
+            RetryPolicy::UserBlocking,
+            &self.readiness_cancellation(repo_path, &pod_name.0),
+        )?;
 
         {
             let conn = self.db.lock().unwrap();
@@ -3198,7 +3280,12 @@ impl DaemonServer {
             self.cleanup_codex_runtime(repo_path, &pod_name.0);
         }
 
-        let _pod = PodClient::new(&container_url, &token, RetryPolicy::UserBlocking)?;
+        let _pod = PodClient::new_cancellable(
+            &container_url,
+            &token,
+            RetryPolicy::UserBlocking,
+            &self.readiness_cancellation(repo_path, &pod_name.0),
+        )?;
 
         // Set up port forwarding for an existing container.  Skip if
         // handles for this pod are already held; replacing them during
@@ -3291,6 +3378,7 @@ impl DaemonServer {
         local_env_vars: &HashMap<String, String>,
         raw_devcontainer_json: &str,
         progress_tx: &std::sync::mpsc::Sender<crate::image::OutputLine>,
+        readiness_cancel: &CancellationToken,
     ) -> Result<LaunchResult> {
         let (node_selector, tolerations) = match docker_host {
             Host::Kubernetes {
@@ -3367,9 +3455,8 @@ impl DaemonServer {
         self.ensure_git_tunnel(&pod_connection, &executor, exec_pod_id.as_str())
             .map_err(|e| mark_error(e.context("starting tunnel to k8s pod")))?;
 
-        // Start container-serve with git-init params.  It clones the
-        // repo, sets up git remotes/hooks, and runs lifecycle commands
-        // during startup, so it only accepts connections once ready.
+        // Setup reports progress before the state greeting, so slow git and
+        // lifecycle commands remain observable while launch waits for readiness.
         progress_tx
             .send(OutputLine::Stderr("starting container server...".into()))
             .ok();
@@ -3402,9 +3489,14 @@ impl DaemonServer {
         let container_url = endpoint.url.clone();
 
         let progress_for_wait = progress_tx.clone();
-        let pod = PodClient::wait_and_connect(&container_url, &token, |msg| {
-            let _ = progress_for_wait.send(OutputLine::Stderr(msg.to_string()));
-        })
+        let pod = PodClient::wait_and_connect(
+            &container_url,
+            &token,
+            |msg| {
+                let _ = progress_for_wait.send(OutputLine::Stderr(msg.to_string()));
+            },
+            readiness_cancel,
+        )
         .map_err(mark_error)?;
 
         // Populate bind mount volumes with data from the local machine.
@@ -3481,6 +3573,7 @@ impl DaemonServer {
         build_tx: std::sync::mpsc::Sender<crate::image::OutputLine>,
         initialize_mode: InitializeMode,
     ) -> Result<LaunchResult> {
+        self.check_readiness_cancellation(&params.repo_path, &params.pod_name.0)?;
         let PodLaunchParams {
             pod_name,
             repo_path,
@@ -3935,11 +4028,13 @@ impl DaemonServer {
         gateway::install_host_hooks(&repo_path)?;
 
         let git_setup = fresh_pod_git_setup(&pod_name.0, host_branch.as_deref(), git_identity);
+        let readiness_cancel = self.readiness_cancellation(&repo_path, &pod_name.0);
 
         self.create_pod_container(
             ResolvedLaunch {
                 pod_name,
                 repo_path,
+                readiness_cancel,
                 docker_host,
                 devcontainer,
                 raw_devcontainer_json,
@@ -4097,6 +4192,9 @@ impl DaemonServer {
                 docker_host,
                 devcontainer,
                 raw_devcontainer_json: source_devcontainer_json,
+                // Fork has no lifecycle lease, so it must not inherit a
+                // different operation's cancellation for this destination.
+                readiness_cancel: CancellationToken::new(),
                 image: Image(source_image),
                 image_built: false,
                 compose_model,
@@ -4133,6 +4231,7 @@ impl DaemonServer {
         let ResolvedLaunch {
             pod_name,
             repo_path,
+            readiness_cancel,
             docker_host,
             devcontainer,
             raw_devcontainer_json,
@@ -4170,6 +4269,7 @@ impl DaemonServer {
                 &local_env_vars,
                 &raw_devcontainer_json,
                 &progress_tx,
+                &readiness_cancel,
             )?;
             self.spawn_reconnect_k8s_siblings(
                 context.clone(),
@@ -4293,9 +4393,8 @@ impl DaemonServer {
             self.ensure_git_tunnel(&pod_connection, &executor, backend_container)
                 .context("starting tunnel to docker container")?;
 
-            // Start container-serve with git-init params.  It clones the
-            // repo, sets up git remotes/hooks, and runs lifecycle commands
-            // during startup, so it only accepts connections once ready.
+            // Setup reports progress before the state greeting, so slow git and
+            // lifecycle commands remain observable while launch waits for readiness.
             progress_tx
                 .send(OutputLine::Stderr("starting container server...".into()))
                 .ok();
@@ -4324,9 +4423,14 @@ impl DaemonServer {
             let container_url_inner = endpoint.url;
 
             let progress_for_wait = progress_tx.clone();
-            let pod_inner = PodClient::wait_and_connect(&container_url_inner, &token, |msg| {
-                let _ = progress_for_wait.send(OutputLine::Stderr(msg.to_string()));
-            })?;
+            let pod_inner = PodClient::wait_and_connect(
+                &container_url_inner,
+                &token,
+                |msg| {
+                    let _ = progress_for_wait.send(OutputLine::Stderr(msg.to_string()));
+                },
+                &readiness_cancel,
+            )?;
 
             // Populate bind mount volumes with data from the local machine.
             upload_bind_mounts(&pod_inner, &bind_sources)
@@ -4368,7 +4472,12 @@ impl DaemonServer {
             Err(e) => return Err(mark_error(e)),
         };
 
-        let _pod = PodClient::new(&container_url, &token, RetryPolicy::UserBlocking)?;
+        let _pod = PodClient::new_cancellable(
+            &container_url,
+            &token,
+            RetryPolicy::UserBlocking,
+            &readiness_cancel,
+        )?;
 
         {
             let conn = self.db.lock().unwrap();
@@ -4759,9 +4868,12 @@ impl DaemonServer {
                     );
                     if let Ok(out) = token_out {
                         let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        if let Ok(old_pod) =
-                            PodClient::new(&container_url, &token, RetryPolicy::Background)
-                        {
+                        if let Ok(old_pod) = PodClient::new_cancellable(
+                            &container_url,
+                            &token,
+                            RetryPolicy::Background,
+                            &self.readiness_cancellation(&repo_path, &pod_name.0),
+                        ) {
                             let p = old_pod
                                 .git_patch_get()
                                 .context("snapshotting dirty files in k8s pod")?;
@@ -4779,6 +4891,10 @@ impl DaemonServer {
                 }
             }
 
+            // A failed optional snapshot probe may be cancellation. Do not
+            // start rebuilding while an explicit delete is waiting for us.
+            self.check_readiness_cancellation(&repo_path, &pod_name.0)?;
+
             // 2. Delete the pod
             self.delete_pod_impl(
                 pod_name.clone(),
@@ -4794,10 +4910,11 @@ impl DaemonServer {
 
             // 4. Restore snapshots
             if patch.is_some() || !agent_snapshots.is_empty() {
-                let new_pod = PodClient::new(
+                let new_pod = PodClient::new_cancellable(
                     &launch_result.container_url,
                     &launch_result.container_token,
                     RetryPolicy::UserBlocking,
+                    &self.readiness_cancellation(&repo_path, &pod_name.0),
                 )?;
 
                 if let Some(patch_content) = patch {
@@ -4891,9 +5008,12 @@ impl DaemonServer {
                     )) {
                         let port = proxy.port;
                         let url = format!("http://127.0.0.1:{port}");
-                        if let Ok(old_pod) =
-                            PodClient::new(&url, &old_token, RetryPolicy::Background)
-                        {
+                        if let Ok(old_pod) = PodClient::new_cancellable(
+                            &url,
+                            &old_token,
+                            RetryPolicy::Background,
+                            &self.readiness_cancellation(&repo_path, &pod_name.0),
+                        ) {
                             let p = old_pod
                                 .git_patch_get()
                                 .context("snapshotting dirty files")?;
@@ -4911,6 +5031,8 @@ impl DaemonServer {
                 }
             }
         }
+
+        self.check_readiness_cancellation(&repo_path, &pod_name.0)?;
 
         if old_record.is_some() {
             // A Compose project can retain sidecars after its agent disappears,
@@ -4939,10 +5061,11 @@ impl DaemonServer {
 
         // 4. Restore snapshots
         if patch.is_some() || !agent_snapshots.is_empty() {
-            let new_pod = PodClient::new(
+            let new_pod = PodClient::new_cancellable(
                 &launch_result.container_url,
                 &launch_result.container_token,
                 RetryPolicy::UserBlocking,
+                &self.readiness_cancellation(&repo_path, &pod_name.0),
             )?;
 
             if let Some(patch_content) = patch {
@@ -5362,11 +5485,21 @@ impl Daemon for DaemonServer {
         self.remember_client_context(&params.client_context);
         let (tx, rx) = std::sync::mpsc::channel();
         let this = self.handle();
+        let lifecycle_request = this
+            .lifecycle_locks
+            .for_pod(&params.repo_path, &params.pod_name.0)
+            .queue()?;
         let handle = std::thread::spawn(move || {
-            let lifecycle_lock = this
-                .lifecycle_locks
-                .for_pod(&params.repo_path, &params.pod_name.0);
-            let _guard = lifecycle_lock.acquire();
+            let _guard = lifecycle_request.acquire(|| {
+                if tx
+                    .send(OutputLine::Stderr(
+                        "waiting for another operation on this pod...".into(),
+                    ))
+                    .is_err()
+                {
+                    log::debug!("launch client disconnected while waiting for the lifecycle lock");
+                }
+            })?;
             let remove_connection_on_failure = this
                 .connections
                 .pod(&params.repo_path, &params.pod_name.0)
@@ -5393,11 +5526,23 @@ impl Daemon for DaemonServer {
         self.remember_client_context(&params.client_context);
         let (tx, rx) = std::sync::mpsc::channel();
         let this = self.handle();
+        let lifecycle_request = this
+            .lifecycle_locks
+            .for_pod(&params.repo_path, &params.pod_name.0)
+            .queue()?;
         let handle = std::thread::spawn(move || {
-            let lifecycle_lock = this
-                .lifecycle_locks
-                .for_pod(&params.repo_path, &params.pod_name.0);
-            let _guard = lifecycle_lock.acquire();
+            let _guard = lifecycle_request.acquire(|| {
+                if tx
+                    .send(OutputLine::Stderr(
+                        "waiting for another operation on this pod...".into(),
+                    ))
+                    .is_err()
+                {
+                    log::debug!(
+                        "recreate client disconnected while waiting for the lifecycle lock"
+                    );
+                }
+            })?;
             this.recreate_pod_impl(params, tx)
         });
         Ok(ServerLaunchProgress {
@@ -5419,7 +5564,7 @@ impl Daemon for DaemonServer {
 
     fn stop_pod(&self, pod_name: PodName, repo_path: PathBuf, wait: bool) -> Result<()> {
         let lifecycle_lock = self.lifecycle_locks.for_pod(&repo_path, &pod_name.0);
-        let lifecycle_guard = lifecycle_lock.acquire();
+        let lifecycle_guard = lifecycle_lock.queue()?.acquire(|| {})?;
         let pod_record = {
             let conn = self.db.lock().unwrap();
             db::get_pod(&conn, &repo_path, &pod_name.0)?
@@ -5503,7 +5648,7 @@ impl Daemon for DaemonServer {
 
     fn delete_pod(&self, pod_name: PodName, repo_path: PathBuf, wait: bool) -> Result<()> {
         let lifecycle_lock = self.lifecycle_locks.for_pod(&repo_path, &pod_name.0);
-        let lifecycle_guard = lifecycle_lock.acquire();
+        let lifecycle_guard = lifecycle_lock.acquire_for_delete();
         self.delete_pod_impl(
             pod_name,
             repo_path,
@@ -5931,7 +6076,7 @@ impl Daemon for DaemonServer {
         let lifecycle_lock = self
             .lifecycle_locks
             .for_pod(&request.repo_path, &request.pod_name);
-        let _guard = lifecycle_lock.acquire();
+        let _guard = lifecycle_lock.queue()?.acquire(|| {})?;
         self.connect_pod_impl(request)
     }
 

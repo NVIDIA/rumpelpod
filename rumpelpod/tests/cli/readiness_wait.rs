@@ -8,7 +8,7 @@
 //! initial cause was unknown.
 
 use std::fs;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use indoc::indoc;
@@ -63,12 +63,24 @@ impl TestProcess {
     }
 
     fn success(&mut self, timeout: Duration, reason: &str) -> String {
+        let status = self.wait(timeout, reason);
+        let output = self.output();
+        assert!(status.success(), "{reason}: {status}\n{output}");
+        output
+    }
+
+    fn failure(&mut self, timeout: Duration, reason: &str) -> String {
+        let status = self.wait(timeout, reason);
+        let output = self.output();
+        assert!(!status.success(), "{reason}: command succeeded\n{output}");
+        output
+    }
+
+    fn wait(&mut self, timeout: Duration, reason: &str) -> ExitStatus {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait().expect("poll command") {
-                let output = self.output();
-                assert!(status.success(), "{reason}: {status}\n{output}");
-                return output;
+                return status;
             }
             assert!(
                 Instant::now() < deadline,
@@ -196,6 +208,19 @@ fn readiness_wait_completes_when_lifecycle_is_released() {
     fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
     let (mut launch, container_id) = blocked_launch(&repo, &daemon, "release-readiness");
 
+    // This exceeds the readiness read deadline and the lifecycle guard's
+    // first progress message. Only startup heartbeats keep the stream live
+    // until the next progress message at 70 seconds.
+    std::thread::sleep(Duration::from_secs(45));
+    assert!(
+        launch
+            .child
+            .try_wait()
+            .expect("poll live startup")
+            .is_none(),
+        "healthy setup timed out before the hook was released:\n{}",
+        launch.output()
+    );
     TestProcess::spawn(Command::new("docker").args([
         "exec",
         &container_id,
@@ -301,4 +326,131 @@ fn readiness_wait_enter_recovers_abandoned_launch_in_stopped_container() {
         "enter blocked behind readiness retries instead of restarting the stopped container",
     );
     assert!(output.contains("readiness-recovered"), "{output}");
+}
+
+#[test]
+fn readiness_wait_reports_stopped_container_to_launching_cli() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "failed-readiness");
+
+    stop_container(&container_id);
+    let output = launch.failure(
+        RECOVERY_TIMEOUT,
+        "a stopped container should fail its launch without another command cancelling it",
+    );
+    assert!(output.contains("event stream"), "{output}");
+}
+
+#[test]
+fn readiness_wait_delete_cancels_attached_launch_with_unresponsive_server() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "paused-readiness");
+
+    // A paused server cannot send progress or close its stream. Delete must
+    // interrupt the pending read even while the original CLI is still alive.
+    TestProcess::spawn(Command::new("docker").args(["pause", &container_id]))
+        .success(RECOVERY_TIMEOUT, "pause the test container");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "paused-readiness",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete must interrupt an unresponsive readiness stream",
+    );
+    let output = launch.failure(RECOVERY_TIMEOUT, "delete must cancel the original launch");
+    assert!(
+        output.contains("readiness wait cancelled by delete"),
+        "{output}"
+    );
+}
+
+#[test]
+fn readiness_wait_reports_unresponsive_server_to_launching_cli() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "silent-readiness");
+
+    TestProcess::spawn(Command::new("docker").args(["pause", &container_id]))
+        .success(RECOVERY_TIMEOUT, "pause the test container");
+    let output = launch.failure(
+        Duration::from_secs(45),
+        "a server that stops sending heartbeats should fail its launch",
+    );
+    assert!(output.contains("event stream"), "{output}");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "silent-readiness",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "readiness timeout should release the lock",
+    );
+}
+
+#[test]
+fn readiness_wait_delete_cancels_queued_enter_without_recreating_pod() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, _container_id) = blocked_launch(&repo, &daemon, "queued-readiness");
+    launch.abandon();
+
+    let mut enter = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "queued-readiness",
+        "--",
+        "true",
+    ]));
+    enter.wait_for_output("waiting for another operation on this pod");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "queued-readiness",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete must take priority over queued enter",
+    );
+    let output = enter.failure(
+        RECOVERY_TIMEOUT,
+        "queued enter must not recreate a deleted pod",
+    );
+    assert!(
+        output.contains("pod operation cancelled by delete"),
+        "{output}"
+    );
+    let output = TestProcess::spawn(pod_command(&repo, &daemon).arg("list"))
+        .success(RECOVERY_TIMEOUT, "list after cancelling the queued enter");
+    assert!(!output.contains("queued-readiness"), "{output}");
 }

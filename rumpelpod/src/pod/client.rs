@@ -14,8 +14,12 @@ use anyhow::{Context, Result};
 use flate2::read::GzEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio_util::io::StreamReader;
+use tokio_util::sync::CancellationToken;
 
 use super::types::*;
+use crate::async_runtime::block_on;
 use crate::jitter;
 use crate::RetryPolicy;
 
@@ -33,10 +37,18 @@ pub struct PodClient {
 impl PodClient {
     /// Connect to the container server, waiting for it to become ready.
     ///
-    /// `policy` controls whether the readiness poll retries indefinitely
-    /// (`UserBlocking`) or gives up after a fixed number of attempts
-    /// (`Background`).
+    /// `policy` controls progress reporting. Connecting is bounded; an
+    /// established startup stream may stay open as long as it remains live.
     pub fn new(url: &str, token: &str, policy: RetryPolicy) -> Result<Self> {
+        Self::new_cancellable(url, token, policy, &CancellationToken::new())
+    }
+
+    pub fn new_cancellable(
+        url: &str,
+        token: &str,
+        policy: RetryPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
             .timeout(None)
             .gzip(true)
@@ -47,7 +59,12 @@ impl PodClient {
             url: url.trim_end_matches('/').to_string(),
             token: token.to_string(),
         };
-        pod.wait_ready(policy)?;
+        let eprintln_progress = |msg: &str| eprintln!("{msg}");
+        let on_progress: Option<&dyn Fn(&str)> = match policy {
+            RetryPolicy::UserBlocking => Some(&eprintln_progress),
+            RetryPolicy::Background => None,
+        };
+        pod.wait_ready_impl(on_progress, cancellation)?;
         Ok(pod)
     }
 
@@ -60,7 +77,12 @@ impl PodClient {
 
     /// Wait for readiness, forwarding progress and retry messages
     /// through a callback instead of eprintln.
-    pub fn wait_and_connect(url: &str, token: &str, on_progress: impl Fn(&str)) -> Result<Self> {
+    pub fn wait_and_connect(
+        url: &str,
+        token: &str,
+        on_progress: impl Fn(&str),
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
             .timeout(None)
             .gzip(true)
@@ -71,7 +93,7 @@ impl PodClient {
             url: url.trim_end_matches('/').to_string(),
             token: token.to_string(),
         };
-        pod.wait_ready_impl(RetryPolicy::UserBlocking, Some(&on_progress))?;
+        pod.wait_ready_impl(Some(&on_progress), cancellation)?;
         Ok(pod)
     }
 
@@ -93,88 +115,68 @@ impl PodClient {
     /// Block until the container server accepts connections on /events
     /// and sends its `state` greeting.
     ///
-    /// Uses exponential backoff (100ms doubling up to 30s) so
-    /// high-latency links (e.g. remote Docker over slow WiFi) and slow
-    /// lifecycle commands get enough time without hammering the
-    /// connection.
-    ///
-    /// `UserBlocking` retries indefinitely with progress on stderr.
-    /// `Background` gives up after 20 attempts.
-    ///
-    /// Returns an error if the greeting carries a lifecycle failure.
-    fn wait_ready(&self, policy: RetryPolicy) -> Result<()> {
-        let eprintln_progress = |msg: &str| eprintln!("{msg}");
-        let on_progress: Option<&dyn Fn(&str)> = if policy == RetryPolicy::UserBlocking {
-            Some(&eprintln_progress)
-        } else {
-            None
-        };
-        self.wait_ready_impl(policy, on_progress)
-    }
-
+    /// Long setup commands are allowed, but losing their event stream must
+    /// fail the launch so a dead container cannot retain its lifecycle lock.
     fn wait_ready_impl(
         &self,
-        policy: RetryPolicy,
         on_progress: Option<&dyn Fn(&str)>,
+        cancellation: &CancellationToken,
     ) -> Result<()> {
+        block_on(async {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    Err(anyhow::anyhow!("pod readiness wait cancelled by delete"))
+                }
+                result = self.wait_ready_async(on_progress) => result,
+            }
+        })
+    }
+
+    async fn wait_ready_async(&self, on_progress: Option<&dyn Fn(&str)>) -> Result<()> {
         let url = &self.url;
         let token = &self.token;
-        // No total timeout -- the SSE stream is open-ended and we
-        // only read until the first `state` event.
-        let poll_client = reqwest::blocking::Client::builder()
-            .timeout(None)
+        // Startup heartbeats keep long lifecycle commands alive. A read
+        // deadline catches broken transports without timing out healthy setup.
+        let poll_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build poll client");
 
-        let max_delay = Duration::from_secs(30);
-        let mut delay = Duration::from_millis(100);
-        let mut attempt = 0u32;
-
-        let emit = |msg: &str| {
-            if let Some(cb) = on_progress {
-                cb(msg);
+        let connect = async {
+            let mut delay = Duration::from_millis(100);
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match poll_client
+                    .get(format!("{url}/events"))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => return resp.error_for_status().context("opening readiness stream"),
+                    Err(e) => {
+                        if let Some(cb) = on_progress {
+                            cb(&format!(
+                                "waiting for container server (attempt {attempt}: {e})..."
+                            ));
+                        }
+                    }
+                }
+                tokio::time::sleep(jitter(delay)).await;
+                delay = delay.saturating_mul(2).min(Duration::from_secs(5));
             }
         };
+        let response = tokio::time::timeout(Duration::from_secs(30), connect)
+            .await
+            .with_context(|| {
+                format!("container server at {url} did not respond within 30 seconds")
+            })??;
 
-        loop {
-            attempt += 1;
-            match poll_client
-                .get(format!("{url}/events"))
-                .header("Authorization", format!("Bearer {token}"))
-                .send()
-            {
-                Ok(resp) if resp.status().is_success() => match read_greeting(resp, on_progress) {
-                    Ok(Some(lifecycle_err)) => {
-                        return Err(anyhow::anyhow!("{lifecycle_err}"));
-                    }
-                    Ok(None) => {
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        emit(&format!(
-                            "waiting for container server (attempt {attempt}: {e})..."
-                        ));
-                    }
-                },
-                Ok(resp) => {
-                    let status = resp.status();
-                    emit(&format!(
-                        "waiting for container server (attempt {attempt}, status {status})..."
-                    ));
-                }
-                Err(e) => {
-                    emit(&format!(
-                        "waiting for container server (attempt {attempt}: {e})..."
-                    ));
-                }
-            }
-            if policy == RetryPolicy::Background && attempt >= 20 {
-                return Err(anyhow::anyhow!(
-                    "container server at {url} did not become ready"
-                ));
-            }
-            std::thread::sleep(jitter(delay));
-            delay = delay.saturating_mul(2).min(max_delay);
+        match read_greeting(response, on_progress).await? {
+            Some(lifecycle_err) => Err(anyhow::anyhow!("{lifecycle_err}")),
+            None => Ok(()),
         }
     }
 
@@ -582,16 +584,20 @@ impl PodClient {
 ///
 /// Returns `Ok(Some(msg))` if the greeting carries a lifecycle error,
 /// `Ok(None)` on success.
-fn read_greeting(
-    resp: reqwest::blocking::Response,
+async fn read_greeting(
+    resp: reqwest::Response,
     on_progress: Option<&dyn Fn(&str)>,
 ) -> Result<Option<String>> {
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(resp);
+    let stream = futures_util::stream::try_unfold(resp, |mut resp| async move {
+        let chunk = resp.chunk().await.map_err(std::io::Error::other)?;
+        Ok::<_, std::io::Error>(chunk.map(|bytes| (bytes, resp)))
+    });
+    let mut reader = BufReader::new(StreamReader::new(Box::pin(stream)));
     loop {
         let mut line = String::new();
         let n = reader
             .read_line(&mut line)
+            .await
             .context("reading event stream")?;
         if n == 0 {
             return Err(anyhow::anyhow!("event stream closed before state event"));
@@ -601,10 +607,14 @@ fn read_greeting(
             let mut data_line = String::new();
             reader
                 .read_line(&mut data_line)
+                .await
                 .context("reading state event data")?;
             // Consume blank separator line.
             let mut blank = String::new();
-            reader.read_line(&mut blank).ok();
+            reader
+                .read_line(&mut blank)
+                .await
+                .context("reading state event separator")?;
 
             let json_str = data_line
                 .trim()
@@ -622,10 +632,14 @@ fn read_greeting(
             let mut data_line = String::new();
             reader
                 .read_line(&mut data_line)
+                .await
                 .context("reading progress event data")?;
             // Consume blank separator line.
             let mut blank = String::new();
-            reader.read_line(&mut blank).ok();
+            reader
+                .read_line(&mut blank)
+                .await
+                .context("reading progress event separator")?;
 
             if let Some(cb) = on_progress {
                 if let Some(msg) = data_line.trim().strip_prefix("data: ") {

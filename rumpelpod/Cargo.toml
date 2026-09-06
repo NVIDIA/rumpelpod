@@ -62,7 +62,7 @@ tower-service = ">= 0"
 futures-core = ">= 0"
 futures-util = ">= 0"
 tokio-stream = ">= 0"
-tokio-util = { version = ">= 0", features = ["io", "io-util"] }
+tokio-util = { version = ">= 0", features = ["io", "io-util", "rt"] }
 comfy-table = ">= 0"
 vt100 = ">= 0"
 kube = { version = ">= 0", features = ["client", "ws", "rustls-tls"] }

@@ -1,17 +1,21 @@
-Reproduce hangs after abandoned pod launches
+Allow recovery from stalled pod startup
 
-Readiness waits can retain a pod's lifecycle lock after the launching
-CLI exits. An open event stream without a state greeting, or retries
-after the container stops, then block later delete and enter requests
-forever.
+Abandoned launches retained lifecycle locks while retrying readiness
+forever, preventing enter and delete from recovering stopped containers.
+Silent startup streams could also block deletion of a running container.
 
-Use a controlled startup hook to reproduce both states without assuming
-what originally stalled the affected pods. A passing release control
-checks the fixture, while three regression tests require recovery within
-15 seconds and currently fail against the unfixed daemon. Bound and reap
-test commands so these failures report the hang instead of hanging the
-test runner. No production behavior is changed.
+Let explicit deletion cancel readiness before acquiring the lifecycle
+lock. Cancel queued operations so they cannot recreate the deleted pod.
+Propagate readiness cancellation before recreation rebuilds the pod.
+Keep CLI disconnection from cancelling background startup. Fail a launch
+when its established readiness stream breaks; bound initial connection
+attempts and idle reads. Startup heartbeats allow long lifecycle
+commands to remain live without an overall setup deadline.
 
-Validation: all four required smoke filters passed via cargo pipeline.
-cargo pipeline readiness_wait passed the release control and reproduced
-all three hangs on both attempts, with no test runner timeouts.
+Integration tests cover abandoned launches, stopped containers, explicit
+deletion with a paused server, automatic failure without another CLI
+command, and healthy setup that outlasts the transport timeout.
+
+Validation: required smoke filters, readiness_wait, and fork_smoke_test
+passed via cargo pipeline. The full cargo pipeline --continue run passed
+586 tests with two skips and no failures or timeouts.

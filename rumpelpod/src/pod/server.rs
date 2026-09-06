@@ -847,6 +847,9 @@ async fn events_handler(State(state): State<PodServerState>) -> Response {
     let tx_setup = tx.clone();
     let state_for_task = state.clone();
     tokio::spawn(async move {
+        // Setup may be silent for minutes. Heartbeats distinguish a live
+        // lifecycle command from a broken transport during readiness polling.
+        let mut keepalive = tokio::time::interval(Duration::from_secs(10));
         // Stream setup progress until the setup task finishes.
         // If setup already completed before this connection, the
         // loop body never runs.
@@ -864,6 +867,11 @@ async fn events_handler(State(state): State<PodServerState>) -> Response {
                 msg = progress_rx.recv() => {
                     let Ok(msg) = msg else { break };
                     if tx_setup.send(sse_event("progress", &msg)).await.is_err() {
+                        return;
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if tx_setup.send(sse_event("keepalive", "{}")).await.is_err() {
                         return;
                     }
                 }
