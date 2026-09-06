@@ -20,6 +20,10 @@ use crate::executor::ExecutorResources;
 /// Pinned pi version for deterministic tests.
 pub(super) const PI_VERSION: &str = "0.82.0";
 
+// Keep the runtime aligned with .devcontainer/Dockerfile. Wolfi's rolling
+// Node packages can require a newer glibc than the cached test base image.
+const NODE_VERSION: &str = "22.23.1";
+
 /// Write a devcontainer that installs Node.js and the pinned pi CLI.
 ///
 /// pi is a Node.js program, so the image needs a node runtime.  We
@@ -28,7 +32,18 @@ pub(super) const PI_VERSION: &str = "0.82.0";
 /// does not depend on a `pi` binary being present on the test host.
 fn write_pi_test_devcontainer(repo: &TestRepo) {
     let extra_dockerfile = formatdoc! {r#"
-        RUN apk add --no-cache nodejs npm
+        RUN apk add --no-cache curl libstdc++
+        RUN case "$(uname -m)" in \
+                x86_64) NODE_ARCH=x64; NODE_SHA256=7a8cb04b4a1df4eaf432125324b81b29a088e73570a23259a8de1c65d07fc129 ;; \
+                aarch64) NODE_ARCH=arm64; NODE_SHA256=543fa39e57d4c07855939459a323f4deb9a79dd1bb45e6e99458b0f2de10db8d ;; \
+                *) echo "unsupported Node architecture: $(uname -m)" >&2; exit 1 ;; \
+            esac && \
+            curl -fsSL "https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-linux-$NODE_ARCH.tar.gz" \
+                -o /tmp/node.tar.gz && \
+            echo "$NODE_SHA256  /tmp/node.tar.gz" | sha256sum -c - && \
+            tar xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 && \
+            rm /tmp/node.tar.gz && \
+            node --version && npm --version
         RUN npm install -g --ignore-scripts {PI_NPM_PACKAGE}@{PI_VERSION}
     "#, PI_NPM_PACKAGE = "@earendil-works/pi-coding-agent"};
 
