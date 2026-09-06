@@ -244,6 +244,100 @@ fn workspace_clone_skip_preserves_files_without_a_baked_checkout() {
 }
 
 #[test]
+fn workspace_clone_skip_fork_inherits_repository_setup() {
+    let repo = TestRepo::new();
+    Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/original.git",
+        ])
+        .current_dir(repo.path())
+        .success()
+        .unwrap();
+    write_test_devcontainer(&repo, &format!("RUN rm -rf {TEST_REPO_PATH}"), "");
+
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(
+        repo.path().join(".rumpelpod.json"),
+        merge_config(
+            &executor.json,
+            json!({
+                "build": {"workspaceClone": {"mode": "skip"}},
+                "merge": {"descriptionFile": "MERGE_MSG"}
+            }),
+        ),
+    )
+    .unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "source", "--", "true"])
+        .success()
+        .unwrap();
+
+    // A fork uses the source pod's setup, including after a server restart,
+    // even if the host configuration has since changed.
+    Command::new("git")
+        .args([
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.invalid/changed.git",
+        ])
+        .current_dir(repo.path())
+        .success()
+        .unwrap();
+    fs::write(
+        repo.path().join(".rumpelpod.json"),
+        merge_config(
+            &executor.json,
+            json!({
+                "build": {"workspaceClone": {"mode": "skip"}},
+                "merge": {"description": "off"}
+            }),
+        ),
+    )
+    .unwrap();
+    pod_command(&repo, &daemon)
+        .args(["stop", "source"])
+        .success()
+        .unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "source", "--", "true"])
+        .success()
+        .unwrap();
+    pod_command(&repo, &daemon)
+        .args(["fork", "source", "forked"])
+        .success()
+        .unwrap();
+
+    let output = pod_command(&repo, &daemon)
+        .args([
+            "enter", "forked", "--", "git", "remote", "get-url", "origin",
+        ])
+        .success()
+        .unwrap();
+    assert_eq!(output, b"https://example.invalid/original.git\n");
+    let rejected = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "forked",
+            "--",
+            "git",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Needs a description",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("MERGE_MSG is not staged"));
+}
+
+#[test]
 fn workspace_clone_rejects_invalid_configuration() {
     let repo = TestRepo::new();
     for invalid in [

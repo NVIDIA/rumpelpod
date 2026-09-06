@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
+use indoc::formatdoc;
 use serde::{Deserialize, Serialize};
 
 use crate::command_ext::CommandExt;
-use crate::git::GitIdentity;
+use crate::git::{GitIdentity, GitRemote};
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -38,6 +39,8 @@ pub struct GitSetupRequest {
     pub primary: String,
     /// Git user identity from the host to write into the pod's .git/config.
     pub git_identity: Option<GitIdentity>,
+    pub remotes: Vec<GitRemote>,
+    pub description_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,12 +86,46 @@ const HOOK_SIGNATURE: &str = "Installed by rumpelpod (pod)";
 // Git setup
 // ---------------------------------------------------------------------------
 
+/// Return whether the repository was created so image-supplied files can be
+/// preserved instead of sanitized as an existing checkout.
+pub(crate) fn initialize_repository(repo_path: &Path) -> Result<bool> {
+    if repo_path
+        .join(".git")
+        .try_exists()
+        .context("checking for an existing repository")?
+    {
+        return Ok(false);
+    }
+    Command::new("git")
+        .arg("init")
+        .arg(repo_path)
+        .success()
+        .context("initializing repository for the host fetch")?;
+    Ok(true)
+}
+
 pub fn setup_git_impl(req: &GitSetupRequest) -> Result<()> {
     let repo_path = &req.repo_path;
     let pod_name = &req.pod_name;
     let token = &req.token;
     let push_refspec = format!("+refs/heads/*:refs/rumpelpod/*@{pod_name}");
     let repo_url = &req.url;
+
+    configure_remotes(repo_path, &req.remotes)?;
+    if let Some(description_file) = &req.description_file {
+        install_pre_commit_hook(repo_path, description_file)?;
+    }
+    // Forks need the source pod's policy even if host settings have changed
+    // or the pod server has restarted. An empty value means no DESCRIPTION policy.
+    Command::new("git")
+        .args([
+            "config",
+            "rumpelpod.description-file",
+            req.description_file.as_deref().unwrap_or(""),
+        ])
+        .current_dir(repo_path)
+        .success()
+        .context("recording description policy for forks")?;
 
     // Set up gateway remotes. `host` fetches branches directly from
     // the host repo; `rumpelpod` pushes pod branches back through the
@@ -231,6 +268,104 @@ pub(crate) fn refresh_gateway_urls_impl(req: &GitGatewayRefreshRequest) -> Resul
     let repo_url = format!("{}/rumpelpod.git", req.base_url);
     configure_gateway_urls(&req.repo_path, &repo_url, &req.token)?;
     refresh_submodule_gateway_urls(&req.repo_path, &req.base_url, &req.token)?;
+    Ok(())
+}
+
+const MANAGED_REMOTES: &[&str] = &["host", "rumpelpod"];
+
+/// Write `.git/hooks/pre-commit` in the cloned repo.  The hook fails
+/// the commit when the DESCRIPTION file is missing or not formatted
+/// like a git commit message.  Signed with a distinct comment so the
+/// host-hook stripper and the pod-side reference-transaction installer
+/// leave it alone.
+fn install_pre_commit_hook(repo_path: &Path, description_file: &str) -> Result<()> {
+    let hooks_dir = repo_path.join(".git/hooks");
+    std::fs::create_dir_all(&hooks_dir).with_context(|| {
+        let p = hooks_dir.display();
+        format!("creating hooks dir {p}")
+    })?;
+    let hook_path = hooks_dir.join("pre-commit");
+
+    // Single-quote the path for the shell and escape any embedded
+    // single quotes so a config-supplied path cannot inject commands.
+    let escaped = description_file.replace('\'', "'\\''");
+    let content = formatdoc! {"
+        #!/bin/sh
+        # Installed by rumpelpod (pod pre-commit)
+        exec /opt/rumpelpod/bin/rumpel git-hook pre-commit-description --file '{escaped}'
+    "};
+
+    std::fs::write(&hook_path, content).with_context(|| {
+        let p = hook_path.display();
+        format!("writing pre-commit hook {p}")
+    })?;
+    let mut perms = std::fs::metadata(&hook_path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook_path, perms).with_context(|| {
+        let p = hook_path.display();
+        format!("setting mode on {p}")
+    })?;
+    Ok(())
+}
+
+/// Apply the original repository remotes before adding gateway remotes.
+///
+/// Also removes any pre-existing remotes (from the base image) that
+/// are not in the provided list and not rumpelpod-managed.
+fn configure_remotes(repo_path: &Path, remotes: &[GitRemote]) -> Result<()> {
+    if remotes.is_empty() {
+        return Ok(());
+    }
+
+    // List existing remotes in the repo.
+    let existing_output = Command::new("git")
+        .args(["remote"])
+        .current_dir(repo_path)
+        .success()
+        .context("listing existing remotes")?;
+    let existing: Vec<&str> = std::str::from_utf8(&existing_output)
+        .context("non-UTF-8 remote names")?
+        .lines()
+        .collect();
+
+    let managed = MANAGED_REMOTES;
+
+    // Remove stale remotes that are not in the host list and not managed.
+    for name in &existing {
+        if managed.contains(name) {
+            continue;
+        }
+        if !remotes.iter().any(|remote| remote.name == *name) {
+            Command::new("git")
+                .args(["remote", "remove", name])
+                .current_dir(repo_path)
+                .success()
+                .with_context(|| format!("removing remote '{name}'"))?;
+        }
+    }
+
+    // Add or update remotes from the host.
+    for remote in remotes {
+        let name = remote.name.as_str();
+        let url = remote.url.as_str();
+        if managed.contains(&name) {
+            continue;
+        }
+        if existing.contains(&name) {
+            Command::new("git")
+                .args(["remote", "set-url", name, url])
+                .current_dir(repo_path)
+                .success()
+                .with_context(|| format!("setting URL for remote '{name}'"))?;
+        } else {
+            Command::new("git")
+                .args(["remote", "add", name, url])
+                .current_dir(repo_path)
+                .success()
+                .with_context(|| format!("adding remote '{name}'"))?;
+        }
+    }
+
     Ok(())
 }
 

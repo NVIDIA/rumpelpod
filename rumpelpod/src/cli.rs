@@ -780,10 +780,6 @@ pub struct PrepareImageCommand {
     #[arg(long)]
     pub grok_version: Option<String>,
 
-    /// Host git remote to configure (NAME=URL, repeatable)
-    #[arg(long = "remote")]
-    pub remotes: Vec<String>,
-
     /// Absolute path at which docker or k8s will later mount a volume,
     /// tmpfs, or bind source.  Pre-created and chowned to `--user` so
     /// docker does not synthesize a root-owned target at container
