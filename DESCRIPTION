@@ -1,0 +1,17 @@
+Reproduce hangs after abandoned pod launches
+
+Readiness waits can retain a pod's lifecycle lock after the launching
+CLI exits. An open event stream without a state greeting, or retries
+after the container stops, then block later delete and enter requests
+forever.
+
+Use a controlled startup hook to reproduce both states without assuming
+what originally stalled the affected pods. A passing release control
+checks the fixture, while three regression tests require recovery within
+15 seconds and currently fail against the unfixed daemon. Bound and reap
+test commands so these failures report the hang instead of hanging the
+test runner. No production behavior is changed.
+
+Validation: all four required smoke filters passed via cargo pipeline.
+cargo pipeline readiness_wait passed the release control and reproduced
+all three hangs on both attempts, with no test runner timeouts.

@@ -53,6 +53,8 @@ mod pipeline;
 mod podman;
 #[path = "cli/prune.rs"]
 mod prune;
+#[path = "cli/readiness_wait.rs"]
+mod readiness_wait;
 #[path = "cli/recreate.rs"]
 mod recreate;
 #[path = "cli/review.rs"]
