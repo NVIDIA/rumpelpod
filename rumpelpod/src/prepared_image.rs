@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Build a "prepared" Docker image that pre-installs the rumpel binary,
-//! a repo clone, and locally available coding agent CLIs on top of the
+//! an optional repo clone, and locally available coding agent CLIs on top of the
 //! resolved devcontainer image. This avoids repeating expensive setup steps
 //! every time a container is created.
 
@@ -18,11 +18,12 @@ use indoc::{formatdoc, indoc};
 use nix::fcntl::{AtFlags, AT_FDCWD};
 use nix::unistd::{Gid, Uid};
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::cli::PrepareImageCommand;
-use crate::config::{ContainerEngine, Host};
+use crate::config::{ContainerEngine, Host, RepoCloneMode};
 use crate::git::GitRemote;
 use crate::image::{BuildOutputFn, BuildResult, BuildxMode, Image, OutputLine};
 use crate::CommandExt;
@@ -33,7 +34,7 @@ const CLAUDE_CODE_DIST_BUCKET: &str =
 
 /// Bump this when the Dockerfile template changes in a way that
 /// invalidates previously built prepared images.
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 
 /// File baked into the prepared image listing the container env var
 /// names the daemon resolved from `containerEnv` and `--env-file` at
@@ -46,6 +47,25 @@ pub const CONTAINER_ENV_KEYS_PATH: &str = "/opt/rumpelpod/container-env-keys";
 /// Where the host .git dir is bind-mounted during `docker build`.
 /// Must match the `--mount` target in `generate_dockerfile`.
 const BUILD_GIT_DIR_PATH: &str = "/tmp/host-git-dir";
+
+const REPO_SETUP_PATH: &str = "/opt/rumpelpod/repo-setup.json";
+
+/// Repositories created at startup need the same setup as baked checkouts.
+#[derive(Serialize, Deserialize)]
+struct RepoSetup {
+    remotes: Vec<String>,
+    description_file: Option<String>,
+}
+
+impl RepoSetup {
+    fn apply(&self, repo_path: &Path) -> Result<()> {
+        configure_remotes(repo_path, &self.remotes)?;
+        if let Some(description_file) = &self.description_file {
+            install_pre_commit_hook(repo_path, description_file)?;
+        }
+        Ok(())
+    }
+}
 
 const CLI_DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -364,7 +384,7 @@ pub(crate) fn find_rumpel_binary(architecture: &str) -> Result<PathBuf> {
 
 /// Compute a deterministic tag for the prepared image.
 ///
-/// Inputs hashed: base image tag, rumpel version, container repo path,
+/// Inputs hashed: base image tag, clone mode, rumpel version, container repo path,
 /// user, coding agent CLI versions (if available),
 /// user-configured remotes, schema version, and the resolved
 /// `containerEnv` key set (names only, not values, so changing a value
@@ -372,6 +392,7 @@ pub(crate) fn find_rumpel_binary(architecture: &str) -> Result<PathBuf> {
 #[allow(clippy::too_many_arguments)]
 fn compute_prepared_tag(
     base_image: &str,
+    repo_clone: RepoCloneMode,
     container_repo_path: &Path,
     container_user: &str,
     user_id_update: Option<RemoteUserIdUpdate>,
@@ -388,6 +409,11 @@ fn compute_prepared_tag(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base_image.as_bytes());
+    let clone_mode = match repo_clone {
+        RepoCloneMode::Local => "local",
+        RepoCloneMode::Skip => "skip",
+    };
+    hasher.update(format!("\0repo-clone={clone_mode}\0").as_bytes());
     hasher.update(RUMPEL_VERSION_INFO.as_bytes());
     hasher.update(container_repo_path.as_os_str().as_encoded_bytes());
     hasher.update(container_user.as_bytes());
@@ -449,8 +475,8 @@ fn compute_prepared_tag(
 
 /// Generate the Dockerfile content for the prepared image.
 ///
-/// The host `.git` dir travels as a `gateway-git/` copy in the build
-/// context, exposed through the `gateway` stage and bind-mounted into
+/// In local clone mode, the host `.git` dir travels as a `gateway-git/`
+/// copy in the build context, exposed through the `gateway` stage and bind-mounted into
 /// the prepare-image step, so its contents never end up in a layer of
 /// the prepared image.  A named build context would avoid the copy but
 /// Podman's remote API does not transfer additional build contexts, so
@@ -462,6 +488,7 @@ fn compute_prepared_tag(
 #[allow(clippy::too_many_arguments)]
 fn generate_dockerfile(
     base_image: &str,
+    repo_clone: RepoCloneMode,
     container_repo_path: &Path,
     container_user: &str,
     user_id_update: Option<RemoteUserIdUpdate>,
@@ -476,6 +503,19 @@ fn generate_dockerfile(
 ) -> String {
     let repo_path = container_repo_path.display();
     let rumpel = crate::daemon::RUMPEL_CONTAINER_BIN;
+
+    let (gateway_stage, repo_mount, clone_mode) = match repo_clone {
+        RepoCloneMode::Local => (
+            indoc! {"
+                FROM scratch AS gateway
+                COPY gateway-git/ /
+
+            "},
+            format!("--mount=type=bind,from=gateway,target={BUILD_GIT_DIR_PATH} "),
+            "local",
+        ),
+        RepoCloneMode::Skip => ("", String::new(), "skip"),
+    };
 
     let claude_flag = match claude_info {
         Some(info) => format!(" \\\n      --claude-version '{}'", info.version),
@@ -542,10 +582,7 @@ fn generate_dockerfile(
     // sessions -- switch_user() handles dropping to the container
     // user in-pod.
     formatdoc! {r#"
-        FROM scratch AS gateway
-        COPY gateway-git/ /
-
-        FROM {base_image}
+        {gateway_stage}FROM {base_image}
 
         ARG TARGETARCH
         ARG BASE_USER=root
@@ -555,9 +592,10 @@ fn generate_dockerfile(
         COPY devcontainer.json /opt/rumpelpod/devcontainer.json
         COPY container-env-keys {CONTAINER_ENV_KEYS_PATH}
 
-        RUN --mount=type=bind,from=gateway,target={BUILD_GIT_DIR_PATH} \
+        RUN {repo_mount}\
             {rumpel} prepare-image \
               --repo-path '{repo_path}' \
+              --repo-clone '{clone_mode}' \
               --user '{container_user}'{prepare_image_flags}
 
         USER ${{BASE_USER}}
@@ -566,11 +604,14 @@ fn generate_dockerfile(
 
 /// Assemble the build context directory with the Dockerfile and binaries.
 ///
-/// The host `.git` dir is not staged here; the caller copies it in
-/// afterwards (see `copy_git_dir_into_context`).
+/// Skip mode must not read or transfer the host Git directory, even when
+/// the base image has no checkout.
 #[allow(clippy::too_many_arguments)]
 fn assemble_build_context(
     base_image: &str,
+    repo_clone: RepoCloneMode,
+    git_dir: &Path,
+    binaries: &[(String, PathBuf)],
     container_repo_path: &Path,
     container_user: &str,
     user_id_update: Option<RemoteUserIdUpdate>,
@@ -587,6 +628,7 @@ fn assemble_build_context(
 ) -> Result<tempfile::TempDir> {
     let dockerfile = generate_dockerfile(
         base_image,
+        repo_clone,
         container_repo_path,
         container_user,
         user_id_update,
@@ -599,8 +641,6 @@ fn assemble_build_context(
         inject_system_prompt,
         description_file,
     );
-    let binaries = find_rumpel_binaries()?;
-
     // TODO: BuildKit's incremental context transfer is keyed to the
     // context path, so a fresh temp dir per build means every
     // cache-miss build re-transfers the whole context, including
@@ -611,7 +651,7 @@ fn assemble_build_context(
     let tmp = tempfile::tempdir().context("creating build context temp dir")?;
     fs::write(tmp.path().join("Dockerfile"), dockerfile)
         .context("writing Dockerfile to build context")?;
-    for (name, path) in &binaries {
+    for (name, path) in binaries {
         fs::copy(path, tmp.path().join(name)).with_context(|| {
             let path = path.display();
             format!("copying {path} to build context")
@@ -631,6 +671,11 @@ fn assemble_build_context(
     }
     fs::write(tmp.path().join("container-env-keys"), keys_file)
         .context("writing container-env-keys to build context")?;
+
+    match repo_clone {
+        RepoCloneMode::Local => copy_git_dir_into_context(git_dir, tmp.path())?,
+        RepoCloneMode::Skip => {}
+    }
 
     Ok(tmp)
 }
@@ -695,7 +740,7 @@ fn ensure_buildable_tag(
 /// Build (or reuse a cached) prepared image on top of `base_image`.
 ///
 /// The prepared image includes the rumpel binary, a git clone of the
-/// repo from the host `.git` dir, and optionally the Claude CLI.
+/// repo from the host `.git` dir when enabled, and optionally the Claude CLI.
 ///
 /// Returns a `BuildResult` indicating the final image tag and whether
 /// a build actually ran.
@@ -717,6 +762,7 @@ pub fn build_prepared_image(
     base_image: &Image,
     docker_host: &Host,
     git_dir: &Path,
+    repo_clone: RepoCloneMode,
     container_repo_path: &Path,
     container_user: Option<&str>,
     requested_user_id_update: Option<RemoteUserIdUpdate>,
@@ -795,6 +841,7 @@ pub fn build_prepared_image(
 
     let tag = compute_prepared_tag(
         &base_image.0,
+        repo_clone,
         container_repo_path,
         container_user,
         user_id_update,
@@ -840,6 +887,9 @@ pub fn build_prepared_image(
 
     let build_ctx = assemble_build_context(
         &buildable_base,
+        repo_clone,
+        git_dir,
+        &find_rumpel_binaries()?,
         container_repo_path,
         container_user,
         user_id_update,
@@ -854,8 +904,6 @@ pub fn build_prepared_image(
         raw_devcontainer_json,
         container_env_keys,
     )?;
-    copy_git_dir_into_context(git_dir, build_ctx.path())?;
-
     let mut extra_args = vec![format!("--build-arg=BASE_USER={image_user}")];
     extra_args.extend(build_options.iter().cloned());
 
@@ -1076,7 +1124,7 @@ fn update_remote_user_ids(user: &str, requested: RemoteUserIdUpdate) -> Result<(
     Ok(())
 }
 
-/// Clone the repo and optionally install the Claude CLI.
+/// Prepare a workspace and install the requested coding agent CLIs.
 ///
 /// Invoked as a Dockerfile RUN step after the rumpel binary itself has
 /// been copied in.  Replaces what used to be shell scripting.
@@ -1107,21 +1155,35 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
         ));
     }
 
-    if !cmd.repo_path.join(".git").exists() {
-        let status = Command::new("git")
-            .args(["clone", &format!("file://{BUILD_GIT_DIR_PATH}")])
-            .arg(&cmd.repo_path)
-            .status()
-            .context("cloning repository from build-time git dir")?;
-        if !status.success() {
-            return Err(anyhow::anyhow!("git clone failed"));
+    let mut has_repo = cmd
+        .repo_path
+        .join(".git")
+        .try_exists()
+        .context("checking for a baked repository")?;
+    if !has_repo {
+        match cmd.repo_clone {
+            RepoCloneMode::Local => {
+                Command::new("git")
+                    .args(["clone", &format!("file://{BUILD_GIT_DIR_PATH}")])
+                    .arg(&cmd.repo_path)
+                    .success()
+                    .context("cloning repository from build-time git dir")?;
+                has_repo = true;
+            }
+            RepoCloneMode::Skip => {
+                // Startup runs as the container user, who must own the workspace
+                // even when its parent directory is only writable by root.
+                fs::create_dir_all(&cmd.repo_path).context("creating workspace directory")?;
+            }
         }
     }
 
     // If the base image already had a .git (e.g. from COPY), it may
     // contain host-side hooks that reference binaries outside the
     // container.  Remove them so the pod server can install its own.
-    remove_host_hooks(&cmd.repo_path)?;
+    if has_repo {
+        remove_host_hooks(&cmd.repo_path)?;
+    }
 
     // Ensure the repo is owned by the container user.  The base image
     // may have created it under a different UID (e.g. COPY --chown).
@@ -1159,9 +1221,15 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
         return Err(anyhow::anyhow!("git config safe.directory failed"));
     }
 
-    // Configure host remotes in the cloned repo so they match the
-    // host's configuration from the start.
-    configure_remotes(&cmd.repo_path, &cmd.remotes)?;
+    let repo_setup = RepoSetup {
+        remotes: cmd.remotes.clone(),
+        description_file: cmd.description_file.clone(),
+    };
+    fs::write(REPO_SETUP_PATH, serde_json::to_vec(&repo_setup)?)
+        .context("saving repository setup for container startup")?;
+    if has_repo {
+        repo_setup.apply(&cmd.repo_path)?;
+    }
 
     if let Some(ref version) = cmd.claude_version {
         install_claude_cli(version)?;
@@ -1192,10 +1260,6 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
         }
     }
 
-    if let Some(ref description_file) = cmd.description_file {
-        install_pre_commit_hook(&cmd.repo_path, description_file)?;
-    }
-
     // Record the resolved container user so container-exec and
     // container-serve can switch to it at runtime.
     fs::write(crate::switch_user::USER_FILE, &cmd.user)
@@ -1215,6 +1279,29 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
     create_mount_targets(&cmd.mount_targets, &cmd.user)?;
 
     Ok(())
+}
+
+/// Return whether Git was initialized so startup can preserve files that were
+/// supplied by the image without being part of a baked checkout.
+pub(crate) fn initialize_repository(repo_path: &Path) -> Result<bool> {
+    if repo_path
+        .join(".git")
+        .try_exists()
+        .context("checking for an existing repository")?
+    {
+        return Ok(false);
+    }
+
+    let config = fs::read(REPO_SETUP_PATH).context("reading baked repository setup")?;
+    let repo_setup: RepoSetup =
+        serde_json::from_slice(&config).context("parsing baked repository setup")?;
+    Command::new("git")
+        .arg("init")
+        .arg(repo_path)
+        .success()
+        .context("initializing repository for the host fetch")?;
+    repo_setup.apply(repo_path)?;
+    Ok(true)
 }
 
 /// Pre-create each mount target directory owned by the container user.
@@ -1453,9 +1540,9 @@ fn configure_remotes(repo_path: &Path, remote_specs: &[String]) -> Result<()> {
     let existing_output = Command::new("git")
         .args(["remote"])
         .current_dir(repo_path)
-        .output()
+        .success()
         .context("listing existing remotes")?;
-    let existing: Vec<&str> = std::str::from_utf8(&existing_output.stdout)
+    let existing: Vec<&str> = std::str::from_utf8(&existing_output)
         .context("non-UTF-8 remote names")?
         .lines()
         .collect();
@@ -1471,7 +1558,7 @@ fn configure_remotes(repo_path: &Path, remote_specs: &[String]) -> Result<()> {
             Command::new("git")
                 .args(["remote", "remove", name])
                 .current_dir(repo_path)
-                .status()
+                .success()
                 .with_context(|| format!("removing remote '{name}'"))?;
         }
     }
@@ -1485,13 +1572,13 @@ fn configure_remotes(repo_path: &Path, remote_specs: &[String]) -> Result<()> {
             Command::new("git")
                 .args(["remote", "set-url", name, url])
                 .current_dir(repo_path)
-                .status()
+                .success()
                 .with_context(|| format!("setting URL for remote '{name}'"))?;
         } else {
             Command::new("git")
                 .args(["remote", "add", name, url])
                 .current_dir(repo_path)
-                .status()
+                .success()
                 .with_context(|| format!("adding remote '{name}'"))?;
         }
     }
@@ -2014,6 +2101,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repo_clone_skip_context_does_not_read_host_git() {
+        let temp = tempfile::tempdir().expect("create test directory");
+        let git_dir = temp.path().join("missing-host-git");
+        let binary = temp.path().join("rumpel");
+        fs::write(&binary, "test binary").expect("write binary fixture");
+        let context = assemble_build_context(
+            "example:latest",
+            RepoCloneMode::Skip,
+            &git_dir,
+            &[("rumpel-linux-amd64".to_string(), binary)],
+            Path::new("/workspace"),
+            "root",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            None,
+            "{}",
+            &[],
+        )
+        .expect("skip builds must not need the host Git directory");
+        assert!(!context.path().join("gateway-git").exists());
+        let dockerfile = fs::read_to_string(context.path().join("Dockerfile"))
+            .expect("read generated Dockerfile");
+        assert!(!dockerfile.contains("gateway"), "{dockerfile}");
+        assert!(!dockerfile.contains(BUILD_GIT_DIR_PATH), "{dockerfile}");
+    }
+
+    #[test]
     fn codex_version_changes_prepared_image_tag() {
         let first = LocalCodexInfo {
             version: "0.145.0".to_string(),
@@ -2024,6 +2144,7 @@ mod tests {
         let tag = |codex_info| {
             compute_prepared_tag(
                 "example:latest",
+                RepoCloneMode::Local,
                 Path::new("/workspace"),
                 "root",
                 None,
@@ -2054,6 +2175,7 @@ mod tests {
         let tag = |grok_info| {
             compute_prepared_tag(
                 "example:latest",
+                RepoCloneMode::Local,
                 Path::new("/workspace"),
                 "root",
                 None,
@@ -2117,6 +2239,7 @@ mod tests {
         };
         let dockerfile = generate_dockerfile(
             "example:latest",
+            RepoCloneMode::Local,
             Path::new("/workspace"),
             "root",
             None,

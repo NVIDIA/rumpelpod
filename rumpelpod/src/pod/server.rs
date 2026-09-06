@@ -412,13 +412,19 @@ fn run_setup(
     if let Some(ref params) = git_setup {
         let git_http_url = format!("{tunnel_base_url}/rumpelpod.git");
 
+        let initialized = crate::prepared_image::initialize_repository(repo_path)
+            .expect("repository initialization failed");
+
         let hook_path = repo_path.join(".git/hooks/reference-transaction");
         match std::fs::metadata(&hook_path) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Clean baked checkouts can carry warm build caches whose mtimes
-                // are part of cache validity.
-                if git_setup::needs_sanitize_impl(repo_path).expect("sanitize check failed") {
+                // A fresh repository may contain image-supplied files. Preserve
+                // them and let checkout reject conflicts instead of deleting them.
+                // Clean baked checkouts also retain cache-sensitive mtimes.
+                if !initialized
+                    && git_setup::needs_sanitize_impl(repo_path).expect("sanitize check failed")
+                {
                     progress("sanitizing repository...");
                     git_setup::sanitize_impl(repo_path).expect("sanitize failed");
                 }
