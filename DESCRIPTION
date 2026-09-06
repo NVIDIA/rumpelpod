@@ -1,0 +1,19 @@
+Pin Pi test Node to prevent glibc drift
+
+The cached Wolfi test image provides glibc 2.43, but installing nodejs
+from the live APK repository now selects Node 26.8.1, which requires
+GLIBC_2.44. APK accepts the installed libc, so npm fails before Pi can
+be installed. The pinned Pi version does not pin its system Node
+runtime.
+
+Use the official Node 22.23.1 archive, matching the development
+container, with committed SHA-256 checksums for x86_64 and aarch64. This
+also pins the bundled npm and avoids the newer libc requirement of
+Wolfi's Node build. Pi remains at 0.82.0 with its published
+npm-shrinkwrap locking dependencies.
+
+Validation: reproduced the original pi_smoke failure, then passed all
+five Pi integration tests and enter_smoke_test,
+enter_verifies_user_and_repo_path, claude_smoke, and
+gateway_pod_commit_triggers_push through cargo pipeline. Formatting,
+builds, and clippy also passed.
