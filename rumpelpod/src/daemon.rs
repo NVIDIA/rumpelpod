@@ -3859,7 +3859,7 @@ impl DaemonServer {
         };
         let host_remotes = crate::git::get_remotes(&repo_path).unwrap_or_default();
         let build_options = devcontainer.build_options();
-        let repo_clone = load_json_config(&repo_path)?.build.repo_clone.mode;
+        let workspace_clone = load_json_config(&repo_path)?.build.workspace_clone.mode;
         let compose_agent_has_bind_mount = match (&compose_model, &agent_service) {
             (Some(model), Some(service)) => model.service_has_bind_mount(service)?,
             (None, None) => false,
@@ -3912,7 +3912,7 @@ impl DaemonServer {
             &base_image,
             &docker_host,
             &git_dir,
-            repo_clone,
+            workspace_clone,
             &container_repo_path,
             prepared_user,
             user_id_update,

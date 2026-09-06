@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::cli::PrepareImageCommand;
-use crate::config::{ContainerEngine, Host, RepoCloneMode};
+use crate::config::{ContainerEngine, Host, WorkspaceCloneMode};
 use crate::git::GitRemote;
 use crate::image::{BuildOutputFn, BuildResult, BuildxMode, Image, OutputLine};
 use crate::CommandExt;
@@ -392,7 +392,7 @@ pub(crate) fn find_rumpel_binary(architecture: &str) -> Result<PathBuf> {
 #[allow(clippy::too_many_arguments)]
 fn compute_prepared_tag(
     base_image: &str,
-    repo_clone: RepoCloneMode,
+    workspace_clone: WorkspaceCloneMode,
     container_repo_path: &Path,
     container_user: &str,
     user_id_update: Option<RemoteUserIdUpdate>,
@@ -409,11 +409,11 @@ fn compute_prepared_tag(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base_image.as_bytes());
-    let clone_mode = match repo_clone {
-        RepoCloneMode::Local => "local",
-        RepoCloneMode::Skip => "skip",
+    let clone_mode = match workspace_clone {
+        WorkspaceCloneMode::Local => "local",
+        WorkspaceCloneMode::Skip => "skip",
     };
-    hasher.update(format!("\0repo-clone={clone_mode}\0").as_bytes());
+    hasher.update(format!("\0workspace-clone={clone_mode}\0").as_bytes());
     hasher.update(RUMPEL_VERSION_INFO.as_bytes());
     hasher.update(container_repo_path.as_os_str().as_encoded_bytes());
     hasher.update(container_user.as_bytes());
@@ -488,7 +488,7 @@ fn compute_prepared_tag(
 #[allow(clippy::too_many_arguments)]
 fn generate_dockerfile(
     base_image: &str,
-    repo_clone: RepoCloneMode,
+    workspace_clone: WorkspaceCloneMode,
     container_repo_path: &Path,
     container_user: &str,
     user_id_update: Option<RemoteUserIdUpdate>,
@@ -504,8 +504,8 @@ fn generate_dockerfile(
     let repo_path = container_repo_path.display();
     let rumpel = crate::daemon::RUMPEL_CONTAINER_BIN;
 
-    let (gateway_stage, repo_mount, clone_mode) = match repo_clone {
-        RepoCloneMode::Local => (
+    let (gateway_stage, repo_mount, clone_mode) = match workspace_clone {
+        WorkspaceCloneMode::Local => (
             indoc! {"
                 FROM scratch AS gateway
                 COPY gateway-git/ /
@@ -514,7 +514,7 @@ fn generate_dockerfile(
             format!("--mount=type=bind,from=gateway,target={BUILD_GIT_DIR_PATH} "),
             "local",
         ),
-        RepoCloneMode::Skip => ("", String::new(), "skip"),
+        WorkspaceCloneMode::Skip => ("", String::new(), "skip"),
     };
 
     let claude_flag = match claude_info {
@@ -595,7 +595,7 @@ fn generate_dockerfile(
         RUN {repo_mount}\
             {rumpel} prepare-image \
               --repo-path '{repo_path}' \
-              --repo-clone '{clone_mode}' \
+              --workspace-clone '{clone_mode}' \
               --user '{container_user}'{prepare_image_flags}
 
         USER ${{BASE_USER}}
@@ -609,7 +609,7 @@ fn generate_dockerfile(
 #[allow(clippy::too_many_arguments)]
 fn assemble_build_context(
     base_image: &str,
-    repo_clone: RepoCloneMode,
+    workspace_clone: WorkspaceCloneMode,
     git_dir: &Path,
     binaries: &[(String, PathBuf)],
     container_repo_path: &Path,
@@ -628,7 +628,7 @@ fn assemble_build_context(
 ) -> Result<tempfile::TempDir> {
     let dockerfile = generate_dockerfile(
         base_image,
-        repo_clone,
+        workspace_clone,
         container_repo_path,
         container_user,
         user_id_update,
@@ -672,9 +672,9 @@ fn assemble_build_context(
     fs::write(tmp.path().join("container-env-keys"), keys_file)
         .context("writing container-env-keys to build context")?;
 
-    match repo_clone {
-        RepoCloneMode::Local => copy_git_dir_into_context(git_dir, tmp.path())?,
-        RepoCloneMode::Skip => {}
+    match workspace_clone {
+        WorkspaceCloneMode::Local => copy_git_dir_into_context(git_dir, tmp.path())?,
+        WorkspaceCloneMode::Skip => {}
     }
 
     Ok(tmp)
@@ -762,7 +762,7 @@ pub fn build_prepared_image(
     base_image: &Image,
     docker_host: &Host,
     git_dir: &Path,
-    repo_clone: RepoCloneMode,
+    workspace_clone: WorkspaceCloneMode,
     container_repo_path: &Path,
     container_user: Option<&str>,
     requested_user_id_update: Option<RemoteUserIdUpdate>,
@@ -841,7 +841,7 @@ pub fn build_prepared_image(
 
     let tag = compute_prepared_tag(
         &base_image.0,
-        repo_clone,
+        workspace_clone,
         container_repo_path,
         container_user,
         user_id_update,
@@ -887,7 +887,7 @@ pub fn build_prepared_image(
 
     let build_ctx = assemble_build_context(
         &buildable_base,
-        repo_clone,
+        workspace_clone,
         git_dir,
         &find_rumpel_binaries()?,
         container_repo_path,
@@ -1161,8 +1161,8 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
         .try_exists()
         .context("checking for a baked repository")?;
     if !has_repo {
-        match cmd.repo_clone {
-            RepoCloneMode::Local => {
+        match cmd.workspace_clone {
+            WorkspaceCloneMode::Local => {
                 Command::new("git")
                     .args(["clone", &format!("file://{BUILD_GIT_DIR_PATH}")])
                     .arg(&cmd.repo_path)
@@ -1170,7 +1170,7 @@ pub fn run_prepare_image(cmd: &PrepareImageCommand) -> Result<()> {
                     .context("cloning repository from build-time git dir")?;
                 has_repo = true;
             }
-            RepoCloneMode::Skip => {
+            WorkspaceCloneMode::Skip => {
                 // Startup runs as the container user, who must own the workspace
                 // even when its parent directory is only writable by root.
                 fs::create_dir_all(&cmd.repo_path).context("creating workspace directory")?;
@@ -2101,14 +2101,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repo_clone_skip_context_does_not_read_host_git() {
+    fn workspace_clone_skip_context_does_not_read_host_git() {
         let temp = tempfile::tempdir().expect("create test directory");
         let git_dir = temp.path().join("missing-host-git");
         let binary = temp.path().join("rumpel");
         fs::write(&binary, "test binary").expect("write binary fixture");
         let context = assemble_build_context(
             "example:latest",
-            RepoCloneMode::Skip,
+            WorkspaceCloneMode::Skip,
             &git_dir,
             &[("rumpel-linux-amd64".to_string(), binary)],
             Path::new("/workspace"),
@@ -2144,7 +2144,7 @@ mod tests {
         let tag = |codex_info| {
             compute_prepared_tag(
                 "example:latest",
-                RepoCloneMode::Local,
+                WorkspaceCloneMode::Local,
                 Path::new("/workspace"),
                 "root",
                 None,
@@ -2175,7 +2175,7 @@ mod tests {
         let tag = |grok_info| {
             compute_prepared_tag(
                 "example:latest",
-                RepoCloneMode::Local,
+                WorkspaceCloneMode::Local,
                 Path::new("/workspace"),
                 "root",
                 None,
@@ -2239,7 +2239,7 @@ mod tests {
         };
         let dockerfile = generate_dockerfile(
             "example:latest",
-            RepoCloneMode::Local,
+            WorkspaceCloneMode::Local,
             Path::new("/workspace"),
             "root",
             None,

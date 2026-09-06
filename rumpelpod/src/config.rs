@@ -559,19 +559,19 @@ pub struct JsonConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BuildConfig {
     #[serde(default)]
-    pub repo_clone: RepoCloneConfig,
+    pub workspace_clone: WorkspaceCloneConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct RepoCloneConfig {
-    pub mode: RepoCloneMode,
+pub struct WorkspaceCloneConfig {
+    pub mode: WorkspaceCloneMode,
 }
 
 /// The checkout is optional in the image because startup fetches from the host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
-pub enum RepoCloneMode {
+pub enum WorkspaceCloneMode {
     #[default]
     Local,
     Skip,

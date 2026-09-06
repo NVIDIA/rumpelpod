@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 
 use crate::completions::PodNameCompleter;
-use crate::config::{ContainerEngine, Host, RepoCloneMode};
+use crate::config::{ContainerEngine, Host, WorkspaceCloneMode};
 
 /// Validate that a pod name contains only Docker/git-safe characters:
 /// ASCII alphanumeric, hyphens, underscores, and dots.
@@ -750,7 +750,7 @@ pub struct PrepareImageCommand {
 
     /// Seed the image from the host or defer repository creation to startup
     #[arg(long, value_enum, default_value = "local")]
-    pub repo_clone: RepoCloneMode,
+    pub workspace_clone: WorkspaceCloneMode,
 
     /// User to chown the repo to
     #[arg(long)]

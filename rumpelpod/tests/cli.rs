@@ -55,8 +55,6 @@ mod podman;
 mod prune;
 #[path = "cli/recreate.rs"]
 mod recreate;
-#[path = "cli/repo_clone.rs"]
-mod repo_clone;
 #[path = "cli/review.rs"]
 mod review;
 #[path = "cli/setup_progress.rs"]
@@ -72,3 +70,5 @@ mod stop;
 mod systemd;
 #[path = "cli/version.rs"]
 mod version;
+#[path = "cli/workspace_clone.rs"]
+mod workspace_clone;

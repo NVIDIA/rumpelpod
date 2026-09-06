@@ -16,7 +16,7 @@ use crate::common::{
 use crate::executor::{merge_config, ExecutorResources};
 
 #[test]
-fn repo_clone_modes_control_baking_without_changing_startup_sync() {
+fn workspace_clone_modes_control_baking_without_changing_startup_sync() {
     let repo = TestRepo::new();
     fs::write(repo.path().join("tracked.txt"), "available at startup\n").unwrap();
     Command::new("git")
@@ -88,18 +88,18 @@ fn repo_clone_modes_control_baking_without_changing_startup_sync() {
     let home = TestHome::new();
     let executor = ExecutorResources::setup(&home);
     let daemon = TestDaemon::start(&home);
-    // Changing just repoClone must not reuse a prepared image from the
+    // Changing just workspaceClone must not reuse a prepared image from the
     // other mode, while an omitted setting keeps the existing default.
     for (name, settings, baked_mode) in [
         ("default", json!({}), "local\n"),
         (
             "skip",
-            json!({"build": {"repoClone": {"mode": "skip"}}}),
+            json!({"build": {"workspaceClone": {"mode": "skip"}}}),
             "skip\n",
         ),
         (
             "local",
-            json!({"build": {"repoClone": {"mode": "local"}}}),
+            json!({"build": {"workspaceClone": {"mode": "local"}}}),
             "local\n",
         ),
     ] {
@@ -165,7 +165,7 @@ fn repo_clone_modes_control_baking_without_changing_startup_sync() {
 }
 
 #[test]
-fn repo_clone_skip_reuses_baked_checkout() {
+fn workspace_clone_skip_reuses_baked_checkout() {
     let repo = TestRepo::new();
     fs::write(repo.path().join("cached.txt"), "preserve this checkout\n").unwrap();
     Command::new("git")
@@ -186,7 +186,7 @@ fn repo_clone_skip_reuses_baked_checkout() {
         repo.path().join(".rumpelpod.json"),
         merge_config(
             &executor.json,
-            json!({"build": {"repoClone": {"mode": "skip"}}}),
+            json!({"build": {"workspaceClone": {"mode": "skip"}}}),
         ),
     )
     .unwrap();
@@ -207,7 +207,7 @@ fn repo_clone_skip_reuses_baked_checkout() {
 }
 
 #[test]
-fn repo_clone_skip_preserves_files_without_a_baked_checkout() {
+fn workspace_clone_skip_preserves_files_without_a_baked_checkout() {
     let repo = TestRepo::new();
     write_test_devcontainer(
         &repo,
@@ -225,7 +225,7 @@ fn repo_clone_skip_preserves_files_without_a_baked_checkout() {
         repo.path().join(".rumpelpod.json"),
         merge_config(
             &executor.json,
-            json!({"build": {"repoClone": {"mode": "skip"}}}),
+            json!({"build": {"workspaceClone": {"mode": "skip"}}}),
         ),
     )
     .unwrap();
@@ -244,7 +244,7 @@ fn repo_clone_skip_preserves_files_without_a_baked_checkout() {
 }
 
 #[test]
-fn repo_clone_rejects_invalid_configuration() {
+fn workspace_clone_rejects_invalid_configuration() {
     let repo = TestRepo::new();
     for invalid in [
         "false",
@@ -258,14 +258,14 @@ fn repo_clone_rejects_invalid_configuration() {
     ] {
         fs::write(
             repo.path().join(".rumpelpod.json"),
-            format!(r#"{{"build":{{"repoClone":{invalid}}}}}"#),
+            format!(r#"{{"build":{{"workspaceClone":{invalid}}}}}"#),
         )
         .unwrap();
         assert!(load_json_config(repo.path()).is_err(), "accepted {invalid}");
     }
     fs::write(
         repo.path().join(".rumpelpod.json"),
-        indoc! {r#"{"build":{"repoClnoe":{"mode":"skip"}}}"#},
+        indoc! {r#"{"build":{"workspaceClnoe":{"mode":"skip"}}}"#},
     )
     .unwrap();
     assert!(load_json_config(repo.path()).is_err());

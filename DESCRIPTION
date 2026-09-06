@@ -1,6 +1,6 @@
 Allow repository cloning to wait until pod startup
 
-Add build.repoClone in .rumpelpod.json so prepared images can skip
+Add build.workspaceClone in .rumpelpod.json so prepared images can skip
 transferring the host Git directory to the builder. Local cloning
 remains the default, and skip mode reuses checkouts from the base image.
 

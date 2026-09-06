@@ -155,7 +155,7 @@ See [SSH key forwarding](#ssh-key-forwarding).
 
 Rumpelpod derives a per-repo image on top of the configured base image, with a checkout of the repository baked in.
 On container start, only commits that did not exist when the image was built need to be pulled.
-Set [`build.repoClone.mode`](#buildrepoclone) to `"skip"` in `.rumpelpod.json` to omit this build-time clone and the host Git directory from the prepared image's build context.
+Set [`build.workspaceClone.mode`](#buildworkspaceclone) to `"skip"` in `.rumpelpod.json` to omit this build-time clone and the host Git directory from the prepared image's build context.
 The container then initializes the repository and fetches from the host at startup, or reuses a checkout already supplied by the base image.
 However, the first build inside a fresh pod still runs from zero because there are no build caches.
 
@@ -412,12 +412,12 @@ Local state is tracked in a SQLite database under `~/.local/state/rumpelpod/` (o
 It is optional and holds pod-specific settings that have no devcontainer equivalent.
 Like `devcontainer.json`, the file is parsed as [JSON5](https://json5.org/), so comments and trailing commas are allowed.
 
-### `build.repoClone`
+### `build.workspaceClone`
 
 ```json
 {
   "build": {
-    "repoClone": { "mode": "skip" }
+    "workspaceClone": { "mode": "skip" }
   }
 }
 ```
@@ -435,7 +435,7 @@ In `"skip"` mode, the first startup of an image without a checkout transfers the
 The mode does not enable forwarding Git credentials to the builder.
 It does not exclude files from a user-supplied Dockerfile's build context; use the context path and `.dockerignore` to control that separately.
 
-Only the two modes above are supported. `repoClone` must be an object with a `mode`; booleans and unknown modes or fields are rejected.
+Only the two modes above are supported. `workspaceClone` must be an object with a `mode`; booleans and unknown modes or fields are rejected.
 
 ### `devcontainer`
 
