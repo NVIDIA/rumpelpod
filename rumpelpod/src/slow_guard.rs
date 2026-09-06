@@ -15,8 +15,8 @@ const REPEAT_DELAY: Duration = Duration::from_secs(60);
 /// Spawns a tokio task that, after an initial delay, sends `message`
 /// through the channel and repeats every 60 seconds.  Also calls
 /// `log::info!` on each emission so tests using `RUST_LOG=rumpelpod=info`
-/// get timestamped output.  When info-level logging is enabled the
-/// initial delay is zero, making the guard immediately testable.
+/// get timestamped output.  Logging verbosity does not affect the delay
+/// because daemon diagnostics should not make routine CLI operations noisy.
 ///
 /// The task is aborted when the guard is dropped.
 pub struct SlowGuard {
@@ -26,14 +26,8 @@ pub struct SlowGuard {
 impl SlowGuard {
     pub fn new(message: impl Into<String>, tx: tokio::sync::mpsc::Sender<String>) -> Self {
         let message = message.into();
-        let first = if log::log_enabled!(log::Level::Info) {
-            Duration::ZERO
-        } else {
-            FIRST_DELAY
-        };
-
         let task = RUNTIME.spawn(async move {
-            tokio::time::sleep(first).await;
+            tokio::time::sleep(FIRST_DELAY).await;
             loop {
                 log::info!("{message}");
                 if tx.send(message.clone()).await.is_err() {
