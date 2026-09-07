@@ -5643,6 +5643,7 @@ Used by:
   - unicode-ident 1.0.24  (https://github.com/dtolnay/unicode-ident)
   - utf8parse 0.2.2  (https://github.com/alacritty/vte)
   - vte 0.15.0  (https://github.com/alacritty/vte)
+  - wasm-streams 0.4.2  (https://github.com/MattiasBuelens/wasm-streams/)
   - winapi-i686-pc-windows-gnu 0.4.0  (https://github.com/retep998/winapi-rs)
   - winapi-x86_64-pc-windows-gnu 0.4.0  (https://github.com/retep998/winapi-rs)
 Apache License

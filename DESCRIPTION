@@ -1,21 +1,31 @@
-Allow recovery from stalled pod startup
+Make pod startup an owned cancellable task
 
-Abandoned launches retained lifecycle locks while retrying readiness
-forever, preventing enter and delete from recovering stopped containers.
-Silent startup streams could also block deletion of a running container.
+Startup workers could retain lifecycle locks after their clients left,
+blocking recovery from stopped containers and stalled setup commands.
 
-Let explicit deletion cancel readiness before acquiring the lifecycle
-lock. Cancel queued operations so they cannot recreate the deleted pod.
-Propagate readiness cancellation before recreation rebuilds the pod.
-Keep CLI disconnection from cancelling background startup. Fail a launch
-when its established readiness stream breaks; bound initial connection
-attempts and idle reads. Startup heartbeats allow long lifecycle
-commands to remain live without an overall setup deadline.
+Own startup, reconnect, fork, and recreate as async tasks. Delete aborts
+active and queued startup tasks, waits for their destruction, then takes
+the lifecycle lock and removes remaining pod state. Expose pending
+startup before container creation so delete can also cancel initializers
+and image builds. Client disconnection detaches from startup.
 
-Integration tests cover abandoned launches, stopped containers, explicit
-deletion with a paused server, automatic failure without another CLI
-command, and healthy setup that outlasts the transport timeout.
+Await subprocesses and network operations throughout startup while
+keeping filesystem and database work synchronous. Resource guards kill
+cancelled process groups and release temporary files, connections,
+agents, and proxy sessions. Backend cleanup uses the reserved pod name
+when a create request acted before its reply was lost.
 
-Validation: required smoke filters, readiness_wait, and fork_smoke_test
-passed via cargo pipeline. The full cargo pipeline --continue run passed
-586 tests with two skips and no failures or timeouts.
+Bound readiness connection attempts and idle reads. Startup heartbeats
+allow healthy lifecycle commands to run without an overall deadline.
+Fail an established readiness stream when its container disappears.
+
+Regression tests cover abandoned readiness waits, stopped and paused
+containers, queued enters, initializer and builder descendants, host Git
+fetches, failed-start cleanup, and cancellation after container
+creation. Transport tests preserve half-closed SSH responses and partial
+tunnel frames during concurrent events.
+
+Validation: required smoke and feature filters passed via cargo
+pipeline. The full suite and its resumed checks passed 596 tests with
+two skips. macOS validation was unavailable because the macos host did
+not resolve.

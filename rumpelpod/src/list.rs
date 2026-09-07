@@ -69,6 +69,7 @@ pub fn list(cmd: &ListCommand) -> Result<()> {
 
     for pod in pods {
         let status_str = match pod.status {
+            PodStatus::Starting => "starting",
             PodStatus::Running => "running",
             PodStatus::Stopped => "stopped",
             PodStatus::Gone => "gone",

@@ -8,6 +8,7 @@
 //! backend variant is an internal detail.
 
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt as UnixCommandExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
+use crate::async_command::{AsyncCommandExt, ProcessGroup};
 use crate::async_runtime::block_on;
 use crate::config::{ContainerEngine, Host};
 use crate::daemon::default_docker_socket;
@@ -104,7 +106,7 @@ impl Executor {
 
     /// Connect to a remote Podman service through a fresh SSH proxy
     /// owned by this executor.  The daemon uses the per-connection
-    /// proxy via [`Self::new`] instead; this is for CLI-side use where
+    /// proxy via [`Self::new_async`] instead; this is for CLI-side use where
     /// no `HostConnection` exists.
     pub fn podman_ssh(ssh_destination: &str) -> Result<Self> {
         let proxy = Arc::new(crate::executor::PodmanSshProxy::start(ssh_destination)?);
@@ -174,11 +176,12 @@ impl Executor {
     /// client.  Failure surfaces to the caller so commands like
     /// `rumpel enter` can report the underlying transport error
     /// directly.
-    pub fn new(conn: &HostConnection) -> Result<Self> {
+    pub async fn new_async(conn: &HostConnection) -> Result<Self> {
         match conn {
             HostConnection::Localhost(local) => {
                 local
-                    .ensure_connected()
+                    .ensure_connected_async()
+                    .await
                     .context("opening local engine connection")?;
                 match local.engine() {
                     ContainerEngine::Docker => {
@@ -191,7 +194,8 @@ impl Executor {
                 }
             }
             HostConnection::Ssh(ssh) => {
-                ssh.ensure_connected()
+                ssh.ensure_connected_async()
+                    .await
                     .context("opening ssh engine transport")?;
                 match ssh.engine() {
                     ContainerEngine::Docker => Self::docker_ssh(ssh.destination()),
@@ -202,7 +206,10 @@ impl Executor {
                 }
             }
             HostConnection::Kubernetes(k) => {
-                let client = k.ensure_client().context("opening k8s connection")?;
+                let client = k
+                    .ensure_client_async()
+                    .await
+                    .context("opening k8s connection")?;
                 Ok(Self {
                     inner: Inner::Kubernetes(K8sBackend { client }),
                 })
@@ -218,7 +225,7 @@ impl Executor {
     ///
     /// Returns the backend's identifier for the new pod: the docker
     /// container id, or the kubernetes pod name.
-    pub fn launch(&self, id: &PodId, spec: PodSpec) -> Result<String> {
+    pub async fn launch_async(&self, id: &PodId, spec: PodSpec) -> Result<String> {
         match &self.inner {
             Inner::Docker(d) => {
                 if !spec.k8s_only.is_empty() {
@@ -226,7 +233,7 @@ impl Executor {
                         "k8s-only spec fields (node_selector/tolerations) set on a docker launch"
                     );
                 }
-                docker_launch(d, id, spec)
+                docker_launch(d, id, spec).await
             }
             Inner::Kubernetes(k) => {
                 if !spec.docker_only.is_empty() {
@@ -235,7 +242,7 @@ impl Executor {
                          set on a kubernetes launch"
                     );
                 }
-                k8s_launch(k, id, spec)?;
+                k8s_launch(k, id, spec).await?;
                 Ok(id.as_str().to_string())
             }
         }
@@ -243,30 +250,32 @@ impl Executor {
 
     /// Remove a pod.  Idempotent: succeeds if the pod is already gone.
     pub fn delete<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<()> {
+        crate::async_runtime::block_on(self.delete_async(id))
+    }
+
+    pub async fn delete_async<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<()> {
         match &self.inner {
-            Inner::Docker(d) => docker_delete(d, id.as_ref()),
-            Inner::Kubernetes(k) => k.client.delete_pod(id.as_ref()),
+            Inner::Docker(d) => docker_delete(d, id.as_ref()).await,
+            Inner::Kubernetes(k) => k.client.delete_pod_async(id.as_ref()).await,
         }
     }
 
     /// Current pod status.  Returns `Gone` when the pod no longer
     /// exists on the backend.
     pub fn status<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<PodStatus> {
+        crate::async_runtime::block_on(self.status_async(id))
+    }
+
+    pub async fn status_async<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<PodStatus> {
         match &self.inner {
-            Inner::Docker(d) => docker_status(d, id.as_ref()),
-            Inner::Kubernetes(k) => k.client.get_pod_status(id.as_ref()),
+            Inner::Docker(d) => docker_status(d, id.as_ref()).await,
+            Inner::Kubernetes(k) => k.client.get_pod_status_async(id.as_ref()).await,
         }
     }
 
     /// Run a command inside the pod, wait for it to finish, and
     /// collect output.  Enters as the image's USER on both backends;
     /// there is no override, matching k8s's constraint.
-    pub fn exec<T: AsRef<str> + ?Sized>(&self, id: &T, req: ExecRequest) -> Result<ExecOutput> {
-        block_on(self.exec_async(id, req))
-    }
-
-    /// Async variant of [`Self::exec`].  Use from within a tokio task
-    /// so the call doesn't re-enter the shared runtime.
     pub async fn exec_async<T: AsRef<str> + ?Sized>(
         &self,
         id: &T,
@@ -283,10 +292,14 @@ impl Executor {
     /// servers (e.g. container-serve).  Docker uses `detach: true`;
     /// kubernetes fakes it by backgrounding under `sh -c`, which
     /// means stdin/stdout/stderr are all discarded.
-    pub fn exec_detached<T: AsRef<str> + ?Sized>(&self, id: &T, req: ExecRequest) -> Result<()> {
+    pub async fn exec_detached_async<T: AsRef<str> + ?Sized>(
+        &self,
+        id: &T,
+        req: ExecRequest,
+    ) -> Result<()> {
         match &self.inner {
-            Inner::Docker(d) => docker_exec_detached(d, id.as_ref(), req),
-            Inner::Kubernetes(k) => k8s_exec_detached(k, id.as_ref(), req),
+            Inner::Docker(d) => docker_exec_detached(d, id.as_ref(), req).await,
+            Inner::Kubernetes(k) => k8s_exec_detached(k, id.as_ref(), req).await,
         }
     }
 
@@ -308,8 +321,12 @@ impl Executor {
     /// kubernetes, which has no analogue -- the only way to stop
     /// a k8s pod is to delete it.
     pub fn stop<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<()> {
+        crate::async_runtime::block_on(self.stop_async(id))
+    }
+
+    pub async fn stop_async<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<()> {
         match &self.inner {
-            Inner::Docker(d) => docker_stop(d, id.as_ref()),
+            Inner::Docker(d) => docker_stop(d, id.as_ref()).await,
             Inner::Kubernetes(_) => {
                 anyhow::bail!("stop not supported on kubernetes, delete the pod instead")
             }
@@ -318,9 +335,9 @@ impl Executor {
 
     /// Start a stopped pod.  Errors on kubernetes for the same
     /// reason as `stop`.
-    pub fn start<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<()> {
+    pub async fn start_async<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<()> {
         match &self.inner {
-            Inner::Docker(d) => docker_start(d, id.as_ref()),
+            Inner::Docker(d) => docker_start(d, id.as_ref()).await,
             Inner::Kubernetes(_) => {
                 anyhow::bail!("start not supported on kubernetes, launch a new pod instead")
             }
@@ -334,9 +351,9 @@ impl Executor {
     /// using this as a preflight against a missing fork image trust
     /// the cluster's pull behavior and let any failure surface at
     /// pod start.
-    pub fn image_present(&self, image: &str) -> Result<bool> {
+    pub async fn image_present_async(&self, image: &str) -> Result<bool> {
         match &self.inner {
-            Inner::Docker(d) => docker_image_present(d, image),
+            Inner::Docker(d) => docker_image_present(d, image).await,
             Inner::Kubernetes(_) => Ok(true),
         }
     }
@@ -406,6 +423,8 @@ impl DockerBackend {
     fn tokio_command(&self) -> TokioCommand {
         let mut command = TokioCommand::new(self.engine.binary_name());
         self.apply_tokio_target(&mut command);
+        command.as_std_mut().process_group(0);
+        command.kill_on_drop(true);
         command
     }
 
@@ -500,14 +519,15 @@ fn docker_stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).trim().to_string()
 }
 
-fn docker_inspect_container(
+async fn docker_inspect_container_async(
     backend: &DockerBackend,
     id: &str,
 ) -> Result<Option<DockerContainerInspect>> {
     let mut command = backend.command();
     let output = command
         .args(["container", "inspect", id])
-        .output()
+        .output_async()
+        .await
         .context("running docker container inspect")?;
     if !output.status.success() {
         if docker_not_found(&output) {
@@ -531,11 +551,12 @@ fn docker_exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
-fn docker_delete(backend: &DockerBackend, id: &str) -> Result<()> {
+async fn docker_delete(backend: &DockerBackend, id: &str) -> Result<()> {
     let mut command = backend.command();
     let output = command
         .args(["rm", "-f", id])
-        .output()
+        .output_async()
+        .await
         .context("running docker rm")?;
     if output.status.success() || docker_not_found(&output) {
         return Ok(());
@@ -544,8 +565,8 @@ fn docker_delete(backend: &DockerBackend, id: &str) -> Result<()> {
     Err(anyhow::anyhow!("docker rm failed: {stderr}"))
 }
 
-fn docker_status(backend: &DockerBackend, id: &str) -> Result<PodStatus> {
-    let Some(container) = docker_inspect_container(backend, id)? else {
+async fn docker_status(backend: &DockerBackend, id: &str) -> Result<PodStatus> {
+    let Some(container) = docker_inspect_container_async(backend, id).await? else {
         return Ok(PodStatus::Gone);
     };
     let state = container
@@ -583,6 +604,7 @@ async fn docker_exec(backend: &DockerBackend, id: &str, req: ExecRequest) -> Res
     command.stderr(Stdio::piped());
 
     let mut child = command.spawn().context("spawning docker exec")?;
+    let mut group = ProcessGroup::new(&child);
     if let Some(data) = req.stdin {
         let mut stdin = child.stdin.take().context("docker exec stdin missing")?;
         stdin
@@ -599,6 +621,7 @@ async fn docker_exec(backend: &DockerBackend, id: &str, req: ExecRequest) -> Res
         .wait_with_output()
         .await
         .context("waiting for docker exec")?;
+    group.completed(output.status);
     Ok(ExecOutput {
         stdout: output.stdout,
         stderr: output.stderr,
@@ -689,6 +712,7 @@ async fn docker_exec_streaming(
     command.kill_on_drop(true);
 
     let mut child = command.spawn().context("spawning streaming docker exec")?;
+    let group = ProcessGroup::new(&child);
     let stdin = child.stdin.take().context("taking docker exec stdin")?;
     let stdout = child.stdout.take().context("taking docker exec stdout")?;
     let stderr = child.stderr.take().context("taking docker exec stderr")?;
@@ -697,7 +721,7 @@ async fn docker_exec_streaming(
         stdin: Box::new(stdin),
         stdout: Box::new(stdout),
         stderr: Box::new(stderr),
-        keepalive: Box::new(child),
+        keepalive: Box::new((group, child)),
     })
 }
 
@@ -736,7 +760,7 @@ async fn k8s_exec_streaming(
     })
 }
 
-fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<String> {
+async fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<String> {
     let PodSpec {
         image,
         hostname,
@@ -830,9 +854,14 @@ fn docker_launch(backend: &DockerBackend, id: &PodId, spec: PodSpec) -> Result<S
         command.args(cmd);
     }
 
-    let stdout = command.success().context("creating container")?;
+    let stdout = command
+        .success_async()
+        .await
+        .context("creating container")?;
     let container_id = String::from_utf8_lossy(&stdout).trim().to_string();
-    docker_start(backend, id.as_str()).context("starting container")?;
+    docker_start(backend, id.as_str())
+        .await
+        .context("starting container")?;
     Ok(container_id)
 }
 
@@ -854,7 +883,7 @@ fn docker_mount_arg(mount: super::Mount) -> String {
     parts.join(",")
 }
 
-fn k8s_launch(backend: &K8sBackend, id: &PodId, spec: PodSpec) -> Result<()> {
+async fn k8s_launch(backend: &K8sBackend, id: &PodId, spec: PodSpec) -> Result<()> {
     use crate::k8s::{K8sPodOptions, K8sResourceRequests, K8sVolumeMount};
 
     let PodSpec {
@@ -922,13 +951,14 @@ fn k8s_launch(backend: &K8sBackend, id: &PodId, spec: PodSpec) -> Result<()> {
 
     backend
         .client
-        .create_pod(id.as_str(), &image, labels, annotations, &env, &options)?;
+        .create_pod_async(id.as_str(), &image, labels, annotations, &env, &options)
+        .await?;
 
-    backend.client.wait_running(id.as_str())?;
+    backend.client.wait_running_async(id.as_str()).await?;
     Ok(())
 }
 
-fn docker_exec_detached(backend: &DockerBackend, id: &str, req: ExecRequest) -> Result<()> {
+async fn docker_exec_detached(backend: &DockerBackend, id: &str, req: ExecRequest) -> Result<()> {
     if req.stdin.is_some() {
         return Err(anyhow::anyhow!(
             "executor::exec_detached does not support stdin on docker"
@@ -946,11 +976,14 @@ fn docker_exec_detached(backend: &DockerBackend, id: &str, req: ExecRequest) -> 
     }
     command.arg(id);
     command.args(req.cmd);
-    command.success().context("starting detached docker exec")?;
+    command
+        .success_async()
+        .await
+        .context("starting detached docker exec")?;
     Ok(())
 }
 
-fn k8s_exec_detached(backend: &K8sBackend, id: &str, req: ExecRequest) -> Result<()> {
+async fn k8s_exec_detached(backend: &K8sBackend, id: &str, req: ExecRequest) -> Result<()> {
     // kube-rs exec has no detach flag.  Approximate it by wrapping
     // the command under `sh -c '<cmd> </dev/null >/tmp/exec.log 2>&1 &'`,
     // which returns as soon as sh backgrounds the child.  Output is
@@ -975,7 +1008,7 @@ fn k8s_exec_detached(backend: &K8sBackend, id: &str, req: ExecRequest) -> Result
         env: Vec::new(),
         stdin: None,
     };
-    let out = block_on(k8s_exec(backend, id, req))?;
+    let out = (k8s_exec(backend, id, req)).await?;
     if out.exit_code != 0 {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow::anyhow!(
@@ -986,11 +1019,12 @@ fn k8s_exec_detached(backend: &K8sBackend, id: &str, req: ExecRequest) -> Result
     Ok(())
 }
 
-fn docker_stop(backend: &DockerBackend, id: &str) -> Result<()> {
+async fn docker_stop(backend: &DockerBackend, id: &str) -> Result<()> {
     let mut command = backend.command();
     let output = command
         .args(["stop", "--time", "0", id])
-        .output()
+        .output_async()
+        .await
         .context("running docker stop")?;
     if output.status.success() || docker_not_found(&output) {
         return Ok(());
@@ -999,11 +1033,12 @@ fn docker_stop(backend: &DockerBackend, id: &str) -> Result<()> {
     Err(anyhow::anyhow!("docker stop failed: {stderr}"))
 }
 
-fn docker_start(backend: &DockerBackend, id: &str) -> Result<()> {
+async fn docker_start(backend: &DockerBackend, id: &str) -> Result<()> {
     let mut command = backend.command();
     command
         .args(["start", id])
-        .success()
+        .success_async()
+        .await
         .context("starting container")?;
     Ok(())
 }
@@ -1055,11 +1090,12 @@ fn k8s_exec_interactive(
     c.status().context("spawning kubectl exec")
 }
 
-fn docker_image_present(backend: &DockerBackend, image: &str) -> Result<bool> {
+async fn docker_image_present(backend: &DockerBackend, image: &str) -> Result<bool> {
     let mut command = backend.command();
     let output = command
         .args(["image", "inspect", image])
-        .output()
+        .output_async()
+        .await
         .context("running docker image inspect")?;
     if output.status.success() {
         Ok(true)

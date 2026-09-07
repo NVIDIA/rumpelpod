@@ -13,8 +13,10 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::Deserialize;
+
+use crate::async_command::AsyncCommandExt;
 
 /// Parsed OCI image reference.
 pub(crate) struct ImageRef {
@@ -94,7 +96,7 @@ pub(crate) fn parse_image_ref(image: &str) -> ImageRef {
 /// registry HTTP API.
 ///
 /// Downloads only the manifest and config blob (a few KB total).
-pub(crate) fn fetch_image_user(image: &str) -> Result<String> {
+pub(crate) async fn fetch_image_user_async(image: &str) -> Result<String> {
     let image_ref = parse_image_ref(image);
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -102,12 +104,12 @@ pub(crate) fn fetch_image_user(image: &str) -> Result<String> {
         .context("building HTTP client")?;
 
     let scheme = registry_scheme(&image_ref.registry);
-    let cred = authenticate(&client, &image_ref, scheme)?;
+    let cred = authenticate(&client, &image_ref, scheme).await?;
 
-    let manifest = fetch_manifest(&client, &image_ref, scheme, cred.as_ref())?;
+    let manifest = fetch_manifest(&client, &image_ref, scheme, cred.as_ref()).await?;
     let config_digest =
-        config_digest_from_manifest(&manifest, &client, &image_ref, scheme, cred.as_ref())?;
-    let config = fetch_blob(&client, &image_ref, scheme, &config_digest, cred.as_ref())?;
+        config_digest_from_manifest(&manifest, &client, &image_ref, scheme, cred.as_ref()).await?;
+    let config = fetch_blob(&client, &image_ref, scheme, &config_digest, cred.as_ref()).await?;
 
     let user = config
         .get("config")
@@ -156,11 +158,16 @@ pub(crate) enum Credential {
 /// the OCI token exchange and returns the bearer token.  On a `Basic`
 /// challenge, looks up credentials in the docker config (credHelpers
 /// / credsStore / auths) and returns them for per-request basic auth.
-fn authenticate(client: &Client, image_ref: &ImageRef, scheme: &str) -> Result<Option<Credential>> {
+async fn authenticate(
+    client: &Client,
+    image_ref: &ImageRef,
+    scheme: &str,
+) -> Result<Option<Credential>> {
     let url = format!("{scheme}://{}/v2/", image_ref.registry);
     let resp = client
         .get(&url)
         .send()
+        .await
         .with_context(|| format!("probing registry at {url}"))?;
 
     if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
@@ -183,16 +190,18 @@ fn authenticate(client: &Client, image_ref: &ImageRef, scheme: &str) -> Result<O
                 .get(&realm)
                 .query(&[("scope", scope.as_str()), ("service", service.as_str())]);
 
-            if let Some((user, pass)) = registry_credentials(image_ref.auth_config_key()) {
+            if let Some((user, pass)) = registry_credentials(image_ref.auth_config_key()).await {
                 req = req.basic_auth(&user, Some(&pass));
             }
 
             let token_resp: serde_json::Value = req
                 .send()
+                .await
                 .context("requesting auth token")?
                 .error_for_status()
                 .context("auth token request failed")?
                 .json()
+                .await
                 .context("parsing auth token response")?;
 
             let token = token_resp
@@ -204,8 +213,9 @@ fn authenticate(client: &Client, image_ref: &ImageRef, scheme: &str) -> Result<O
             Ok(Some(Credential::Bearer(token.to_string())))
         }
         AuthChallenge::Basic => {
-            let (user, pass) =
-                registry_credentials(image_ref.auth_config_key()).with_context(|| {
+            let (user, pass) = registry_credentials(image_ref.auth_config_key())
+                .await
+                .with_context(|| {
                     let key = image_ref.auth_config_key();
                     format!(
                         "registry {} requires Basic auth but no credentials \
@@ -272,9 +282,9 @@ fn parse_www_authenticate(header: &str) -> Result<AuthChallenge> {
 /// Read credentials for a registry from Docker and Podman auth files.
 ///
 /// Checks `credHelpers`, `credsStore`, and direct `auths` entries.
-fn registry_credentials(registry: &str) -> Option<(String, String)> {
+async fn registry_credentials(registry: &str) -> Option<(String, String)> {
     for config_path in auth_config_paths() {
-        let Some(creds) = credentials_from_config(&config_path, registry) else {
+        let Some(creds) = credentials_from_config_async(&config_path, registry).await else {
             continue;
         };
         return Some(creds);
@@ -299,7 +309,10 @@ fn auth_config_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn credentials_from_config(config_path: &PathBuf, registry: &str) -> Option<(String, String)> {
+async fn credentials_from_config_async(
+    config_path: &PathBuf,
+    registry: &str,
+) -> Option<(String, String)> {
     let content = std::fs::read_to_string(config_path).ok()?;
     let config: serde_json::Value = serde_json::from_str(&content).ok()?;
 
@@ -309,14 +322,14 @@ fn credentials_from_config(config_path: &PathBuf, registry: &str) -> Option<(Str
         .and_then(|h| h.get(registry))
         .and_then(|h| h.as_str())
     {
-        if let Some(creds) = credentials_from_helper(helper, registry) {
+        if let Some(creds) = credentials_from_helper(helper, registry).await {
             return Some(creds);
         }
     }
 
     // credsStore: default credential helper for all registries.
     if let Some(store) = config.get("credsStore").and_then(|s| s.as_str()) {
-        if let Some(creds) = credentials_from_helper(store, registry) {
+        if let Some(creds) = credentials_from_helper(store, registry).await {
             return Some(creds);
         }
     }
@@ -326,19 +339,17 @@ fn credentials_from_config(config_path: &PathBuf, registry: &str) -> Option<(Str
 }
 
 /// Shell out to `docker-credential-<helper>` to retrieve credentials.
-fn credentials_from_helper(helper: &str, registry: &str) -> Option<(String, String)> {
+async fn credentials_from_helper(helper: &str, registry: &str) -> Option<(String, String)> {
     let helper_bin = format!("docker-credential-{helper}");
-    let mut child = Command::new(&helper_bin)
+    let mut input = tempfile::NamedTempFile::new().ok()?;
+    input.write_all(registry.as_bytes()).ok()?;
+    let output = Command::new(&helper_bin)
         .arg("get")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdin(input.reopen().ok()?)
         .stderr(Stdio::null())
-        .spawn()
+        .output_async()
+        .await
         .ok()?;
-
-    child.stdin.take()?.write_all(registry.as_bytes()).ok()?;
-
-    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -395,11 +406,7 @@ const MANIFEST_ACCEPT: &str = "\
     application/vnd.oci.image.manifest.v1+json, \
     application/vnd.oci.image.index.v1+json";
 
-fn authed_get(
-    client: &Client,
-    url: &str,
-    cred: Option<&Credential>,
-) -> reqwest::blocking::RequestBuilder {
+fn authed_get(client: &Client, url: &str, cred: Option<&Credential>) -> reqwest::RequestBuilder {
     let req = client.get(url);
     match cred {
         Some(Credential::Bearer(t)) => req.bearer_auth(t),
@@ -408,7 +415,7 @@ fn authed_get(
     }
 }
 
-fn fetch_manifest(
+async fn fetch_manifest(
     client: &Client,
     image_ref: &ImageRef,
     scheme: &str,
@@ -422,15 +429,17 @@ fn fetch_manifest(
     authed_get(client, &url, cred)
         .header("Accept", MANIFEST_ACCEPT)
         .send()
+        .await
         .context("fetching manifest")?
         .error_for_status()
         .with_context(|| format!("fetching manifest for {}", image_ref.repository))?
         .json()
+        .await
         .context("parsing manifest JSON")
 }
 
 /// Check whether an image manifest exists in a registry.
-pub(crate) fn image_manifest_exists(image: &str) -> Result<bool> {
+pub(crate) async fn image_manifest_exists_async(image: &str) -> Result<bool> {
     let image_ref = parse_image_ref(image);
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -438,7 +447,7 @@ pub(crate) fn image_manifest_exists(image: &str) -> Result<bool> {
         .context("building HTTP client")?;
 
     let scheme = registry_scheme(&image_ref.registry);
-    let cred = authenticate(&client, &image_ref, scheme)?;
+    let cred = authenticate(&client, &image_ref, scheme).await?;
     let url = format!(
         "{scheme}://{}/v2/{}/manifests/{}",
         image_ref.registry, image_ref.repository, image_ref.reference
@@ -447,6 +456,7 @@ pub(crate) fn image_manifest_exists(image: &str) -> Result<bool> {
     let resp = authed_get(&client, &url, cred.as_ref())
         .header("Accept", MANIFEST_ACCEPT)
         .send()
+        .await
         .with_context(|| format!("fetching manifest for {image}"))?;
 
     if resp.status().is_success() {
@@ -457,7 +467,7 @@ pub(crate) fn image_manifest_exists(image: &str) -> Result<bool> {
     }
 
     let status = resp.status();
-    let text = resp.text().unwrap_or_default();
+    let text = resp.text().await.unwrap_or_default();
     let text_lower = text.to_ascii_lowercase();
     if text_lower.contains("manifest unknown") || text_lower.contains("not found") {
         return Ok(false);
@@ -471,7 +481,7 @@ pub(crate) fn image_manifest_exists(image: &str) -> Result<bool> {
 /// Extract the config digest, following through manifest lists if
 /// needed.  The USER is architecture-independent so any platform
 /// entry works.
-fn config_digest_from_manifest(
+async fn config_digest_from_manifest(
     manifest: &serde_json::Value,
     client: &Client,
     image_ref: &ImageRef,
@@ -511,8 +521,15 @@ fn config_digest_from_manifest(
                 repository: image_ref.repository.clone(),
                 reference: digest.to_string(),
             };
-            let platform_manifest = fetch_manifest(client, &platform_ref, scheme, cred)?;
-            config_digest_from_manifest(&platform_manifest, client, image_ref, scheme, cred)
+            let platform_manifest = fetch_manifest(client, &platform_ref, scheme, cred).await?;
+            Box::pin(config_digest_from_manifest(
+                &platform_manifest,
+                client,
+                image_ref,
+                scheme,
+                cred,
+            ))
+            .await
         }
 
         _ => Err(anyhow::anyhow!(
@@ -521,7 +538,7 @@ fn config_digest_from_manifest(
     }
 }
 
-fn fetch_blob(
+async fn fetch_blob(
     client: &Client,
     image_ref: &ImageRef,
     scheme: &str,
@@ -535,10 +552,12 @@ fn fetch_blob(
 
     authed_get(client, &url, cred)
         .send()
+        .await
         .context("fetching config blob")?
         .error_for_status()
         .context("fetching config blob")?
         .json()
+        .await
         .context("parsing config blob JSON")
 }
 

@@ -158,6 +158,7 @@ fn validate_dns_1123_label(s: &str) -> Result<(), &'static str> {
 /// Status of a pod container.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PodStatus {
+    Starting,
     Running,
     Stopped,
     /// Container no longer exists (was deleted outside of rumpel)

@@ -10,9 +10,9 @@
 //! both live on `Connections`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -21,7 +21,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use log::{error, info};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
+use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::broadcast;
+
+use crate::async_command::AsyncCommandExt;
 
 use crate::config::Host;
 use crate::daemon::host_connection::HostKey;
@@ -45,10 +49,10 @@ struct ManagedSshAgent {
 }
 
 impl ManagedSshAgent {
-    fn configured(key: &PodConnectionKey, keys: &[PathBuf]) -> Result<Self> {
+    async fn configured(key: &PodConnectionKey, keys: &[PathBuf]) -> Result<Self> {
         let configured_keys_hash = Self::configured_keys_hash(keys)?;
-        let mut agent = Self::start(key)?;
-        agent.add_configured_keys(keys)?;
+        let mut agent = Self::start(key).await?;
+        agent.add_configured_keys(keys).await?;
         agent.configured_keys_hash = Some(configured_keys_hash);
         Ok(agent)
     }
@@ -66,7 +70,7 @@ impl ManagedSshAgent {
         Ok(hex::encode(hasher.finalize()))
     }
 
-    fn start(key: &PodConnectionKey) -> Result<Self> {
+    async fn start(key: &PodConnectionKey) -> Result<Self> {
         let pod_name = PodName(key.pod_name.clone());
         let agent_dir = crate::daemon::ssh_agent_dir(&key.repo_path, &pod_name);
         match std::fs::remove_dir_all(&agent_dir) {
@@ -84,7 +88,8 @@ impl ManagedSshAgent {
         })?;
 
         let socket_path = agent_dir.join("agent.sock");
-        let child = match Command::new("ssh-agent")
+        let child = match TokioCommand::new("ssh-agent")
+            .kill_on_drop(true)
             .args(["-D", "-a"])
             .arg(&socket_path)
             .stdin(Stdio::null())
@@ -113,16 +118,12 @@ impl ManagedSshAgent {
         while !agent.socket_path.exists() {
             match agent.child.try_wait() {
                 Ok(Some(status)) => {
-                    let stderr = agent
-                        .child
-                        .stderr
-                        .take()
-                        .and_then(|mut stderr| {
-                            let mut output = String::new();
-                            stderr.read_to_string(&mut output).ok()?;
-                            Some(output)
-                        })
-                        .unwrap_or_default();
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = agent.child.stderr.take() {
+                        pipe.read_to_string(&mut stderr)
+                            .await
+                            .context("reading ssh-agent error")?;
+                    }
                     let stderr = stderr.trim();
                     return Err(anyhow::anyhow!("ssh-agent exited with {status}: {stderr}"));
                 }
@@ -134,7 +135,7 @@ impl ManagedSshAgent {
                     "ssh-agent did not create its socket within {SSH_AGENT_START_TIMEOUT:?}"
                 ));
             }
-            std::thread::sleep(Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Ok(agent)
     }
@@ -147,7 +148,7 @@ impl ManagedSshAgent {
         }
     }
 
-    fn add_configured_keys(&mut self, keys: &[PathBuf]) -> Result<()> {
+    async fn add_configured_keys(&mut self, keys: &[PathBuf]) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -156,7 +157,8 @@ impl ManagedSshAgent {
             .env("SSH_AUTH_SOCK", &self.socket_path)
             .env("SSH_ASKPASS_REQUIRE", "never")
             .stdin(Stdio::null())
-            .output()
+            .output_async()
+            .await
             .context("running ssh-add for configured SSH keys")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -175,11 +177,8 @@ impl Drop for ManagedSshAgent {
         match self.child.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) => {
-                if let Err(error) = self.child.kill() {
+                if let Err(error) = self.child.start_kill() {
                     error!("failed to kill ssh-agent: {error}");
-                }
-                if let Err(error) = self.child.wait() {
-                    error!("failed to wait on ssh-agent: {error}");
                 }
             }
             Err(error) => error!("failed to check ssh-agent before cleanup: {error}"),
@@ -369,7 +368,8 @@ pub struct PodConnection {
     resources: Mutex<PodConnectionResources>,
     /// Reconnect and recreation preserve the connection, so the agent stays here.
     managed_ssh_agent: Mutex<Option<ManagedSshAgent>>,
-    git_tunnel_setup: Mutex<()>,
+    ssh_agent_setup: tokio::sync::Mutex<()>,
+    git_tunnel_setup: tokio::sync::Mutex<()>,
     git_tunnel_repair_scheduled: AtomicBool,
     repair_state: Arc<PodRepairState>,
     event_loop: Mutex<Option<EventLoopHandle>>,
@@ -398,7 +398,8 @@ impl PodConnection {
             codex_state: Arc::new(Mutex::new(None)),
             resources: Mutex::new(PodConnectionResources::new()),
             managed_ssh_agent: Mutex::new(managed_ssh_agent),
-            git_tunnel_setup: Mutex::new(()),
+            ssh_agent_setup: tokio::sync::Mutex::new(()),
+            git_tunnel_setup: tokio::sync::Mutex::new(()),
             git_tunnel_repair_scheduled: AtomicBool::new(false),
             repair_state: Arc::new(PodRepairState::default()),
             event_loop: Mutex::new(None),
@@ -422,37 +423,43 @@ impl PodConnection {
     }
 
     pub fn ensure_ssh_agent(&self) -> Result<PathBuf> {
-        let mut slot = self.managed_ssh_agent.lock().unwrap();
-        if let Some(agent) = slot.as_mut() {
-            if agent.is_alive()? {
-                return Ok(agent.socket_path.clone());
+        crate::async_runtime::block_on(self.ensure_ssh_agent_async())
+    }
+
+    async fn ensure_ssh_agent_async(&self) -> Result<PathBuf> {
+        let _setup = self.ssh_agent_setup.lock().await;
+        {
+            let mut slot = self.managed_ssh_agent.lock().unwrap();
+            if let Some(agent) = slot.as_mut() {
+                if agent.is_alive()? {
+                    return Ok(agent.socket_path.clone());
+                }
             }
+            slot.take();
         }
-        drop(slot.take());
-        let agent = ManagedSshAgent::start(&self.key)?;
+        let agent = ManagedSshAgent::start(&self.key).await?;
         let socket_path = agent.socket_path.clone();
-        *slot = Some(agent);
+        *self.managed_ssh_agent.lock().unwrap() = Some(agent);
         Ok(socket_path)
     }
 
-    pub fn configure_ssh_agent(&self, keys: &[PathBuf]) -> Result<PathBuf> {
+    async fn configure_ssh_agent(&self, keys: &[PathBuf]) -> Result<PathBuf> {
         let configured_keys_hash = ManagedSshAgent::configured_keys_hash(keys)?;
-
-        let mut slot = self.managed_ssh_agent.lock().unwrap();
-        if let Some(agent) = slot.as_mut() {
-            if agent.configured_keys_hash.as_ref() == Some(&configured_keys_hash)
-                && agent.is_alive()?
-            {
-                return Ok(agent.socket_path.clone());
+        let _setup = self.ssh_agent_setup.lock().await;
+        {
+            let mut slot = self.managed_ssh_agent.lock().unwrap();
+            if let Some(agent) = slot.as_mut() {
+                if agent.configured_keys_hash.as_ref() == Some(&configured_keys_hash)
+                    && agent.is_alive()?
+                {
+                    return Ok(agent.socket_path.clone());
+                }
             }
+            slot.take();
         }
-        drop(slot.take());
-
-        let mut agent = ManagedSshAgent::start(&self.key)?;
-        agent.add_configured_keys(keys)?;
-        agent.configured_keys_hash = Some(configured_keys_hash);
+        let agent = ManagedSshAgent::configured(&self.key, keys).await?;
         let socket_path = agent.socket_path.clone();
-        *slot = Some(agent);
+        *self.managed_ssh_agent.lock().unwrap() = Some(agent);
         Ok(socket_path)
     }
 
@@ -493,11 +500,16 @@ impl PodConnection {
     }
 
     pub fn probe(&self) -> Result<()> {
+        crate::async_runtime::block_on(self.probe_async())
+    }
+
+    pub async fn probe_async(&self) -> Result<()> {
         let endpoint = self
             .endpoint()
             .context("pod connection has no live endpoint")?;
         PodClient::new_with_timeout(&endpoint.url, &endpoint.token, Duration::from_secs(5))?
-            .get_state()
+            .get_state_async()
+            .await
             .context("probing pod connection")?;
         Ok(())
     }
@@ -628,8 +640,12 @@ impl PodConnection {
         resources.git_tunnel = None;
     }
 
-    pub fn git_tunnel_setup_guard(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.git_tunnel_setup.lock().unwrap()
+    pub fn git_tunnel_setup_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        crate::async_runtime::block_on(self.git_tunnel_setup_guard_async())
+    }
+
+    pub async fn git_tunnel_setup_guard_async(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.git_tunnel_setup.lock().await
     }
 
     pub fn try_schedule_git_tunnel_repair(&self) -> bool {
@@ -892,31 +908,48 @@ impl PodConnectionRegistry {
         initial_status: PodConnectionStatus,
         configured_ssh_keys: Option<&[PathBuf]>,
     ) -> Result<Arc<PodConnection>> {
-        let key = PodConnectionKey::new(repo_path.to_path_buf(), pod_name.to_string());
-        let mut pods = self.pods.lock().unwrap();
-        if let Some(connection) = pods.get(&key).cloned() {
-            drop(pods);
-            connection.update_host_and_token(host, token);
-            match configured_ssh_keys {
-                Some(keys) => {
-                    connection.configure_ssh_agent(keys)?;
-                }
-                None => connection.remove_ssh_agent(),
-            }
-            return Ok(connection);
-        }
-        let managed_ssh_agent = configured_ssh_keys
-            .map(|keys| ManagedSshAgent::configured(&key, keys))
-            .transpose()?;
-        let connection = Arc::new(PodConnection::new(
-            self.events_tx.clone(),
-            key.clone(),
+        crate::async_runtime::block_on(self.get_or_create_async(
+            repo_path,
+            pod_name,
             host,
             token,
             initial_status,
-            managed_ssh_agent,
-        ));
-        pods.insert(key, connection.clone());
+            configured_ssh_keys,
+        ))
+    }
+
+    pub async fn get_or_create_async(
+        &self,
+        repo_path: &Path,
+        pod_name: &str,
+        host: Host,
+        token: String,
+        initial_status: PodConnectionStatus,
+        configured_ssh_keys: Option<&[PathBuf]>,
+    ) -> Result<Arc<PodConnection>> {
+        let key = PodConnectionKey::new(repo_path.to_path_buf(), pod_name.to_string());
+        let connection = {
+            let mut pods = self.pods.lock().unwrap();
+            pods.entry(key.clone())
+                .or_insert_with(|| {
+                    Arc::new(PodConnection::new(
+                        self.events_tx.clone(),
+                        key,
+                        host.clone(),
+                        token.clone(),
+                        initial_status,
+                        None,
+                    ))
+                })
+                .clone()
+        };
+        connection.update_host_and_token(host, token);
+        match configured_ssh_keys {
+            Some(keys) => {
+                connection.configure_ssh_agent(keys).await?;
+            }
+            None => connection.remove_ssh_agent(),
+        }
         Ok(connection)
     }
 

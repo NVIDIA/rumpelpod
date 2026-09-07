@@ -291,10 +291,14 @@ impl HostConnection {
     /// a dial-stdio ping, and Kubernetes reuses a cached client when it
     /// still answers.
     pub fn ensure_connected(&self) -> Result<()> {
+        crate::async_runtime::block_on(self.ensure_connected_async())
+    }
+
+    pub async fn ensure_connected_async(&self) -> Result<()> {
         match self {
-            HostConnection::Localhost(c) => c.ensure_connected(),
-            HostConnection::Ssh(c) => c.ensure_connected(),
-            HostConnection::Kubernetes(c) => c.ensure_client().map(|_| ()),
+            HostConnection::Localhost(c) => c.ensure_connected_async().await,
+            HostConnection::Ssh(c) => c.ensure_connected_async().await,
+            HostConnection::Kubernetes(c) => c.ensure_client_async().await.map(|_| ()),
         }
     }
 }
@@ -318,7 +322,7 @@ pub struct LocalhostConnection {
     events_tx: HostConnectionEventTx,
     status_tx: watch::Sender<HostStatus>,
     probe: Arc<Notify>,
-    bring_up: Mutex<()>,
+    bring_up: tokio::sync::Mutex<()>,
     _monitor: AbortOnDrop,
 }
 
@@ -333,7 +337,7 @@ impl LocalhostConnection {
                 events_tx,
                 status_tx,
                 probe,
-                bring_up: Mutex::new(()),
+                bring_up: tokio::sync::Mutex::new(()),
                 _monitor: AbortOnDrop(task),
             }
         })
@@ -373,8 +377,12 @@ impl LocalhostConnection {
     }
 
     pub fn ensure_connected(&self) -> Result<()> {
-        let _guard = self.bring_up.lock().unwrap();
-        if ping_local_engine(self.engine) {
+        crate::async_runtime::block_on(self.ensure_connected_async())
+    }
+
+    pub async fn ensure_connected_async(&self) -> Result<()> {
+        let _guard = self.bring_up.lock().await;
+        if ping_local_engine_async(self.engine).await {
             self.set_status(HostStatus::Connected);
             return Ok(());
         }
@@ -424,26 +432,25 @@ async fn localhost_monitor(weak: Weak<LocalhostConnection>, probe: Arc<Notify>) 
     }
 }
 
-fn ping_local_engine(engine: ContainerEngine) -> bool {
+async fn ping_local_engine_async(engine: ContainerEngine) -> bool {
     match engine {
         ContainerEngine::Docker | ContainerEngine::Podman => {}
         ContainerEngine::Auto => {
             panic!("localhost connection has unresolved container engine auto")
         }
     }
-    match RUNTIME.block_on(async {
-        timeout(ping_timeout(), async {
-            TokioCommand::new(engine.binary_name())
-                .arg("info")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .status()
-                .await
-        })
-        .await
-    }) {
+    match timeout(ping_timeout(), async {
+        TokioCommand::new(engine.binary_name())
+            .arg("info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await
+    })
+    .await
+    {
         Ok(Ok(status)) => status.success(),
         Ok(Err(e)) => {
             debug!("local engine probe failed: {e}");
@@ -470,7 +477,7 @@ pub struct SshConnection {
     /// Wakes the background monitor for an immediate probe.
     probe: Arc<Notify>,
     /// Serializes probes so concurrent callers do not dial in parallel.
-    bring_up: Mutex<()>,
+    bring_up: tokio::sync::Mutex<()>,
     /// Local proxy socket bridging the podman CLI to the remote API
     /// service.  Started on first use; lives as long as the connection.
     /// Always `None` for Docker hosts, which use `docker -H ssh://`.
@@ -495,7 +502,7 @@ impl SshConnection {
                 events_tx,
                 status_tx,
                 probe,
-                bring_up: Mutex::new(()),
+                bring_up: tokio::sync::Mutex::new(()),
                 podman_proxy: Mutex::new(None),
                 _monitor: AbortOnDrop(task),
             }
@@ -585,9 +592,13 @@ impl SshConnection {
     /// here; `bring_up` serializes them so there is at most one dial in
     /// flight per host.
     pub fn ensure_connected(&self) -> Result<()> {
-        let _guard = self.bring_up.lock().unwrap();
+        crate::async_runtime::block_on(self.ensure_connected_async())
+    }
 
-        if ping_ssh_engine(&self.destination, self.engine) {
+    pub async fn ensure_connected_async(&self) -> Result<()> {
+        let _guard = self.bring_up.lock().await;
+
+        if ping_ssh_engine_async(&self.destination, self.engine).await {
             self.set_status(HostStatus::Connected);
             return Ok(());
         }
@@ -670,12 +681,10 @@ fn ping_timeout() -> Duration {
     }
 }
 
-fn ping_ssh_engine(destination: &str, engine: ContainerEngine) -> bool {
+async fn ping_ssh_engine_async(destination: &str, engine: ContainerEngine) -> bool {
     let destination = destination.to_string();
     let timeout_for = ping_timeout();
-    match RUNTIME
-        .block_on(async { timeout(timeout_for, ping_ssh_engine_inner(destination, engine)).await })
-    {
+    match timeout(timeout_for, ping_ssh_engine_inner(destination, engine)).await {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
             debug!("ssh engine ping failed: {e:#}");
@@ -747,7 +756,7 @@ pub struct K8sConnection {
     status_tx: watch::Sender<HostStatus>,
     /// Wakes the background monitor for an immediate probe.
     probe: Arc<Notify>,
-    bring_up: Mutex<()>,
+    bring_up: tokio::sync::Mutex<()>,
     _monitor: AbortOnDrop,
 }
 
@@ -768,7 +777,7 @@ impl K8sConnection {
                 state: Mutex::new(K8sState { client: None }),
                 status_tx,
                 probe,
-                bring_up: Mutex::new(()),
+                bring_up: tokio::sync::Mutex::new(()),
                 _monitor: AbortOnDrop(task),
             }
         })
@@ -818,7 +827,11 @@ impl K8sConnection {
     /// cached one (kube's `Client` is `Clone` and shares the
     /// underlying connection pool).
     pub fn ensure_client(&self) -> Result<K8sClient> {
-        let _guard = self.bring_up.lock().unwrap();
+        crate::async_runtime::block_on(self.ensure_client_async())
+    }
+
+    pub async fn ensure_client_async(&self) -> Result<K8sClient> {
+        let _guard = self.bring_up.lock().await;
 
         let cached = {
             let state = self.state.lock().unwrap();
@@ -826,7 +839,7 @@ impl K8sConnection {
         };
 
         if let Some(client) = cached {
-            if check_k8s_alive(&client).is_ok() {
+            if check_k8s_alive_async(&client).await.is_ok() {
                 self.set_status(HostStatus::Connected);
                 return Ok(client);
             }
@@ -835,7 +848,7 @@ impl K8sConnection {
             self.set_status(HostStatus::Disconnected);
         }
 
-        let client = match K8sClient::new(&self.context, &self.namespace) {
+        let client = match K8sClient::new_async(&self.context, &self.namespace).await {
             Ok(client) => client,
             Err(e) => {
                 self.set_status(HostStatus::Disconnected);
@@ -844,7 +857,7 @@ impl K8sConnection {
         };
         // Cheap probe so we don't cache a client that fails on its
         // first real call.
-        if let Err(e) = check_k8s_alive(&client) {
+        if let Err(e) = check_k8s_alive_async(&client).await {
             self.set_status(HostStatus::Disconnected);
             return Err(e);
         }
@@ -885,11 +898,7 @@ async fn k8s_monitor(weak: Weak<K8sConnection>, probe: Arc<Notify>) {
     }
 }
 
-/// Cheap synchronous liveness check for a `K8sClient`.
-fn check_k8s_alive(client: &K8sClient) -> Result<()> {
-    crate::async_runtime::block_on(check_k8s_alive_async(client))
-}
-
+/// Cheap liveness check for a `K8sClient`.
 async fn check_k8s_alive_async(client: &K8sClient) -> Result<()> {
     let fut = client.client().apiserver_version();
     timeout(Duration::from_secs(5), fut)

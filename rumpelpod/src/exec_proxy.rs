@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use crate::executor::{Executor, PodId};
 
 /// Handle for an active exec proxy listener.  Dropping cancels the
-/// accept loop.
+/// listener and its active connections.
 pub struct ExecProxyHandle {
     /// Local port the proxy listener is bound to.
     pub port: u16,
@@ -110,8 +110,13 @@ async fn accept_loop(
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     alive: Arc<AtomicBool>,
 ) {
+    let mut bridges = tokio::task::JoinSet::new();
     loop {
         let stream = tokio::select! {
+            Some(result) = bridges.join_next() => {
+                if let Err(error) = result { log::error!("exec proxy bridge task failed: {error}"); }
+                continue;
+            }
             result = listener.accept() => {
                 match result {
                     Ok((stream, _)) => stream,
@@ -127,7 +132,7 @@ async fn accept_loop(
         let executor = executor.clone();
         let container = container.clone();
 
-        tokio::spawn(async move {
+        bridges.spawn(async move {
             if let Err(e) = bridge_connection(stream, &executor, &container, container_port).await {
                 log::debug!("exec proxy bridge ended: {e:#}");
             }
@@ -165,7 +170,7 @@ async fn bridge_connection(
 
     // Forward stderr to debug log so tcp-proxy diagnostics surface
     // without corrupting the tunneled byte stream.
-    tokio::spawn(async move {
+    let _stderr = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         loop {
             match stderr.read(&mut buf).await {
@@ -179,12 +184,12 @@ async fn bridge_connection(
                 }
             }
         }
-    });
+    }));
 
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
     // exec stdout -> tcp write
-    let h1 = tokio::spawn(async move {
+    let h1 = async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match stdout.read(&mut buf).await {
@@ -197,10 +202,10 @@ async fn bridge_connection(
             }
         }
         let _ = tcp_write.shutdown().await;
-    });
+    };
 
     // tcp read -> exec stdin
-    let h2 = tokio::spawn(async move {
+    let h2 = async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match tcp_read.read(&mut buf).await {
@@ -213,10 +218,9 @@ async fn bridge_connection(
             }
         }
         let _ = stdin.shutdown().await;
-    });
+    };
 
-    let _ = h1.await;
-    let _ = h2.await;
+    tokio::join!(h1, h2);
     // Keep the backend session alive until both directions have drained;
     // dropping here tears down the docker exec / kubectl subprocess.
     drop(keepalive);

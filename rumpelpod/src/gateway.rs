@@ -46,6 +46,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 use log::error;
 
+use crate::async_command::AsyncCommandExt;
 use crate::command_ext::CommandExt;
 
 /// Info about a submodule discovered in the host repo.
@@ -61,7 +62,7 @@ pub struct SubmoduleInfo {
 ///
 /// WARNING: this resets submodule working trees to the commits recorded by
 /// their parents, so only call it during initial setup.
-pub fn init_submodules_recursive(repo_path: &Path) -> Result<()> {
+pub async fn init_submodules_recursive(repo_path: &Path) -> Result<()> {
     if !repo_path.join(".gitmodules").exists() {
         return Ok(());
     }
@@ -75,7 +76,8 @@ pub fn init_submodules_recursive(repo_path: &Path) -> Result<()> {
             "--recursive",
         ])
         .current_dir(repo_path)
-        .success()
+        .success_async()
+        .await
         .context("git submodule update --init --recursive failed")?;
     Ok(())
 }
@@ -182,7 +184,7 @@ fn is_git_repo(path: &Path) -> bool {
 ///
 /// Initializes submodules on first call.  Idempotent.  If the
 /// `repo_path` is not a git repository, this function does nothing.
-pub fn setup_gateway(repo_path: &Path) -> Result<()> {
+pub async fn setup_gateway(repo_path: &Path) -> Result<()> {
     if !is_git_repo(repo_path) {
         return Ok(());
     }
@@ -191,7 +193,7 @@ pub fn setup_gateway(repo_path: &Path) -> Result<()> {
     // Use a marker file to detect subsequent calls.
     let marker = repo_path.join(".git/rumpelpod-submodules-initialized");
     if !marker.exists() {
-        init_submodules_recursive(repo_path)?;
+        init_submodules_recursive(repo_path).await?;
         let _ = fs::write(&marker, "");
     }
 

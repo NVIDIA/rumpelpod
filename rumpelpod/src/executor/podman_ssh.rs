@@ -17,24 +17,30 @@
 //! socket the SSH user's podman resolves by default (rootless socket,
 //! or `CONTAINER_HOST` from e.g. sshd `SetEnv`).
 
-use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::UnixStream;
+use tokio::process::Command;
+use tokio_util::task::AbortOnDropHandle;
+
+use crate::async_command::ProcessGroup;
+use crate::async_runtime::RUNTIME;
 
 use crate::config::{ContainerEngine, Host};
 
 pub struct PodmanSshProxy {
     socket_path: PathBuf,
-    shutdown: Arc<AtomicBool>,
-    /// Holds the socket file.  Drop only signals the accept loop; it
-    /// does not join it, so the loop may briefly outlive the dir (its
-    /// listener fd stays valid).
+    // The accept task owns active connections, so dropping the proxy also
+    // releases SSH processes that an unreachable host cannot finish.
+    _task: AbortOnDropHandle<()>,
     _dir: tempfile::TempDir,
 }
 
@@ -58,37 +64,41 @@ impl PodmanSshProxy {
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("binding podman ssh proxy {}", socket_path.display()))?;
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let accept_shutdown = shutdown.clone();
-        let accept_destination = destination.to_string();
-        std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                if accept_shutdown.load(Ordering::SeqCst) {
-                    break;
+        listener
+            .set_nonblocking(true)
+            .context("configuring podman proxy listener")?;
+        let _runtime = RUNTIME.enter();
+        let listener = tokio::net::UnixListener::from_std(listener)?;
+        let destination = destination.to_string();
+        let task = RUNTIME.spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    Some(result) = connections.join_next() => {
+                        if let Err(error) = result { log::error!("podman proxy task failed: {error}"); }
+                    }
+                    connection = listener.accept() => {
+                        let (connection, _) = match connection {
+                            Ok(connection) => connection,
+                            Err(error) => {
+                                log::error!("podman ssh proxy accept failed: {error}");
+                                break;
+                            }
+                        };
+                        let destination = destination.clone();
+                        connections.spawn(async move {
+                            if let Err(error) = serve_connection(connection, &destination).await {
+                                log::error!("podman ssh proxy connection to {destination} failed: {error:#}");
+                            }
+                        });
+                    }
                 }
-                let conn = match conn {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        // The loop ends here; later podman calls get a
-                        // bare connection error, so leave a trace.
-                        eprintln!("podman ssh proxy accept failed: {e}");
-                        break;
-                    }
-                };
-                let destination = accept_destination.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = serve_connection(conn, &destination) {
-                        // The podman CLI only reports an opaque broken
-                        // connection; the ssh stderr is here.
-                        eprintln!("podman ssh proxy connection to {destination} failed: {e:#}");
-                    }
-                });
             }
         });
 
         Ok(PodmanSshProxy {
             socket_path,
-            shutdown,
+            _task: AbortOnDropHandle::new(task),
             _dir: dir,
         })
     }
@@ -121,89 +131,177 @@ impl PodmanSshProxy {
     }
 }
 
-impl Drop for PodmanSshProxy {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Unblock the accept loop so it observes the flag.  In-flight
-        // connections keep their ssh child until either side closes.
-        let _ = UnixStream::connect(&self.socket_path);
-    }
-}
-
-/// Forward bytes as they arrive until EOF or an error on either side.
-///
-/// Deliberately not `std::io::copy`: its Linux splice specialization
-/// for socket/pipe pairs can sit on data instead of forwarding it,
-/// which stalls request/response traffic on a connection that is
-/// still open in both directions.
-fn pump(mut from: impl Read, mut to: impl Write) {
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = match from.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        if to.write_all(&buf[..n]).is_err() {
-            break;
-        }
-        if to.flush().is_err() {
-            break;
-        }
-    }
-}
-
 /// Pipe one client connection through a fresh `ssh ... dial-stdio`.
 ///
 /// One ssh process per API connection mirrors what the docker CLI does
 /// for `-H ssh://`; users get connection reuse the same way, via
 /// `ControlMaster` in their SSH config.
-fn serve_connection(conn: UnixStream, destination: &str) -> Result<()> {
-    let mut child = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            destination,
-            "podman",
-            "system",
-            "dial-stdio",
-        ])
+async fn serve_connection(conn: UnixStream, destination: &str) -> Result<()> {
+    let mut command = Command::new("ssh");
+    command.args([
+        "-o",
+        "BatchMode=yes",
+        destination,
+        "podman",
+        "system",
+        "dial-stdio",
+    ]);
+    bridge_connection(conn, command).await
+}
+
+async fn bridge_connection(conn: UnixStream, mut command: Command) -> Result<()> {
+    command.as_std_mut().process_group(0);
+    let mut child = command
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawning ssh podman dial-stdio")?;
 
-    let child_stdin = child.stdin.take().context("ssh child stdin missing")?;
-    let child_stdout = child.stdout.take().context("ssh child stdout missing")?;
+    let _group = ProcessGroup::new(&child);
+    let mut child_stdin = child.stdin.take().context("ssh child stdin missing")?;
+    let mut child_stdout = child.stdout.take().context("ssh child stdout missing")?;
     let mut child_stderr = child.stderr.take().context("ssh child stderr missing")?;
+    let conn = conn.into_std()?;
+    let disconnect = AsyncFd::with_interest(conn.try_clone()?, Interest::WRITABLE)?;
+    let conn = UnixStream::from_std(conn)?;
+    let (mut conn_read, mut conn_write) = conn.into_split();
+    let mut stderr = String::new();
 
-    // Drain stderr concurrently so a chatty remote cannot fill the pipe
-    // and stall ssh.
-    let stderr_pump = std::thread::spawn(move || {
-        let mut stderr = String::new();
-        let _ = child_stderr.read_to_string(&mut stderr);
-        stderr
-    });
-
-    let conn_read = conn.try_clone().context("cloning proxy connection")?;
-    let request_pump = std::thread::spawn(move || {
-        pump(conn_read, child_stdin);
-        // Dropping stdin sends EOF; dial-stdio then closes the remote
-        // side and the response pump finishes.
-    });
-
-    let conn_write = conn.try_clone().context("cloning proxy connection")?;
-    pump(child_stdout, conn_write);
-    let _ = conn.shutdown(std::net::Shutdown::Both);
-    let _ = request_pump.join();
-
-    let stderr = stderr_pump.join().unwrap_or_default();
-    let status = child.wait().context("waiting for ssh podman dial-stdio")?;
-    if !status.success() {
-        let stderr = stderr.trim();
-        return Err(anyhow::anyhow!(
-            "ssh podman dial-stdio exited with {status}: {stderr}"
-        ));
+    let request = async move {
+        tokio::io::copy(&mut conn_read, &mut child_stdin).await?;
+        drop(child_stdin);
+        std::future::pending::<std::io::Result<()>>().await
+    };
+    let response = async {
+        tokio::try_join!(
+            async {
+                tokio::io::copy(&mut child_stdout, &mut conn_write).await?;
+                conn_write.shutdown().await
+            },
+            child_stderr.read_to_string(&mut stderr),
+            child.wait(),
+        )
+    };
+    tokio::select! {
+        result = request => { result.context("forwarding podman request")?; }
+        result = response => {
+            let ((), _, status) = result.context("forwarding podman response")?;
+            if !status.success() {
+                let stderr = stderr.trim();
+                return Err(anyhow::anyhow!("ssh podman dial-stdio exited with {status}: {stderr}"));
+            }
+        }
+        result = wait_disconnected(&disconnect) => { result.context("watching podman client")?; }
     }
     Ok(())
+}
+
+async fn wait_disconnected(socket: &AsyncFd<StdUnixStream>) -> std::io::Result<()> {
+    // EOF alone can be a half-close: the client may still need its response.
+    // A separate registration lets us wait for HUP without consuming either
+    // pump's readiness or spinning on the original socket's permanent EOF.
+    socket
+        .async_io(Interest::WRITABLE, |socket| {
+            let mut descriptor = libc::pollfd {
+                fd: socket.as_raw_fd(),
+                events: 0,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut descriptor, 1, 0) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if descriptor.revents & libc::POLLHUP != 0 {
+                Ok(())
+            } else {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        })
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn podman_ssh_proxy_half_close_drains_buffered_response() {
+        let data = vec![b'x'; 2 * 1024 * 1024];
+        let response_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(response_file.path(), &data).unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "cat >/dev/null; sleep 0.1; cat \"$1\"", "sh"])
+            .arg(response_file.path());
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let task = AbortOnDropHandle::new(tokio::spawn(bridge_connection(server, command)));
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // Input EOF still permits a response, including bytes buffered when
+        // the child exits. Waiting on child status alone can truncate it.
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, data);
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn podman_ssh_proxy_disconnect_kills_unresponsive_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 600", "sh"])
+            .arg(&pid_file);
+        let (client, server) = UnixStream::pair().unwrap();
+        let task = AbortOnDropHandle::new(tokio::spawn(bridge_connection(server, command)));
+        let pid = timeout(Duration::from_secs(5), async {
+            loop {
+                match std::fs::read_to_string(&pid_file) {
+                    Ok(pid) if !pid.trim().is_empty() => {
+                        break Pid::from_raw(pid.trim().parse().unwrap())
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("reading child PID: {error}"),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(client);
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match kill(pid, None) {
+                    Err(Errno::ESRCH) => break,
+                    Ok(()) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("checking cancelled child: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
