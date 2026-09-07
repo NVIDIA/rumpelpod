@@ -182,6 +182,8 @@ fn fresh_pod_git_setup(
     pod_name: &str,
     host_branch: Option<&str>,
     git_identity: Option<crate::git::GitIdentity>,
+    remotes: Vec<crate::git::GitRemote>,
+    description_file: Option<String>,
 ) -> GitSetupParams {
     GitSetupParams {
         branches: vec![crate::pod::git_setup::GitSetupBranch {
@@ -192,6 +194,8 @@ fn fresh_pod_git_setup(
         primary: pod_name.to_string(),
         extra_host_fetch: Vec::new(),
         git_identity,
+        remotes,
+        description_file,
     }
 }
 
@@ -3857,8 +3861,9 @@ impl DaemonServer {
                 Vec::new(),
             )
         };
-        let host_remotes = crate::git::get_remotes(&repo_path).unwrap_or_default();
+        let host_remotes = crate::git::get_remotes(&repo_path)?;
         let build_options = devcontainer.build_options();
+        let workspace_clone = load_json_config(&repo_path)?.build.workspace_clone.mode;
         let compose_agent_has_bind_mount = match (&compose_model, &agent_service) {
             (Some(model), Some(service)) => model.service_has_bind_mount(service)?,
             (None, None) => false,
@@ -3911,10 +3916,10 @@ impl DaemonServer {
             &base_image,
             &docker_host,
             &git_dir,
+            workspace_clone,
             &container_repo_path,
             prepared_user,
             user_id_update,
-            &host_remotes,
             &mount_targets,
             claude_cli_path.as_deref(),
             codex_cli_path.as_deref(),
@@ -3934,7 +3939,13 @@ impl DaemonServer {
 
         gateway::install_host_hooks(&repo_path)?;
 
-        let git_setup = fresh_pod_git_setup(&pod_name.0, host_branch.as_deref(), git_identity);
+        let git_setup = fresh_pod_git_setup(
+            &pod_name.0,
+            host_branch.as_deref(),
+            git_identity,
+            host_remotes,
+            description_file,
+        );
 
         self.create_pod_container(
             ResolvedLaunch {
@@ -4619,6 +4630,8 @@ impl DaemonServer {
             primary: new_name.clone(),
             extra_host_fetch,
             git_identity: Some(git_identity),
+            remotes: state.remotes,
+            description_file: state.description_file,
         };
 
         let new_pod_name = PodName(new_name.clone());

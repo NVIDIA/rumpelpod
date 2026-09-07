@@ -412,13 +412,19 @@ fn run_setup(
     if let Some(ref params) = git_setup {
         let git_http_url = format!("{tunnel_base_url}/rumpelpod.git");
 
+        let initialized =
+            git_setup::initialize_repository(repo_path).expect("repository initialization failed");
+
         let hook_path = repo_path.join(".git/hooks/reference-transaction");
         match std::fs::metadata(&hook_path) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Clean baked checkouts can carry warm build caches whose mtimes
-                // are part of cache validity.
-                if git_setup::needs_sanitize_impl(repo_path).expect("sanitize check failed") {
+                // A fresh repository may contain image-supplied files. Preserve
+                // them and let checkout reject conflicts instead of deleting them.
+                // Clean baked checkouts also retain cache-sensitive mtimes.
+                if !initialized
+                    && git_setup::needs_sanitize_impl(repo_path).expect("sanitize check failed")
+                {
                     progress("sanitizing repository...");
                     git_setup::sanitize_impl(repo_path).expect("sanitize failed");
                 }
@@ -444,6 +450,8 @@ fn run_setup(
                 branches: params.branches.clone(),
                 primary: params.primary.clone(),
                 git_identity: params.git_identity.clone(),
+                remotes: params.remotes.clone(),
+                description_file: params.description_file.clone(),
             })
             .expect("git setup failed");
         }
@@ -1289,7 +1297,23 @@ fn build_state_response(repo_path: &Path) -> Result<StateResponse> {
     let has_pi_config = home.join(crate::daemon::PI_CONFIG_COPIED_SENTINEL).exists();
     let has_grok_state = home.join(".grok").exists();
 
+    let description_out = Command::new("git")
+        .args(["config", "--get", "rumpelpod.description-file"])
+        .current_dir(repo_path)
+        .success()
+        .context("reading description policy for fork")?;
+    let description =
+        String::from_utf8(description_out).context("description policy was not UTF-8")?;
+    let description = description.strip_suffix('\n').unwrap_or(&description);
+    let description_file = if description.is_empty() {
+        None
+    } else {
+        Some(description.to_string())
+    };
+
     Ok(StateResponse {
+        remotes: crate::git::get_remotes(repo_path)?,
+        description_file,
         branches,
         primary,
         has_claude_state,

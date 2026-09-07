@@ -70,3 +70,5 @@ mod stop;
 mod systemd;
 #[path = "cli/version.rs"]
 mod version;
+#[path = "cli/workspace_clone.rs"]
+mod workspace_clone;

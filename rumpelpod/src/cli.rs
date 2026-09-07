@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand, ValueEnum, ValueHint};
 
 use crate::completions::PodNameCompleter;
-use crate::config::{ContainerEngine, Host};
+use crate::config::{ContainerEngine, Host, WorkspaceCloneMode};
 
 /// Validate that a pod name contains only Docker/git-safe characters:
 /// ASCII alphanumeric, hyphens, underscores, and dots.
@@ -748,6 +748,10 @@ pub struct PrepareImageCommand {
     #[arg(long)]
     pub repo_path: PathBuf,
 
+    /// Seed the image from the host or defer repository creation to startup
+    #[arg(long, value_enum, default_value = "local")]
+    pub workspace_clone: WorkspaceCloneMode,
+
     /// User to chown the repo to
     #[arg(long)]
     pub user: String,
@@ -775,10 +779,6 @@ pub struct PrepareImageCommand {
     /// Grok CLI version to install (skip if not provided)
     #[arg(long)]
     pub grok_version: Option<String>,
-
-    /// Host git remote to configure (NAME=URL, repeatable)
-    #[arg(long = "remote")]
-    pub remotes: Vec<String>,
 
     /// Absolute path at which docker or k8s will later mount a volume,
     /// tmpfs, or bind source.  Pre-created and chowned to `--user` so

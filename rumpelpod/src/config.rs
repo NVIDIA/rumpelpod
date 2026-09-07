@@ -509,6 +509,9 @@ pub struct KubernetesConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct JsonConfig {
     #[serde(default)]
+    pub build: BuildConfig,
+
+    #[serde(default)]
     pub claude: ClaudeConfig,
 
     #[serde(default)]
@@ -549,6 +552,29 @@ pub struct JsonConfig {
 
     /// Kubernetes target. Mutually exclusive with `host`.
     pub kubernetes: Option<KubernetesConfig>,
+}
+
+/// Preparation shared by Dockerfile, published-image, and Compose launches.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BuildConfig {
+    #[serde(default)]
+    pub workspace_clone: WorkspaceCloneConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WorkspaceCloneConfig {
+    pub mode: WorkspaceCloneMode,
+}
+
+/// The checkout is optional in the image because startup fetches from the host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceCloneMode {
+    #[default]
+    Local,
+    Skip,
 }
 
 /// SSH agent behavior configured in `.rumpelpod.json`.

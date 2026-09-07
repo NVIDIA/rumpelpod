@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::git::GitIdentity;
+use crate::git::{GitIdentity, GitRemote};
 
 // ---------------------------------------------------------------------------
 // Filesystem
@@ -57,6 +57,8 @@ pub struct StateResponse {
     pub has_grok_state: bool,
     /// Working tree has uncommitted changes.
     pub dirty: bool,
+    pub remotes: Vec<GitRemote>,
+    pub description_file: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -132,6 +134,8 @@ pub struct GitSetupParams {
     pub primary: String,
     pub extra_host_fetch: Vec<String>,
     pub git_identity: Option<GitIdentity>,
+    pub remotes: Vec<GitRemote>,
+    pub description_file: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

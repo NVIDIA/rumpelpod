@@ -410,6 +410,16 @@ Local state is tracked in a SQLite database under `~/.local/state/rumpelpod/` (o
 It is optional and holds pod-specific settings that have no devcontainer equivalent.
 Like `devcontainer.json`, the file is parsed as [JSON5](https://json5.org/), so comments and trailing commas are allowed.
 
+### `build.workspaceClone`
+
+```json
+{ "build": { "workspaceClone": { "mode": "skip" } } }
+```
+
+`"local"` (default) clones from the host during image preparation unless the base image already contains a checkout.
+`"skip"` omits the host Git directory from the prepared build context and skips cloning.
+Both modes initialize the repository if needed and fetch from the host at startup.
+
 ### `devcontainer`
 
 ```json
