@@ -870,7 +870,7 @@ async fn events_handler(State(state): State<PodServerState>) -> Response {
                         return;
                     }
                 }
-                _tick = keepalive.tick() => {
+                _ = keepalive.tick() => {
                     if tx_setup.send(sse_event("keepalive", "{}")).await.is_err() {
                         return;
                     }
