@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::Command;
 use walkdir::WalkDir;
 
-use crate::async_command::AsyncCommandExt;
+use crate::async_command::{foreground, AsyncCommandExt};
 use crate::config::{ContainerEngine, Host};
 use crate::devcontainer::{BuildOptions, DevContainer};
 
@@ -201,7 +201,7 @@ pub fn resolve_image(
     docker_socket: Option<&Path>,
     ssh_auth_sock: Option<&Path>,
 ) -> Result<BuildResult> {
-    crate::async_runtime::block_on(resolve_image_async(
+    crate::async_runtime::block_on(foreground(resolve_image_async(
         devcontainer,
         docker_host,
         repo_root,
@@ -210,7 +210,7 @@ pub fn resolve_image(
         on_output,
         docker_socket,
         ssh_auth_sock,
-    ))
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -372,7 +372,7 @@ pub(crate) fn run_buildx_build(
     on_output: Option<BuildOutputFn>,
     ssh_auth_sock: Option<&Path>,
 ) -> Result<()> {
-    crate::async_runtime::block_on(run_buildx_build_async(
+    crate::async_runtime::block_on(foreground(run_buildx_build_async(
         tag,
         dockerfile,
         context,
@@ -380,7 +380,7 @@ pub(crate) fn run_buildx_build(
         extra_args,
         on_output,
         ssh_auth_sock,
-    ))
+    )))
 }
 
 pub(crate) async fn run_buildx_build_async(
@@ -536,7 +536,11 @@ pub fn pull_image(
     docker_host: &Host,
     docker_socket: Option<&Path>,
 ) -> Result<()> {
-    crate::async_runtime::block_on(pull_image_async(image_name, docker_host, docker_socket))
+    crate::async_runtime::block_on(foreground(pull_image_async(
+        image_name,
+        docker_host,
+        docker_socket,
+    )))
 }
 
 pub async fn pull_image_async(

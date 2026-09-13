@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod connections;
+mod creation;
 pub mod db;
 pub mod host_connection;
 pub mod pod_connection;
@@ -1168,16 +1169,13 @@ async fn upload_bind_mounts(pod: &PodClient, binds: &[BindSource]) -> Result<()>
         return Ok(());
     }
 
-    let archive_file = tempfile::NamedTempFile::new().context("creating bind mount archive")?;
-    let write_end = archive_file.reopen()?;
-
     let binds_owned: Vec<(PathBuf, String)> = binds
         .iter()
         .map(|b| (b.source.clone(), b.target.clone()))
         .collect();
 
-    {
-        let mut archive = tar::Builder::new(write_end);
+    pod.init_mounts_async(move |writer| {
+        let mut archive = tar::Builder::new(writer);
         archive.follow_symlinks(true);
         for (source, target) in &binds_owned {
             // target is absolute, e.g. "/mnt/data".  Strip the leading
@@ -1236,12 +1234,11 @@ async fn upload_bind_mounts(pod: &PodClient, binds: &[BindSource]) -> Result<()>
                     })?;
             }
         }
-        archive.into_inner().context("finalizing bind mount tar")?;
-    }
-
-    pod.init_mounts_async(archive_file.reopen()?)
-        .await
-        .context("uploading bind mount data to container")?;
+        archive.finish().context("finalizing bind mount tar")?;
+        Ok(())
+    })
+    .await
+    .context("uploading bind mount data to container")?;
 
     Ok(())
 }
@@ -2535,6 +2532,7 @@ impl DaemonServer {
             host,
             docker_socket.as_deref(),
             &HashMap::new(),
+            &creation::id(&record.token),
         )?))
     }
 
@@ -2937,6 +2935,7 @@ impl DaemonServer {
                         docker_host,
                         docker_socket.as_deref(),
                         &HashMap::new(),
+                        &creation::id(&record.token),
                     ) {
                         Ok(project) => Some(project),
                         Err(e) => return ReconnectPodResult::Unavailable(e),
@@ -3633,7 +3632,7 @@ impl DaemonServer {
             .map_err(&mark_error)?;
 
         let mut bind_sources = Vec::new();
-        let spec = build_k8s_pod_spec(
+        let mut spec = build_k8s_pod_spec(
             pod_name,
             image,
             repo_path,
@@ -3648,10 +3647,14 @@ impl DaemonServer {
         progress_tx
             .send(OutputLine::Stderr("creating container...".into()))
             .ok();
+        spec.labels
+            .insert(crate::executor::LABEL_CREATION.into(), creation::id(&token));
+        let intent = creation::CreateIntent::new(repo_path, &pod_name.0, docker_host, &token)?;
         let backend_container_id = executor
             .launch_async(&exec_pod_id, spec)
             .await
             .map_err(|e| mark_error(e.context("creating k8s pod")))?;
+        intent.confirmed()?;
         self.container_ids.lock().unwrap().ids.insert(
             (repo_path.to_path_buf(), pod_name.0.clone()),
             backend_container_id,
@@ -4502,6 +4505,7 @@ impl DaemonServer {
         }
 
         let exec_pod_id = crate::executor::pod_id_for(&pod_name, &repo_path);
+        let token = SharedGitServerState::generate_token();
         let compose_project = match (&compose_model, &agent_service) {
             (Some(model), Some(service)) => Some(crate::compose::Project::new(
                 exec_pod_id.as_str(),
@@ -4516,6 +4520,7 @@ impl DaemonServer {
                 &docker_host,
                 docker_socket.as_deref(),
                 &client_env,
+                &creation::id(&token),
             )?),
             (None, None) => None,
             (Some(_), None) | (None, Some(_)) => {
@@ -4524,7 +4529,6 @@ impl DaemonServer {
                 ));
             }
         };
-        let token = SharedGitServerState::generate_token();
 
         let local_env_json = serialize_local_env(&local_env_vars);
         let pod_id = {
@@ -4568,6 +4572,8 @@ impl DaemonServer {
         // Create container and run initial git setup.  Closure used so we
         // can retry once on overlay2 filesystem errors (see below).
         let do_create_and_setup = || async {
+            let intent =
+                creation::CreateIntent::new(&repo_path, &pod_name.0, &docker_host, &token)?;
             progress_tx
                 .send(OutputLine::Stderr("creating container...".into()))
                 .ok();
@@ -4585,7 +4591,7 @@ impl DaemonServer {
                 project.inject_rumpel_into_sidecars_async(service).await?;
                 container
             } else {
-                let spec = build_docker_pod_spec(
+                let mut spec = build_docker_pod_spec(
                     &pod_name,
                     &image,
                     &repo_path,
@@ -4598,8 +4604,11 @@ impl DaemonServer {
                     &publish_ports,
                     &progress_tx,
                 )?;
+                spec.labels
+                    .insert(crate::executor::LABEL_CREATION.into(), creation::id(&token));
                 executor.launch_async(&exec_pod_id, spec).await?
             };
+            intent.confirmed()?;
             self.container_ids.lock().unwrap().ids.insert(
                 (repo_path.clone(), pod_name.0.clone()),
                 agent_container.clone(),
@@ -6605,6 +6614,7 @@ pub fn run_daemon() -> Result<()> {
     // (re)started so that pending pushes land without manual re-entry.
     daemon.restore_running_pods();
     daemon.connections.start();
+    daemon.start_creation_cleanup();
     let git_daemon = daemon.clone();
     daemon
         .connections

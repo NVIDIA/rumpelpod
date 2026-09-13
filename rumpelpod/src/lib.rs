@@ -16,6 +16,7 @@ mod cp;
 mod devcontainer;
 mod exec_proxy;
 mod executor;
+mod streaming_upload;
 
 pub use command_ext::CommandExt;
 pub mod daemon;

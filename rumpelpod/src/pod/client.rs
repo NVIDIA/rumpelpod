@@ -496,13 +496,19 @@ impl PodClient {
 
     /// Populate bind mount targets inside the container from a single tar
     /// archive whose entries use absolute destination paths (leading slash
-    /// stripped).  The reader is gzip-compressed on-the-fly and streamed.
+    /// stripped). Archive construction stays synchronous and streams gzip
+    /// output through a bounded channel owned by this request.
     pub async fn init_mounts_async(
         &self,
-        reader: impl std::io::Read + Send + 'static,
+        archive: impl FnOnce(&mut dyn std::io::Write) -> Result<()> + Send + 'static,
     ) -> Result<()> {
-        let gz_reader = GzEncoder::new(reader, Compression::fast());
-        let body = reader_body(gz_reader);
+        let (body, producer) = crate::streaming_upload::StreamingUpload::new(move |writer| {
+            let mut gzip = flate2::write::GzEncoder::new(writer, Compression::fast());
+            archive(&mut gzip)?;
+            gzip.finish()
+                .context("finishing mount archive compression")?;
+            Ok(())
+        });
 
         let base = &self.url;
         let token = &self.token;
@@ -516,16 +522,26 @@ impl PodClient {
             .body(body)
             .send()
             .await
-            .with_context(|| format!("sending request to {url}"))?;
-
-        if response.status().is_success() {
-            Ok(())
-        } else {
+            .with_context(|| format!("sending request to {url}"));
+        let produced = producer.finish().await;
+        let uploaded = async {
+            let response = response?;
+            if response.status().is_success() {
+                return Ok(());
+            }
             let error: ErrorResponse = response.json().await.unwrap_or_else(|_| ErrorResponse {
                 error: "unknown error".to_string(),
             });
             let err = &error.error;
             Err(anyhow::anyhow!("POST /init-mounts: {err}"))
+        }
+        .await;
+        match (uploaded, produced) {
+            (Ok(()), produced) => produced,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(producer_error)) => {
+                Err(error.context(format!("producing mount archive: {producer_error:#}")))
+            }
         }
     }
 

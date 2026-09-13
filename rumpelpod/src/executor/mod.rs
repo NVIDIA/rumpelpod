@@ -36,6 +36,7 @@ use crate::daemon::protocol::PodName;
 pub const LABEL_DOCKER_REPO_PATH: &str = "dev.rumpelpod.repo_path";
 pub const LABEL_DOCKER_CONTAINER_REPO_PATH: &str = "dev.rumpelpod.container_repo_path";
 pub const LABEL_DOCKER_POD_NAME: &str = "dev.rumpelpod.name";
+pub const LABEL_CREATION: &str = "dev.rumpelpod.creation";
 
 // Kubernetes labels.  Values must satisfy k8s label value rules
 // (<=63 chars, [a-z0-9A-Z._-]), so the repo path is stored as a hash

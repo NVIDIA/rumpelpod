@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use crate::daemon::protocol::PodStatus;
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, DeleteParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, PostParams, Preconditions};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 use log::{info, trace};
@@ -426,6 +426,37 @@ impl K8sClient {
             }
             Err(e) => Err(anyhow::Error::new(e).context("deleting pod")),
         }
+    }
+
+    pub(crate) async fn delete_creation_async(&self, creation: &str) -> Result<()> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let selector = format!("{}={creation}", crate::executor::LABEL_CREATION);
+        for pod in pods.list(&ListParams::default().labels(&selector)).await? {
+            let name = pod
+                .metadata
+                .name
+                .context("cleanup pod is missing its name")?;
+            let uid = pod.metadata.uid.context("cleanup pod is missing its UID")?;
+            let result = pods
+                .delete(
+                    &name,
+                    &DeleteParams {
+                        grace_period_seconds: Some(0),
+                        preconditions: Some(Preconditions {
+                            uid: Some(uid),
+                            resource_version: None,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => {}
+                Err(kube::Error::Api(error)) if error.is_not_found() || error.code == 409 => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Get the status of a pod, mapped to PodStatus.

@@ -9,13 +9,14 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use indoc::{formatdoc, indoc};
 use nix::errno::Errno;
-use nix::sys::signal::kill;
+use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 use tempfile::NamedTempFile;
 
@@ -870,4 +871,199 @@ fn startup_task_failed_start_releases_managed_agent() {
     assert_process_exited(agent);
     let socket = fs::read_to_string(repo.path().join("agent-socket")).unwrap();
     assert!(!Path::new(socket.trim()).parent().unwrap().exists());
+}
+
+#[test]
+fn image_commands_sigint_reaches_child() {
+    for operation in ["fetch", "build"] {
+        let repo = TestRepo::new();
+        let home = TestHome::new();
+        match operation {
+            "fetch" => {
+                fs::create_dir_all(repo.path().join(".devcontainer")).unwrap();
+                fs::write(
+                    repo.path().join(".devcontainer/devcontainer.json"),
+                    r#"{"image":"interrupt-image"}"#,
+                )
+                .unwrap();
+            }
+            "build" => write_test_devcontainer(&repo, "", ""),
+            _ => unreachable!("unknown image operation"),
+        }
+        let docker = home.bin_dir().join("docker");
+        fs::write(
+            &docker,
+            indoc! {r#"
+                #!/bin/sh
+                echo $$ > "$INTERRUPT_PID_FILE"
+                exec sleep 600
+            "#},
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let pid_file = repo.path().join("image-child-pid");
+        let mut cli = TestProcess::spawn(
+            Command::new(home.bin_dir().join("rumpel"))
+                .args(["image", operation])
+                .current_dir(repo.path())
+                .env("HOME", home.path())
+                .env("PATH", home.bin_dir())
+                .env("INTERRUPT_PID_FILE", &pid_file)
+                .process_group(0),
+        );
+        let child = wait_for_pid(&pid_file);
+        killpg(Pid::from_raw(cli.child.id() as i32), Signal::SIGINT).unwrap();
+        cli.failure(RECOVERY_TIMEOUT, "Ctrl-C should end the image command");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && kill(child, None).is_ok() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = kill(child, None).is_ok();
+        if survived {
+            kill(child, Signal::SIGKILL).unwrap();
+        }
+        assert!(
+            !survived,
+            "image {operation} left its child {child} running after Ctrl-C"
+        );
+    }
+}
+
+#[test]
+fn startup_task_delete_cleans_late_creation_after_daemon_restart() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let docker = home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).unwrap();
+    let real_docker_path = real_docker.display();
+    let markers = repo.path().display();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+        #!/bin/sh
+        case " $* " in
+            *" create "*)
+                if [ ! -e '{markers}/accepted-args' ]; then
+                    printf '%s\0' "$@" > '{markers}/accepted-args'
+                    echo $$ > '{markers}/create-parent'
+                    exec sleep 600
+                fi
+                ;;
+        esac
+        exec '{real_docker_path}' "$@"
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    write_test_devcontainer(&repo, "VOLUME /late-anonymous-volume", "");
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "late-create",
+        "--",
+        "true",
+    ]));
+    launch.wait_for_output("creating container...");
+    let parent = wait_for_pid(&repo.path().join("create-parent"));
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "late-create",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete before the backend finishes creating",
+    );
+    launch.failure(RECOVERY_TIMEOUT, "cancelled startup must finish");
+    assert_process_exited(parent);
+    daemon.kill();
+    drop(daemon);
+
+    // Model an accepted backend request completing after its client was
+    // cancelled and delete saw NotFound. Replaying the saved request here
+    // puts its completion outside both the startup task and daemon lifetime.
+    let bytes = fs::read(repo.path().join("accepted-args")).unwrap();
+    let arguments: Vec<_> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| std::str::from_utf8(arg).unwrap())
+        .collect();
+    let container = TestProcess::spawn(Command::new(&real_docker).args(arguments)).success(
+        RECOVERY_TIMEOUT,
+        "complete accepted creation after deletion",
+    );
+    let container = container.trim();
+    let volume = TestProcess::spawn(Command::new(&real_docker).args([
+        "inspect",
+        "--format",
+        "{{range .Mounts}}{{if eq .Destination \"/late-anonymous-volume\"}}{{.Name}}{{end}}{{end}}",
+        container,
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "find anonymous volume owned by late container",
+    );
+    let volume = volume.trim();
+    assert!(!volume.is_empty());
+
+    let daemon = TestDaemon::start(&home);
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    loop {
+        let remaining = TestProcess::spawn(Command::new(&real_docker).args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("id={container}"),
+        ]))
+        .success(RECOVERY_TIMEOUT, "check late creation cleanup");
+        let remaining_volume = TestProcess::spawn(Command::new(&real_docker).args([
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            &format!("name={volume}"),
+        ]))
+        .success(RECOVERY_TIMEOUT, "check late anonymous volume cleanup");
+        if remaining.trim().is_empty() && remaining_volume.trim().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late container survived daemon restart: {container}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Retained cleanup intents must not mistake the replacement for the
+    // abandoned launch, even though both use the same logical pod name.
+    write_test_devcontainer(&repo, "", "");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "late-create",
+        "--",
+        "true",
+    ]))
+    .success(
+        Duration::from_secs(60),
+        "reuse pod name after late creation cleanup",
+    );
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "late-create",
+        "--",
+        "sleep",
+        "1",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "cleanup must preserve a subsequent launch",
+    );
 }

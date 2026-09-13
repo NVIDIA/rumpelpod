@@ -1791,8 +1791,16 @@ fn init_mounts_impl(reader: impl std::io::Read) -> Result<()> {
             })?;
         }
     }
+    // Tar stops at its end marker before gzip and HTTP reach EOF. Drain
+    // the body so success also confirms that the producer finished writing.
+    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
+        .context("finishing mount upload")?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "mount_upload_tests.rs"]
+mod mount_upload_tests;
 
 #[cfg(test)]
 mod tests {

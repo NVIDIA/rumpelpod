@@ -260,6 +260,41 @@ impl Executor {
         }
     }
 
+    pub(crate) async fn delete_creation_async(&self, creation: &str) -> Result<()> {
+        match &self.inner {
+            Inner::Docker(backend) => {
+                let filter = format!("label={}={creation}", super::LABEL_CREATION);
+                for (list, remove) in [
+                    (vec!["ps", "-aq"], vec!["rm", "-f", "-v"]),
+                    (vec!["network", "ls", "-q"], vec!["network", "rm"]),
+                ] {
+                    let output = backend
+                        .command()
+                        .args(list)
+                        .args(["--filter", &filter])
+                        .success_async()
+                        .await?;
+                    for id in String::from_utf8(output)?.lines() {
+                        let output = backend
+                            .command()
+                            .args(&remove)
+                            .arg(id)
+                            .output_async()
+                            .await?;
+                        if !output.status.success() && !docker_not_found(&output) {
+                            let error = docker_stderr(&output);
+                            return Err(anyhow::anyhow!(
+                                "removing creation resource {id}: {error}"
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Inner::Kubernetes(backend) => backend.client.delete_creation_async(creation).await,
+        }
+    }
+
     /// Current pod status.  Returns `Gone` when the pod no longer
     /// exists on the backend.
     pub fn status<T: AsRef<str> + ?Sized>(&self, id: &T) -> Result<PodStatus> {

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::future::Future;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -12,6 +13,16 @@ use nix::unistd::Pid;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 use crate::image::OutputLine;
+
+tokio::task_local! {
+    static FOREGROUND: ();
+}
+
+// CLI image commands share the terminal's process group so signals reach
+// their children even when the CLI exits without running destructors.
+pub(crate) async fn foreground<F: Future>(future: F) -> F::Output {
+    FOREGROUND.scope((), future).await
+}
 
 // Killing just the shell leaves its children running after startup is
 // cancelled. Keep the group owned until the whole command has completed.
@@ -33,14 +44,32 @@ impl ProcessGroup {
 struct CommandLease<'a> {
     target: &'a mut Command,
     command: Option<tokio::process::Command>,
+    owns_group: bool,
 }
 
 impl<'a> CommandLease<'a> {
     fn new(target: &'a mut Command) -> Self {
-        let command = take_command(target);
+        let owns_group = FOREGROUND.try_with(|()| ()).is_err();
+        let mut command =
+            tokio::process::Command::from(std::mem::replace(target, Command::new("")));
+        command.as_std_mut().process_group(if owns_group {
+            0
+        } else {
+            nix::unistd::getpgrp().as_raw()
+        });
+        command.kill_on_drop(true);
         Self {
             target,
             command: Some(command),
+            owns_group,
+        }
+    }
+
+    fn group(&self, child: &tokio::process::Child) -> ProcessGroup {
+        if self.owns_group {
+            ProcessGroup::new(child)
+        } else {
+            ProcessGroup(None)
         }
     }
 }
@@ -75,13 +104,6 @@ impl Drop for ProcessGroup {
     }
 }
 
-fn take_command(command: &mut Command) -> tokio::process::Command {
-    let mut command = tokio::process::Command::from(std::mem::replace(command, Command::new("")));
-    command.as_std_mut().process_group(0);
-    command.kill_on_drop(true);
-    command
-}
-
 // These methods use Tokio's stdio semantics: output captures stdout/stderr
 // and leaves stdin as configured. Callers feeding no input can set it to null.
 pub(crate) trait AsyncCommandExt {
@@ -95,7 +117,7 @@ impl AsyncCommandExt for Command {
         let mut command = CommandLease::new(self);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
-        let mut group = ProcessGroup::new(&child);
+        let mut group = command.group(&child);
         let mut stdout = child.stdout.take().expect("stdout was piped");
         let mut stderr = child.stderr.take().expect("stderr was piped");
         let mut stdout_bytes = Vec::new();
@@ -116,7 +138,7 @@ impl AsyncCommandExt for Command {
     async fn status_async(&mut self) -> io::Result<ExitStatus> {
         let mut command = CommandLease::new(self);
         let mut child = command.spawn()?;
-        let mut group = ProcessGroup::new(&child);
+        let mut group = command.group(&child);
         let status = child.wait().await?;
         group.completed(status);
         Ok(status)
@@ -144,7 +166,7 @@ pub(crate) async fn stream_output(
     let mut child_command = CommandLease::new(command);
     child_command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = child_command.spawn().context("starting command")?;
-    let mut group = ProcessGroup::new(&child);
+    let mut group = child_command.group(&child);
     let mut stdout = BufReader::new(child.stdout.take().expect("stdout was piped")).lines();
     let mut stderr = BufReader::new(child.stderr.take().expect("stderr was piped")).lines();
     let mut stdout_done = false;

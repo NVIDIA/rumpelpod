@@ -3,29 +3,48 @@ Make pod startup an owned cancellable task
 Startup workers could retain lifecycle locks after their clients left,
 blocking recovery from stopped containers and stalled setup commands.
 
-Own startup, reconnect, fork, and recreate as async tasks. Delete aborts
-active and queued startup tasks, waits for their destruction, then takes
-the lifecycle lock and removes remaining pod state. Expose pending
-startup before container creation so delete can also cancel initializers
-and image builds. Client disconnection detaches from startup.
+Own startup, reconnect, fork, and recreate as async tasks. Delete
+aborts active and queued startup tasks, waits for their destruction,
+then takes the lifecycle lock and removes remaining pod state. Expose
+pending startup before container creation so delete can also cancel
+initializers and image builds. Client disconnection detaches from
+startup.
 
 Await subprocesses and network operations throughout startup while
 keeping filesystem and database work synchronous. Resource guards kill
 cancelled process groups and release temporary files, connections,
-agents, and proxy sessions. Backend cleanup uses the reserved pod name
-when a create request acted before its reply was lost.
+agents, and proxy sessions. Keep standalone image commands in the
+terminal process group so Ctrl-C also reaches builders and pull
+clients.
+
+Record unconfirmed creates durably before contacting the backend. If a
+request finishes after delete observed NotFound, cleanup finds its
+launch identity, including after a daemon restart. Remove containers
+and networks by immutable identity and use Kubernetes UID
+preconditions so cleanup cannot target a newer launch with the same
+pod name. Retain uncertain intents because absence alone cannot prove
+completion. Named volumes remain subject to explicit lifecycle cleanup
+because they may be shared or reused.
+
+Stream bind archives through a bounded channel from a synchronous
+filesystem producer. Cancellation and early HTTP rejection release
+writers blocked on the network. Drain successful uploads through EOF
+so gzip finalization and archive errors cannot race with success
+responses.
 
 Bound readiness connection attempts and idle reads. Startup heartbeats
 allow healthy lifecycle commands to run without an overall deadline.
 Fail an established readiness stream when its container disappears.
 
 Regression tests cover abandoned readiness waits, stopped and paused
-containers, queued enters, initializer and builder descendants, host Git
-fetches, failed-start cleanup, and cancellation after container
-creation. Transport tests preserve half-closed SSH responses and partial
-tunnel frames during concurrent events.
+containers, queued enters, initializer and builder descendants, host
+Git fetches, failed-start cleanup, and cancellation after container
+creation, late backend completion across daemon restart, terminal
+signals, streaming uploads, and gzip finalization. Transport tests
+preserve half-closed SSH responses and partial tunnel frames during
+concurrent events.
 
 Validation: required smoke and feature filters passed via cargo
-pipeline. The full suite and its resumed checks passed 596 tests with
-two skips. macOS validation was unavailable because the macos host did
-not resolve.
+pipeline. The full pipeline passed 603 tests with two skips and no
+failures. macOS validation was unavailable because the macos SSH
+hostname did not resolve.

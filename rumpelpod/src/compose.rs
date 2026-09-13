@@ -180,6 +180,39 @@ impl Model {
         &self.json
     }
 
+    fn label_creation(&mut self, creation: &str) -> Result<()> {
+        // Named volumes can outlive a launch and be adopted by another pod.
+        // Only resources with immutable backend IDs are safe to sweep later.
+        for kind in ["services", "networks"] {
+            if let Some(resources) = self.value.get_mut(kind) {
+                for resource in resources
+                    .as_object_mut()
+                    .context("invalid compose resources")?
+                    .values_mut()
+                {
+                    let resource = resource
+                        .as_object_mut()
+                        .context("invalid compose resource")?;
+                    if resource.get("external").and_then(Value::as_bool) == Some(true) {
+                        continue;
+                    }
+                    let labels = resource
+                        .entry("labels")
+                        .or_insert_with(|| serde_json::json!({}));
+                    labels
+                        .as_object_mut()
+                        .context("invalid compose resource labels")?
+                        .insert(
+                            crate::executor::LABEL_CREATION.to_string(),
+                            Value::String(creation.to_string()),
+                        );
+                }
+            }
+        }
+        self.json = serde_json::to_string(&self.value)?;
+        Ok(())
+    }
+
     pub fn services(&self) -> HashSet<String> {
         self.value
             .get("services")
@@ -662,7 +695,7 @@ impl Project {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: &str,
-        model: Model,
+        mut model: Model,
         agent_service: &str,
         pod_name: &str,
         prepared_image: &str,
@@ -673,8 +706,10 @@ impl Project {
         host: &Host,
         docker_socket: Option<&Path>,
         client_env: &HashMap<String, String>,
+        creation: &str,
     ) -> Result<Self> {
         model.validate_service(agent_service)?;
+        model.label_creation(creation)?;
         let override_yaml = generate_override(
             &model,
             agent_service,
