@@ -386,29 +386,81 @@ fn spawn_host_mux(
         let mut keepalive_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
         keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        loop {
-            tokio::select! {
-                frame_res = read_frame(&mut pod_stdout) => {
-                    let frame = match frame_res {
-                        Ok(f) => f,
-                        Err(e) => {
-                            log::debug!("tunnel mux: read error: {e}");
-                            break;
-                        }
-                    };
-                    match frame.frame_type {
-                        FRAME_OPEN => {
-                            let sid = frame.stream_id;
-                            // Connect synchronously so the write half is in the
-                            // map before we read the next frame (which is likely
-                            // a DATA for this same stream).
-                            let tcp = match TcpStream::connect(&target_addr).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    log::debug!(
-                                        "tunnel: failed to connect to {target_addr}: {e}"
-                                    );
-                                    let mut w = stdin_mu.lock().await;
+        let mut readers = tokio::task::JoinSet::new();
+        let mux = async {
+            let mut frame_read = Box::pin(read_frame(&mut pod_stdout));
+            loop {
+                tokio::select! {
+                    Some(result) = readers.join_next() => {
+                        if let Err(error) = result { log::error!("tunnel reader task failed: {error}"); }
+                    }
+                    frame_res = &mut frame_read => {
+                        // Keep partial frames across timer and reader completions.
+                        drop(frame_read);
+                        frame_read = Box::pin(read_frame(&mut pod_stdout));
+                        let frame = match frame_res {
+                            Ok(f) => f,
+                            Err(e) => {
+                                log::debug!("tunnel mux: read error: {e}");
+                                break;
+                            }
+                        };
+                        match frame.frame_type {
+                            FRAME_OPEN => {
+                                let sid = frame.stream_id;
+                                // Connect synchronously so the write half is in the
+                                // map before we read the next frame (which is likely
+                                // a DATA for this same stream).
+                                let tcp = match TcpStream::connect(&target_addr).await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        log::debug!(
+                                            "tunnel: failed to connect to {target_addr}: {e}"
+                                        );
+                                        let mut w = stdin_mu.lock().await;
+                                        let _ = write_frame(
+                                            &mut *w,
+                                            &Frame {
+                                                stream_id: sid,
+                                                frame_type: FRAME_CLOSE,
+                                                payload: Vec::new(),
+                                            },
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                };
+                                let (read_half, write_half) = tokio::io::split(tcp);
+                                writes_clone.lock().await.insert(sid, write_half);
+
+                                // Spawn reader: local TCP read -> DATA frames back
+                                // to pod, CLOSE on EOF.
+                                let stdin_for_reader = stdin_mu.clone();
+                                let writes_for_reader = writes_clone.clone();
+                                readers.spawn(async move {
+                                    let mut reader = read_half;
+                                    let mut buf = vec![0u8; MAX_PAYLOAD];
+                                    loop {
+                                        let n = match reader.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(n) => n,
+                                        };
+                                        let mut w = stdin_for_reader.lock().await;
+                                        if write_frame(
+                                            &mut *w,
+                                            &Frame {
+                                                stream_id: sid,
+                                                frame_type: FRAME_DATA,
+                                                payload: buf[..n].to_vec(),
+                                            },
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    let mut w = stdin_for_reader.lock().await;
                                     let _ = write_frame(
                                         &mut *w,
                                         &Frame {
@@ -418,106 +470,66 @@ fn spawn_host_mux(
                                         },
                                     )
                                     .await;
-                                    continue;
-                                }
-                            };
-                            let (read_half, write_half) = tokio::io::split(tcp);
-                            writes_clone.lock().await.insert(sid, write_half);
-
-                            // Spawn reader: local TCP read -> DATA frames back
-                            // to pod, CLOSE on EOF.
-                            let stdin_for_reader = stdin_mu.clone();
-                            let writes_for_reader = writes_clone.clone();
-                            tokio::spawn(async move {
-                                let mut reader = read_half;
-                                let mut buf = vec![0u8; MAX_PAYLOAD];
-                                loop {
-                                    let n = match reader.read(&mut buf).await {
-                                        Ok(0) | Err(_) => break,
-                                        Ok(n) => n,
-                                    };
-                                    let mut w = stdin_for_reader.lock().await;
-                                    if write_frame(
-                                        &mut *w,
-                                        &Frame {
-                                            stream_id: sid,
-                                            frame_type: FRAME_DATA,
-                                            payload: buf[..n].to_vec(),
-                                        },
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        break;
+                                    writes_for_reader.lock().await.remove(&sid);
+                                });
+                            }
+                            FRAME_DATA => {
+                                let mut map = writes_clone.lock().await;
+                                if let Some(writer) = map.get_mut(&frame.stream_id) {
+                                    if writer.write_all(&frame.payload).await.is_err() {
+                                        map.remove(&frame.stream_id);
                                     }
                                 }
-                                let mut w = stdin_for_reader.lock().await;
-                                let _ = write_frame(
-                                    &mut *w,
-                                    &Frame {
-                                        stream_id: sid,
-                                        frame_type: FRAME_CLOSE,
-                                        payload: Vec::new(),
-                                    },
-                                )
-                                .await;
-                                writes_for_reader.lock().await.remove(&sid);
-                            });
-                        }
-                        FRAME_DATA => {
-                            let mut map = writes_clone.lock().await;
-                            if let Some(writer) = map.get_mut(&frame.stream_id) {
-                                if writer.write_all(&frame.payload).await.is_err() {
-                                    map.remove(&frame.stream_id);
+                            }
+                            FRAME_CLOSE => {
+                                // Dropping the WriteHalf from tokio::io::split
+                                // does not close the TcpStream -- both halves
+                                // share a BiLock and the ReadHalf is still
+                                // pinned in the reader task below.  Shutdown
+                                // sends FIN so the server observes EOF and
+                                // closes, which lets the reader task exit
+                                // and release the fd.
+                                let sid = frame.stream_id;
+                                let writer = writes_clone.lock().await.remove(&sid);
+                                if let Some(mut writer) = writer {
+                                    if let Err(e) = writer.shutdown().await {
+                                        log::error!(
+                                            "tunnel mux: shutdown on stream {sid} failed: {e}"
+                                        );
+                                    }
                                 }
                             }
-                        }
-                        FRAME_CLOSE => {
-                            // Dropping the WriteHalf from tokio::io::split
-                            // does not close the TcpStream -- both halves
-                            // share a BiLock and the ReadHalf is still
-                            // pinned in the reader task below.  Shutdown
-                            // sends FIN so the server observes EOF and
-                            // closes, which lets the reader task exit
-                            // and release the fd.
-                            let sid = frame.stream_id;
-                            let writer = writes_clone.lock().await.remove(&sid);
-                            if let Some(mut writer) = writer {
-                                if let Err(e) = writer.shutdown().await {
-                                    log::error!(
-                                        "tunnel mux: shutdown on stream {sid} failed: {e}"
-                                    );
-                                }
+                            _ => {
+                                let frame_type = frame.frame_type;
+                                log::debug!(
+                                    "tunnel mux: unknown frame type {frame_type}"
+                                );
                             }
                         }
-                        _ => {
-                            let frame_type = frame.frame_type;
-                            log::debug!(
-                                "tunnel mux: unknown frame type {frame_type}"
-                            );
+                    }
+                    _ = keepalive_interval.tick() => {
+                        let mut w = stdin_mu.lock().await;
+                        if write_frame(
+                            &mut *w,
+                            &Frame {
+                                stream_id: 0,
+                                frame_type: FRAME_DATA,
+                                payload: Vec::new(),
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
                         }
                     }
-                }
-                _ = keepalive_interval.tick() => {
-                    let mut w = stdin_mu.lock().await;
-                    if write_frame(
-                        &mut *w,
-                        &Frame {
-                            stream_id: 0,
-                            frame_type: FRAME_DATA,
-                            payload: Vec::new(),
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                }
-                _ = cancel_rx.changed() => {
-                    break;
                 }
             }
+        };
+        // Cancellation must also interrupt awaits within a frame handler.
+        tokio::select! {
+            () = mux => {}
+            _ = cancel_rx.changed() => {}
         }
         alive.store(false, Ordering::Relaxed);
     });
@@ -640,7 +652,7 @@ async fn start_tunnel_inner(
     }
 
     // Drain remaining stderr to debug log in the background.
-    tokio::spawn(async move {
+    let stderr_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         loop {
             match stderr.read(&mut buf).await {
@@ -654,7 +666,7 @@ async fn start_tunnel_inner(
                 }
             }
         }
-    });
+    }));
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let alive = Arc::new(AtomicBool::new(true));
@@ -665,7 +677,7 @@ async fn start_tunnel_inner(
         target_addr.to_string(),
         cancel_rx,
         alive.clone(),
-        keepalive,
+        (keepalive, stderr_task),
     );
 
     Ok(TunnelHandle {
@@ -742,6 +754,56 @@ mod tests {
             .expect("read failed");
         assert_eq!(n, 0, "expected EOF after FRAME_CLOSE");
 
+        drop(cancel_tx);
+    }
+
+    #[tokio::test]
+    async fn tunnel_partial_frame_survives_keepalive_tick() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let (from_pod_host, mut from_pod_test) = tokio::io::duplex(8192);
+        let (to_pod_host, mut to_pod_test) = tokio::io::duplex(8192);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        spawn_host_mux(
+            from_pod_host,
+            to_pod_host,
+            target,
+            cancel_rx,
+            Arc::new(AtomicBool::new(true)),
+            (),
+        );
+        write_frame(
+            &mut from_pod_test,
+            &Frame {
+                stream_id: 1,
+                frame_type: FRAME_OPEN,
+                payload: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let (mut target, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        // Consume the immediate tick before deliberately splitting a frame
+        // across the following tick. Its bytes must stay in the same reader.
+        read_frame(&mut to_pod_test).await.unwrap();
+        from_pod_test
+            .write_all(&[1, 0, 0, 0, FRAME_DATA, 3, 0, 0, 0, b'a'])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(6), read_frame(&mut to_pod_test))
+            .await
+            .unwrap()
+            .unwrap();
+        from_pod_test.write_all(b"bc").await.unwrap();
+        let mut received = [0; 3];
+        tokio::time::timeout(Duration::from_secs(2), target.read_exact(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received, b"abc");
         drop(cancel_tx);
     }
 }

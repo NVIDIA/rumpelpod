@@ -1,0 +1,1069 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! A launch waiting for the container's SSE state greeting holds the pod's
+//! lifecycle lock even after its CLI disconnects. These regressions require
+//! subsequent delete and enter requests to recover without a daemon restart.
+//! The startup hook supplies a reproducible stall; the original incident's
+//! initial cause was unknown.
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+use indoc::{formatdoc, indoc};
+use nix::errno::Errno;
+use nix::sys::signal::{kill, killpg, Signal};
+use nix::unistd::Pid;
+use tempfile::NamedTempFile;
+
+use crate::common::{pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo};
+use crate::executor::{executor_mode, skip_test, ExecutorMode, ExecutorResources};
+
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+// A failed assertion must reap the CLI before TestDaemon removes the pods.
+// Files keep diagnostics available without a pipe reader that could itself
+// hang when an abandoned process retains stdout or stderr.
+struct TestProcess {
+    child: Child,
+    log: NamedTempFile,
+}
+
+impl TestProcess {
+    fn spawn(command: &mut Command) -> Self {
+        let log = NamedTempFile::new().expect("create command log");
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(log.as_file().try_clone().expect("open stdout log"))
+            .stderr(log.as_file().try_clone().expect("open stderr log"))
+            .spawn()
+            .expect("spawn test command");
+        Self { child, log }
+    }
+
+    fn output(&self) -> String {
+        fs::read_to_string(self.log.path()).expect("read command log")
+    }
+
+    fn wait_for_output(&mut self, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let output = self.output();
+            if output.contains(marker) {
+                return;
+            }
+            assert!(
+                self.child.try_wait().expect("poll command").is_none(),
+                "command exited before {marker:?}:\n{output}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "command never reached {marker:?}:\n{output}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn success(&mut self, timeout: Duration, reason: &str) -> String {
+        let status = self.wait(timeout, reason);
+        let output = self.output();
+        assert!(status.success(), "{reason}: {status}\n{output}");
+        output
+    }
+
+    fn failure(&mut self, timeout: Duration, reason: &str) -> String {
+        let status = self.wait(timeout, reason);
+        let output = self.output();
+        assert!(!status.success(), "{reason}: command succeeded\n{output}");
+        output
+    }
+
+    fn wait(&mut self, timeout: Duration, reason: &str) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll command") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{reason}: command did not finish within {timeout:?}\n{}",
+                self.output()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn abandon(&mut self) {
+        assert!(
+            self.child.try_wait().expect("poll launch").is_none(),
+            "launch finished before its CLI could be abandoned:\n{}",
+            self.output()
+        );
+        self.child.kill().expect("kill launching CLI");
+        self.child.wait().expect("reap launching CLI");
+    }
+}
+
+impl Drop for TestProcess {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(e) => eprintln!("failed to poll test command during cleanup: {e}"),
+        }
+        if let Err(e) = self.child.kill() {
+            eprintln!("failed to kill test command during cleanup: {e}");
+        }
+        if let Err(e) = self.child.wait() {
+            eprintln!("failed to reap test command during cleanup: {e}");
+        }
+    }
+}
+
+fn requires_local_docker() -> bool {
+    // These tests stop containers behind the daemon's back to model the
+    // stopped containers left by the reboot in the reported incident.
+    match executor_mode() {
+        ExecutorMode::Docker => true,
+        ExecutorMode::Podman | ExecutorMode::Ssh | ExecutorMode::K8s => {
+            skip_test();
+            false
+        }
+    }
+}
+
+fn blocked_launch(repo: &TestRepo, daemon: &TestDaemon, name: &str) -> (TestProcess, String) {
+    // The persistent marker lets a restarted container finish setup, so an
+    // enter timeout after stopping it cannot be blamed on the hook rerunning.
+    write_test_devcontainer(
+        repo,
+        "",
+        indoc! {r#",
+            "onCreateCommand": "if [ ! -e /tmp/readiness-started ]; then touch /tmp/readiness-started; while [ ! -e /tmp/release-readiness ]; do sleep 0.1; done; fi",
+            "waitFor": "onCreateCommand"
+        "#},
+    );
+    let mut launch = TestProcess::spawn(pod_command(repo, daemon).args([
+        "enter",
+        "--create",
+        name,
+        "--",
+        "echo",
+        "readiness-enter-ok",
+    ]));
+
+    // This message reaches the CLI through wait_ready_impl's /events reader,
+    // proving the launch has reached readiness polling with its lock held.
+    launch.wait_for_output("running lifecycle commands...");
+    let repo_path = repo.path().display();
+    let output = TestProcess::spawn(Command::new("docker").args([
+        "ps",
+        "-q",
+        "--filter",
+        &format!("label=dev.rumpelpod.repo_path={repo_path}"),
+        "--filter",
+        &format!("label=dev.rumpelpod.name={name}"),
+    ]))
+    .success(RECOVERY_TIMEOUT, "find the test container");
+    let ids: Vec<_> = output.lines().collect();
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected exactly one test container: {output}"
+    );
+    let container_id = ids[0].to_string();
+    TestProcess::spawn(Command::new("docker").args([
+        "exec",
+        &container_id,
+        "sh",
+        "-c",
+        "while [ ! -e /tmp/readiness-started ]; do sleep 0.1; done",
+    ]))
+    .success(RECOVERY_TIMEOUT, "startup hook did not reach its barrier");
+    (launch, container_id)
+}
+
+fn stop_container(container_id: &str) {
+    // rumpel stop needs the same lock as launch and would hide the readiness
+    // retry bug behind another lock waiter. Kill only this test's container.
+    TestProcess::spawn(Command::new("docker").args(["kill", container_id]))
+        .success(RECOVERY_TIMEOUT, "stop container outside the daemon");
+    let output = TestProcess::spawn(Command::new("docker").args([
+        "inspect",
+        "--format",
+        "{{.State.Running}}",
+        container_id,
+    ]))
+    .success(RECOVERY_TIMEOUT, "inspect stopped container");
+    assert_eq!(output.trim(), "false");
+}
+
+#[test]
+fn readiness_wait_completes_when_lifecycle_is_released() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "release-readiness");
+
+    // This exceeds the readiness read deadline and the lifecycle guard's
+    // first progress message. Only startup heartbeats keep the stream live
+    // until the next progress message at 70 seconds.
+    std::thread::sleep(Duration::from_secs(45));
+    assert!(
+        launch
+            .child
+            .try_wait()
+            .expect("poll live startup")
+            .is_none(),
+        "healthy setup timed out before the hook was released:\n{}",
+        launch.output()
+    );
+    TestProcess::spawn(Command::new("docker").args([
+        "exec",
+        &container_id,
+        "touch",
+        "/tmp/release-readiness",
+    ]))
+    .success(RECOVERY_TIMEOUT, "release the startup hook");
+    let output = launch.success(RECOVERY_TIMEOUT, "readiness should complete after release");
+    assert!(output.contains("readiness-enter-ok"), "{output}");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "release-readiness",
+    ]))
+    .success(RECOVERY_TIMEOUT, "completed launch should release the lock");
+}
+
+#[test]
+fn readiness_wait_delete_cancels_abandoned_launch() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, _container_id) = blocked_launch(&repo, &daemon, "delete-readiness");
+    launch.abandon();
+
+    // /events remains open without a state greeting. Deletion must be able
+    // to interrupt that read rather than wait for setup to finish.
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "delete-readiness",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete blocked behind the abandoned launch's readiness wait",
+    );
+    let output = TestProcess::spawn(pod_command(&repo, &daemon).arg("list"))
+        .success(RECOVERY_TIMEOUT, "list after deletion");
+    assert!(!output.contains("delete-readiness"), "{output}");
+}
+
+#[test]
+fn readiness_wait_delete_cancels_abandoned_launch_in_stopped_container() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "delete-stopped-readiness");
+    launch.abandon();
+    stop_container(&container_id);
+
+    // The stopped server can never supply a greeting. Retrying its endpoint
+    // indefinitely must not prevent removal of the abandoned pod.
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "delete-stopped-readiness",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete blocked behind readiness retries for a stopped container",
+    );
+    let output = TestProcess::spawn(pod_command(&repo, &daemon).arg("list"))
+        .success(RECOVERY_TIMEOUT, "list after deletion");
+    assert!(!output.contains("delete-stopped-readiness"), "{output}");
+}
+
+#[test]
+fn readiness_wait_enter_recovers_abandoned_launch_in_stopped_container() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "enter-stopped-readiness");
+    launch.abandon();
+    stop_container(&container_id);
+
+    let output = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "enter-stopped-readiness",
+        "--",
+        "echo",
+        "readiness-recovered",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "enter blocked behind readiness retries instead of restarting the stopped container",
+    );
+    assert!(output.contains("readiness-recovered"), "{output}");
+}
+
+#[test]
+fn readiness_wait_reports_stopped_container_to_launching_cli() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "failed-readiness");
+
+    stop_container(&container_id);
+    let output = launch.failure(
+        RECOVERY_TIMEOUT,
+        "a stopped container should fail its launch without another command cancelling it",
+    );
+    assert!(output.contains("event stream"), "{output}");
+}
+
+#[test]
+fn readiness_wait_delete_cancels_attached_launch_with_unresponsive_server() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "paused-readiness");
+
+    // A paused server cannot send progress or close its stream. Delete must
+    // interrupt the pending read even while the original CLI is still alive.
+    TestProcess::spawn(Command::new("docker").args(["pause", &container_id]))
+        .success(RECOVERY_TIMEOUT, "pause the test container");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "paused-readiness",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete must interrupt an unresponsive readiness stream",
+    );
+    let output = launch.failure(RECOVERY_TIMEOUT, "delete must cancel the original launch");
+    assert!(
+        output.contains("pod operation cancelled by delete"),
+        "{output}"
+    );
+}
+
+#[test]
+fn readiness_wait_reports_unresponsive_server_to_launching_cli() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, container_id) = blocked_launch(&repo, &daemon, "silent-readiness");
+
+    TestProcess::spawn(Command::new("docker").args(["pause", &container_id]))
+        .success(RECOVERY_TIMEOUT, "pause the test container");
+    let output = launch.failure(
+        Duration::from_secs(45),
+        "a server that stops sending heartbeats should fail its launch",
+    );
+    assert!(output.contains("event stream"), "{output}");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "silent-readiness",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "readiness timeout should release the lock",
+    );
+}
+
+#[test]
+fn readiness_wait_delete_cancels_queued_enter_without_recreating_pod() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let (mut launch, _container_id) = blocked_launch(&repo, &daemon, "queued-readiness");
+    launch.abandon();
+
+    let mut enter = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "queued-readiness",
+        "--",
+        "true",
+    ]));
+    enter.wait_for_output("waiting for another operation on this pod");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "queued-readiness",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete must take priority over queued enter",
+    );
+    let output = enter.failure(
+        RECOVERY_TIMEOUT,
+        "queued enter must not recreate a deleted pod",
+    );
+    assert!(
+        output.contains("pod operation cancelled by delete"),
+        "{output}"
+    );
+    let output = TestProcess::spawn(pod_command(&repo, &daemon).arg("list"))
+        .success(RECOVERY_TIMEOUT, "list after cancelling the queued enter");
+    assert!(!output.contains("queued-readiness"), "{output}");
+}
+
+fn wait_for_pid(path: &Path) -> Pid {
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(text) if !text.trim().is_empty() => {
+                return Pid::from_raw(text.trim().parse().expect("parse command PID"));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("read PID marker: {e}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command did not write {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_process_exited(pid: Pid) {
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    loop {
+        match kill(pid, None) {
+            Err(Errno::ESRCH) => return,
+            Ok(()) => {}
+            Err(e) => panic!("probe command {pid}: {e}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled startup left process {pid} alive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn startup_task_delete_cancels_host_initializer_and_its_children() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    write_test_devcontainer(
+        &repo,
+        "",
+        indoc! {r#",
+        "initializeCommand": "echo $$ > init-parent; sh -c 'echo $$ > init-child; exec sleep 600' & wait"
+    "#},
+    );
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "cancel-initializer",
+        "--",
+        "true",
+    ]));
+    launch.wait_for_output("running initializeCommand...");
+    let parent = wait_for_pid(&repo.path().join("init-parent"));
+    let child = wait_for_pid(&repo.path().join("init-child"));
+
+    // This is before image resolution or the pod DB row exists. Delete must
+    // find the daemon-owned task, and dropping it must stop the whole command.
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "cancel-initializer",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete must cancel an initializer before container creation",
+    );
+    launch.failure(
+        RECOVERY_TIMEOUT,
+        "cancelled initializer must fail its launch",
+    );
+    assert_process_exited(parent);
+    assert_process_exited(child);
+
+    write_test_devcontainer(&repo, "", "");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "cancel-initializer",
+        "--",
+        "true",
+    ]))
+    .success(
+        Duration::from_secs(60),
+        "cancelled startup must release its pod name",
+    );
+}
+
+#[test]
+fn startup_task_survives_cli_disconnection_during_initializer() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    write_test_devcontainer(
+        &repo,
+        "",
+        indoc! {r#",
+        "initializeCommand": "echo $$ > init-parent; while [ ! -e release-initializer ]; do sleep 0.1; done"
+    "#},
+    );
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "detached-initializer",
+        "--",
+        "true",
+    ]));
+    launch.wait_for_output("running initializeCommand...");
+    wait_for_pid(&repo.path().join("init-parent"));
+    launch.abandon();
+    fs::write(repo.path().join("release-initializer"), "").unwrap();
+
+    // Observing list does not resume startup; only the original task can
+    // create the container after its CLI has disconnected.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let output = TestProcess::spawn(pod_command(&repo, &daemon).args(["list", "--sync"]))
+            .success(RECOVERY_TIMEOUT, "list detached startup");
+        if output
+            .lines()
+            .any(|line| line.contains("detached-initializer") && line.contains("running"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached startup did not create its container:\n{output}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "detached-initializer",
+    ]))
+    .success(RECOVERY_TIMEOUT, "delete detached startup");
+}
+
+#[test]
+fn startup_task_delete_cancels_image_builder_and_its_children() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let docker = home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).unwrap();
+    let real_docker = real_docker.display();
+    let markers = repo.path().display();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+        #!/bin/sh
+        case " $* " in
+            *" buildx build "*)
+                echo $$ > '{markers}/build-parent'
+                sh -c 'echo $$ > "{markers}/build-child"; exec sleep 600' &
+                wait
+                ;;
+            *) exec '{real_docker}' "$@" ;;
+        esac
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    write_test_devcontainer(&repo, "", "");
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "cancel-build",
+        "--",
+        "true",
+    ]));
+    launch.wait_for_output("resolving image...");
+    let parent = wait_for_pid(&repo.path().join("build-parent"));
+    let child = wait_for_pid(&repo.path().join("build-child"));
+
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "cancel-build",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete must cancel a builder before container creation",
+    );
+    launch.failure(RECOVERY_TIMEOUT, "cancelled build must fail its launch");
+    assert_process_exited(parent);
+    assert_process_exited(child);
+}
+
+#[test]
+fn startup_task_delete_removes_container_created_before_cancelled_reply() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let docker = home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).unwrap();
+    let real_docker = real_docker.display();
+    let markers = repo.path().display();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+        #!/bin/sh
+        case " $* " in
+            *" create "*)
+                '{real_docker}' "$@" > '{markers}/created-container' || exit $?
+                echo $$ > '{markers}/create-parent'
+                exec sleep 600
+                ;;
+            *) exec '{real_docker}' "$@" ;;
+        esac
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    write_test_devcontainer(&repo, "", "");
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "cancel-create",
+        "--",
+        "true",
+    ]));
+    launch.wait_for_output("creating container...");
+    let parent = wait_for_pid(&repo.path().join("create-parent"));
+    let container_id = fs::read_to_string(repo.path().join("created-container")).unwrap();
+    let container_id = container_id.trim();
+    assert!(!container_id.is_empty());
+
+    // The engine has acted but the startup task has not received the ID.
+    // Cleanup must use the reserved identity, not only a returned handle.
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "cancel-create",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete must remove a container with a cancelled create reply",
+    );
+    launch.failure(RECOVERY_TIMEOUT, "cancelled create must fail its launch");
+    assert_process_exited(parent);
+    let output = TestProcess::spawn(Command::new("docker").args([
+        "ps",
+        "-aq",
+        "--filter",
+        &format!("id={container_id}"),
+    ]))
+    .success(RECOVERY_TIMEOUT, "inspect cancellation cleanup");
+    assert!(
+        output.trim().is_empty(),
+        "cancelled startup left container {container_id}: {output}"
+    );
+}
+
+#[test]
+fn startup_task_delete_cancels_host_submodule_fetch() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let git = home.bin_dir().join("git");
+    let real_git = fs::canonicalize(&git).unwrap();
+    let real_git = real_git.display();
+    let markers = repo.path().display();
+    fs::remove_file(&git).unwrap();
+    fs::write(
+        &git,
+        formatdoc! {r#"
+        #!/bin/sh
+        case " $* " in
+            *" submodule update "*)
+                echo $$ > '{markers}/fetch-parent'
+                sh -c 'echo $$ > "{markers}/fetch-child"; exec sleep 600' &
+                wait
+                ;;
+            *) exec '{real_git}' "$@" ;;
+        esac
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    fs::write(repo.path().join(".gitmodules"), "").unwrap();
+    write_test_devcontainer(&repo, "", "");
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "cancel-submodule",
+        "--",
+        "true",
+    ]));
+    let parent = wait_for_pid(&repo.path().join("fetch-parent"));
+    let child = wait_for_pid(&repo.path().join("fetch-child"));
+
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "cancel-submodule",
+    ]))
+    .success(RECOVERY_TIMEOUT, "delete must cancel a hung host Git fetch");
+    launch.failure(RECOVERY_TIMEOUT, "cancelled fetch must fail its launch");
+    assert_process_exited(parent);
+    assert_process_exited(child);
+    assert!(!repo
+        .path()
+        .join(".git/rumpelpod-submodules-initialized")
+        .exists());
+}
+
+#[test]
+fn startup_task_failed_start_releases_managed_agent() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let agent = home.bin_dir().join("ssh-agent");
+    let real_agent = fs::canonicalize(&agent).unwrap();
+    let real_agent = real_agent.display();
+    let markers = repo.path().display();
+    fs::remove_file(&agent).unwrap();
+    fs::write(
+        &agent,
+        formatdoc! {r#"
+        #!/bin/sh
+        echo $$ > '{markers}/agent-pid'
+        echo "$3" > '{markers}/agent-socket'
+        exec '{real_agent}' "$@"
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+    let daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    write_test_devcontainer(&repo, "", r#", "initializeCommand": "exit 23" "#);
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "failed-initializer",
+        "--",
+        "true",
+    ]));
+    let agent = wait_for_pid(&repo.path().join("agent-pid"));
+    launch.failure(RECOVERY_TIMEOUT, "initializer failure must fail startup");
+
+    // No delete request is needed to release resources owned by failed
+    // startup, including resources registered before the initializer ran.
+    assert_process_exited(agent);
+    let socket = fs::read_to_string(repo.path().join("agent-socket")).unwrap();
+    assert!(!Path::new(socket.trim()).parent().unwrap().exists());
+    let output = TestProcess::spawn(pod_command(&repo, &daemon).args(["list", "--sync"]))
+        .success(RECOVERY_TIMEOUT, "list after failed initialization");
+    assert!(!output.contains("failed-initializer"));
+
+    write_test_devcontainer(&repo, "", "");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "failed-initializer",
+        "--",
+        "true",
+    ]))
+    .success(
+        Duration::from_secs(60),
+        "create a pod before failed replacement",
+    );
+    let agent = wait_for_pid(&repo.path().join("agent-pid"));
+    write_test_devcontainer(&repo, "INVALID_DOCKERFILE_INSTRUCTION", "");
+    TestProcess::spawn(pod_command(&repo, &daemon).args(["recreate", "failed-initializer"]))
+        .failure(Duration::from_secs(60), "replacement image build must fail");
+
+    // Recreate starts with an existing connection, but once its old pod is
+    // removed there is no session to preserve after replacement fails.
+    assert_process_exited(agent);
+    let socket = fs::read_to_string(repo.path().join("agent-socket")).unwrap();
+    assert!(!Path::new(socket.trim()).parent().unwrap().exists());
+}
+
+#[test]
+fn image_commands_sigint_reaches_child() {
+    for operation in ["fetch", "build"] {
+        let repo = TestRepo::new();
+        let home = TestHome::new();
+        match operation {
+            "fetch" => {
+                fs::create_dir_all(repo.path().join(".devcontainer")).unwrap();
+                fs::write(
+                    repo.path().join(".devcontainer/devcontainer.json"),
+                    r#"{"image":"interrupt-image"}"#,
+                )
+                .unwrap();
+            }
+            "build" => write_test_devcontainer(&repo, "", ""),
+            _ => unreachable!("unknown image operation"),
+        }
+        let docker = home.bin_dir().join("docker");
+        fs::write(
+            &docker,
+            indoc! {r#"
+                #!/bin/sh
+                echo $$ > "$INTERRUPT_PID_FILE"
+                exec sleep 600
+            "#},
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        let pid_file = repo.path().join("image-child-pid");
+        let mut cli = TestProcess::spawn(
+            Command::new(home.bin_dir().join("rumpel"))
+                .args(["image", operation])
+                .current_dir(repo.path())
+                .env("HOME", home.path())
+                .env("PATH", home.bin_dir())
+                .env("INTERRUPT_PID_FILE", &pid_file)
+                .process_group(0),
+        );
+        let child = wait_for_pid(&pid_file);
+        killpg(Pid::from_raw(cli.child.id() as i32), Signal::SIGINT).unwrap();
+        cli.failure(RECOVERY_TIMEOUT, "Ctrl-C should end the image command");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && kill(child, None).is_ok() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = kill(child, None).is_ok();
+        if survived {
+            kill(child, Signal::SIGKILL).unwrap();
+        }
+        assert!(
+            !survived,
+            "image {operation} left its child {child} running after Ctrl-C"
+        );
+    }
+}
+
+#[test]
+fn startup_task_delete_cleans_late_creation_after_daemon_restart() {
+    if !requires_local_docker() {
+        return;
+    }
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let docker = home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).unwrap();
+    let real_docker_path = real_docker.display();
+    let markers = repo.path().display();
+    fs::remove_file(&docker).unwrap();
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+        #!/bin/sh
+        case " $* " in
+            *" create "*)
+                if [ ! -e '{markers}/accepted-args' ]; then
+                    printf '%s\0' "$@" > '{markers}/accepted-args'
+                    echo $$ > '{markers}/create-parent'
+                    exec sleep 600
+                fi
+                ;;
+        esac
+        exec '{real_docker_path}' "$@"
+    "#},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = TestDaemon::start(&home);
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    write_test_devcontainer(&repo, "VOLUME /late-anonymous-volume", "");
+    let mut launch = TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "late-create",
+        "--",
+        "true",
+    ]));
+    launch.wait_for_output("creating container...");
+    let parent = wait_for_pid(&repo.path().join("create-parent"));
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "delete",
+        "--force",
+        "--wait",
+        "late-create",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "delete before the backend finishes creating",
+    );
+    launch.failure(RECOVERY_TIMEOUT, "cancelled startup must finish");
+    assert_process_exited(parent);
+    daemon.kill();
+    drop(daemon);
+
+    // Model an accepted backend request completing after its client was
+    // cancelled and delete saw NotFound. Replaying the saved request here
+    // puts its completion outside both the startup task and daemon lifetime.
+    let bytes = fs::read(repo.path().join("accepted-args")).unwrap();
+    let arguments: Vec<_> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| std::str::from_utf8(arg).unwrap())
+        .collect();
+    let container = TestProcess::spawn(Command::new(&real_docker).args(arguments)).success(
+        RECOVERY_TIMEOUT,
+        "complete accepted creation after deletion",
+    );
+    let container = container.trim();
+    let volume = TestProcess::spawn(Command::new(&real_docker).args([
+        "inspect",
+        "--format",
+        "{{range .Mounts}}{{if eq .Destination \"/late-anonymous-volume\"}}{{.Name}}{{end}}{{end}}",
+        container,
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "find anonymous volume owned by late container",
+    );
+    let volume = volume.trim();
+    assert!(!volume.is_empty());
+
+    let daemon = TestDaemon::start(&home);
+    let deadline = Instant::now() + RECOVERY_TIMEOUT;
+    loop {
+        let remaining = TestProcess::spawn(Command::new(&real_docker).args([
+            "ps",
+            "-aq",
+            "--filter",
+            &format!("id={container}"),
+        ]))
+        .success(RECOVERY_TIMEOUT, "check late creation cleanup");
+        let remaining_volume = TestProcess::spawn(Command::new(&real_docker).args([
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            &format!("name={volume}"),
+        ]))
+        .success(RECOVERY_TIMEOUT, "check late anonymous volume cleanup");
+        if remaining.trim().is_empty() && remaining_volume.trim().is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late container survived daemon restart: {container}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Retained cleanup intents must not mistake the replacement for the
+    // abandoned launch, even though both use the same logical pod name.
+    write_test_devcontainer(&repo, "", "");
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "--create",
+        "late-create",
+        "--",
+        "true",
+    ]))
+    .success(
+        Duration::from_secs(60),
+        "reuse pod name after late creation cleanup",
+    );
+    TestProcess::spawn(pod_command(&repo, &daemon).args([
+        "enter",
+        "late-create",
+        "--",
+        "sleep",
+        "1",
+    ]))
+    .success(
+        RECOVERY_TIMEOUT,
+        "cleanup must preserve a subsequent launch",
+    );
+}

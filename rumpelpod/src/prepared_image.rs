@@ -21,6 +21,7 @@ use semver::Version;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::async_command::AsyncCommandExt;
 use crate::cli::PrepareImageCommand;
 use crate::config::{ContainerEngine, Host, WorkspaceCloneMode};
 use crate::image::{BuildOutputFn, BuildResult, BuildxMode, Image, OutputLine};
@@ -90,7 +91,7 @@ const PI_MIN_NODE: (u64, u64, u64) = (22, 19, 0);
 ///
 /// Uses the client-provided path so the daemon does not depend on its
 /// own PATH. `codex --version` outputs e.g. `codex-cli 0.145.0`.
-fn detect_local_codex(codex_cli_path: Option<&Path>) -> Result<Option<LocalCodexInfo>> {
+async fn detect_local_codex(codex_cli_path: Option<&Path>) -> Result<Option<LocalCodexInfo>> {
     let Some(bin) = codex_cli_path else {
         return Ok(None);
     };
@@ -98,7 +99,8 @@ fn detect_local_codex(codex_cli_path: Option<&Path>) -> Result<Option<LocalCodex
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .output_async()
+        .await
         .with_context(|| format!("running {} --version", bin.display()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -190,7 +192,7 @@ fn container_has_grok() -> bool {
 ///
 /// Uses the client-provided path so the daemon does not depend on its
 /// own PATH. `grok --version` outputs e.g. `grok 0.2.111 (94172f2aa4) [stable]`.
-fn detect_local_grok(grok_cli_path: Option<&Path>) -> Result<Option<LocalGrokInfo>> {
+async fn detect_local_grok(grok_cli_path: Option<&Path>) -> Result<Option<LocalGrokInfo>> {
     let Some(bin) = grok_cli_path else {
         return Ok(None);
     };
@@ -198,7 +200,8 @@ fn detect_local_grok(grok_cli_path: Option<&Path>) -> Result<Option<LocalGrokInf
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .output_async()
+        .await
         .with_context(|| format!("running {} --version", bin.display()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -251,7 +254,7 @@ const RUMPEL_VERSION_INFO: &str = env!("RUMPELPOD_VERSION_INFO");
 /// PATH search (for backwards compatibility with older clients).
 /// `claude --version` outputs e.g. "2.1.79 (Claude Code)"; we
 /// extract just the semver portion.
-fn detect_local_claude(claude_cli_path: Option<&Path>) -> Option<LocalClaudeInfo> {
+async fn detect_local_claude(claude_cli_path: Option<&Path>) -> Option<LocalClaudeInfo> {
     let bin = match claude_cli_path {
         Some(path) => path.to_path_buf(),
         None => PathBuf::from("claude"),
@@ -260,7 +263,8 @@ fn detect_local_claude(claude_cli_path: Option<&Path>) -> Option<LocalClaudeInfo
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .output_async()
+        .await
         .ok()?;
     if !output.status.success() {
         return None;
@@ -280,7 +284,7 @@ fn detect_local_claude(claude_cli_path: Option<&Path>) -> Option<LocalClaudeInfo
 /// search.  `pi --version` may print the version anywhere in its output,
 /// so pick the first whitespace token that looks like a version number
 /// (starts with a digit, optionally after a leading `v`).
-fn detect_local_pi(pi_cli_path: Option<&Path>) -> Option<LocalPiInfo> {
+async fn detect_local_pi(pi_cli_path: Option<&Path>) -> Option<LocalPiInfo> {
     let bin = match pi_cli_path {
         Some(path) => path.to_path_buf(),
         None => PathBuf::from("pi"),
@@ -289,7 +293,8 @@ fn detect_local_pi(pi_cli_path: Option<&Path>) -> Option<LocalPiInfo> {
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .output_async()
+        .await
         .ok()?;
     if !output.status.success() {
         return None;
@@ -661,7 +666,7 @@ fn copy_git_dir_into_context(git_dir: &Path, build_context: &Path) -> Result<()>
 ///
 /// `docker build` cannot resolve bare `sha256:...` image IDs in FROM
 /// lines.  Tagging it with a friendly name works around this.
-fn ensure_buildable_tag(
+async fn ensure_buildable_tag(
     image: &str,
     docker_host: &Host,
     docker_socket: Option<&Path>,
@@ -682,7 +687,8 @@ fn ensure_buildable_tag(
     let status = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .status_async()
+        .await
         .context("tagging base image for prepared build")?;
     if !status.success() {
         return Err(anyhow::anyhow!(
@@ -713,7 +719,7 @@ fn ensure_buildable_tag(
 ///   to `image_user` when neither is set.  Baked into the image at
 ///   `/opt/rumpelpod/user` so `container-exec` and `container-serve`
 ///   can switch to it at runtime.
-pub fn build_prepared_image(
+pub async fn build_prepared_image_async(
     base_image: &Image,
     docker_host: &Host,
     git_dir: &Path,
@@ -735,21 +741,22 @@ pub fn build_prepared_image(
     ssh_auth_sock: Option<&Path>,
     mut on_output: Option<BuildOutputFn>,
 ) -> Result<BuildResult> {
-    let claude_info = detect_local_claude(claude_cli_path);
-    let pi_info = detect_local_pi(pi_cli_path);
-    let codex_info = detect_local_codex(codex_cli_path)?;
-    let grok_info = detect_local_grok(grok_cli_path)?;
+    let claude_info = detect_local_claude(claude_cli_path).await;
+    let pi_info = detect_local_pi(pi_cli_path).await;
+    let codex_info = detect_local_codex(codex_cli_path).await?;
+    let grok_info = detect_local_grok(grok_cli_path).await?;
 
     let mode = BuildxMode::from_host(docker_host, docker_socket);
 
-    let image_user = crate::image::inspect_image_user(&base_image.0, docker_host, docker_socket)?;
+    let image_user =
+        crate::image::inspect_image_user_async(&base_image.0, docker_host, docker_socket).await?;
 
     let buildable_base = match &mode {
         BuildxMode::Load {
             docker_host,
             docker_socket,
             ..
-        } => ensure_buildable_tag(&base_image.0, docker_host, *docker_socket)?,
+        } => ensure_buildable_tag(&base_image.0, docker_host, *docker_socket).await?,
         BuildxMode::Push { .. } => base_image.0.clone(),
     };
 
@@ -816,7 +823,7 @@ pub fn build_prepared_image(
     match &mode {
         BuildxMode::Push { registry, .. } => {
             let push_tag = format!("{registry}:{tag}");
-            if crate::image::registry_image_exists(&push_tag)? {
+            if crate::image::registry_image_exists_async(&push_tag).await? {
                 return Ok(BuildResult {
                     image: Image(mode.output_tag(&tag)),
                     built: false,
@@ -829,7 +836,7 @@ pub fn build_prepared_image(
             ..
         } => {
             let local_tag = mode.output_tag(&tag);
-            if crate::image::image_exists(&local_tag, docker_host, *docker_socket) {
+            if crate::image::image_exists_async(&local_tag, docker_host, *docker_socket).await {
                 return Ok(BuildResult {
                     image: Image(local_tag),
                     built: false,
@@ -861,7 +868,7 @@ pub fn build_prepared_image(
 
     let dockerfile = build_ctx.path().join("Dockerfile");
 
-    crate::image::run_buildx_build(
+    crate::image::run_buildx_build_async(
         &tag,
         &dockerfile,
         build_ctx.path(),
@@ -869,7 +876,8 @@ pub fn build_prepared_image(
         &extra_args,
         on_output,
         ssh_auth_sock,
-    )?;
+    )
+    .await?;
 
     Ok(BuildResult {
         image: Image(mode.output_tag(&tag)),
@@ -2028,7 +2036,7 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&bin, permissions).expect("chmod fake grok");
 
-        let result = detect_local_grok(Some(&bin));
+        let result = crate::async_runtime::block_on(detect_local_grok(Some(&bin)));
         let Err(error) = result else {
             panic!("unrecognized Grok version output should fail detection");
         };
@@ -2090,7 +2098,7 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&bin, permissions).expect("chmod fake codex");
 
-        let result = detect_local_codex(Some(&bin));
+        let result = crate::async_runtime::block_on(detect_local_codex(Some(&bin)));
         let Err(error) = result else {
             panic!("unrecognized Codex version output should fail detection");
         };

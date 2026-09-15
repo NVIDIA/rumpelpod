@@ -105,13 +105,31 @@ impl Connections {
     /// Get or create the host and probe it now.  Used by client
     /// interest (`connect`, `enter`) so a down host is woken instead
     /// of waiting out its backoff.
-    pub fn ensure_host(&self, host: &Host) -> Result<Arc<HostConnection>> {
+    pub async fn ensure_host_async(&self, host: &Host) -> Result<Arc<HostConnection>> {
         let conn = self.inner.hosts.get_or_create(host)?;
-        conn.ensure_connected()?;
+        conn.ensure_connected_async().await?;
         Ok(conn)
     }
 
+    #[cfg(test)]
     pub fn get_or_create_pod(
+        &self,
+        repo_path: &Path,
+        pod_name: &str,
+        host: Host,
+        token: String,
+        configured_ssh_keys: Option<&[PathBuf]>,
+    ) -> Result<Arc<PodConnection>> {
+        crate::async_runtime::block_on(self.get_or_create_pod_async(
+            repo_path,
+            pod_name,
+            host,
+            token,
+            configured_ssh_keys,
+        ))
+    }
+
+    pub async fn get_or_create_pod_async(
         &self,
         repo_path: &Path,
         pod_name: &str,
@@ -125,14 +143,17 @@ impl Connections {
         } else {
             PodConnectionStatus::HostDisconnected
         };
-        self.inner.pods.get_or_create(
-            repo_path,
-            pod_name,
-            host,
-            token,
-            initial_status,
-            configured_ssh_keys,
-        )
+        self.inner
+            .pods
+            .get_or_create_async(
+                repo_path,
+                pod_name,
+                host,
+                token,
+                initial_status,
+                configured_ssh_keys,
+            )
+            .await
     }
 
     pub fn pod(&self, repo_path: &Path, pod_name: &str) -> Option<Arc<PodConnection>> {

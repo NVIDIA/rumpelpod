@@ -9,16 +9,15 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::Command;
 use walkdir::WalkDir;
 
+use crate::async_command::{foreground, AsyncCommandExt};
 use crate::config::{ContainerEngine, Host};
 use crate::devcontainer::{BuildOptions, DevContainer};
-use crate::CommandExt;
 
 /// Set the target flag on a Docker-compatible container command.
 ///
@@ -151,7 +150,7 @@ pub(crate) fn build_image_direct(
     tag: &str,
     dockerfile: &Path,
     context: &Path,
-    mode: &BuildxMode,
+    mode: &BuildxMode<'_>,
 ) -> Result<String> {
     run_buildx_build(tag, dockerfile, context, mode, &[], None, None)?;
     Ok(mode.output_tag(tag))
@@ -202,6 +201,29 @@ pub fn resolve_image(
     docker_socket: Option<&Path>,
     ssh_auth_sock: Option<&Path>,
 ) -> Result<BuildResult> {
+    crate::async_runtime::block_on(foreground(resolve_image_async(
+        devcontainer,
+        docker_host,
+        repo_root,
+        flags,
+        path_tagging,
+        on_output,
+        docker_socket,
+        ssh_auth_sock,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_image_async(
+    devcontainer: &DevContainer,
+    docker_host: &Host,
+    repo_root: &Path,
+    flags: &BuildFlags,
+    path_tagging: ContextPathTagging,
+    on_output: Option<BuildOutputFn>,
+    docker_socket: Option<&Path>,
+    ssh_auth_sock: Option<&Path>,
+) -> Result<BuildResult> {
     let build = match &devcontainer.build {
         Some(build) => build,
         None => {
@@ -243,7 +265,7 @@ pub fn resolve_image(
         match &mode {
             BuildxMode::Push { registry, .. } => {
                 let push_tag = format!("{registry}:{image_name}");
-                if registry_image_exists(&push_tag)? {
+                if registry_image_exists_async(&push_tag).await? {
                     return Ok(BuildResult {
                         image: Image(mode.output_tag(&image_name)),
                         built: false,
@@ -256,7 +278,7 @@ pub fn resolve_image(
                 ..
             } => {
                 let local_name = mode.output_tag(&image_name);
-                if image_exists(&local_name, docker_host, *docker_socket) {
+                if image_exists_async(&local_name, docker_host, *docker_socket).await {
                     return Ok(BuildResult {
                         image: Image(local_name),
                         built: false,
@@ -274,7 +296,7 @@ pub fn resolve_image(
         extra_args.push("--pull".into());
     }
 
-    run_buildx_build(
+    run_buildx_build_async(
         &image_name,
         &dockerfile_path,
         &context_path,
@@ -282,7 +304,8 @@ pub fn resolve_image(
         &extra_args,
         on_output,
         ssh_auth_sock,
-    )?;
+    )
+    .await?;
 
     Ok(BuildResult {
         image: Image(mode.output_tag(&image_name)),
@@ -344,7 +367,27 @@ pub(crate) fn run_buildx_build(
     tag: &str,
     dockerfile: &Path,
     context: &Path,
-    mode: &BuildxMode,
+    mode: &BuildxMode<'_>,
+    extra_args: &[String],
+    on_output: Option<BuildOutputFn>,
+    ssh_auth_sock: Option<&Path>,
+) -> Result<()> {
+    crate::async_runtime::block_on(foreground(run_buildx_build_async(
+        tag,
+        dockerfile,
+        context,
+        mode,
+        extra_args,
+        on_output,
+        ssh_auth_sock,
+    )))
+}
+
+pub(crate) async fn run_buildx_build_async(
+    tag: &str,
+    dockerfile: &Path,
+    context: &Path,
+    mode: &BuildxMode<'_>,
     extra_args: &[String],
     on_output: Option<BuildOutputFn>,
     ssh_auth_sock: Option<&Path>,
@@ -434,10 +477,12 @@ pub(crate) fn run_buildx_build(
     cmd.arg(context.display().to_string());
 
     let build_result = if let Some(on_output) = on_output {
-        run_and_stream(&mut cmd, on_output)
+        run_and_stream(&mut cmd, on_output).await
     } else {
-        use crate::CommandExt;
-        cmd.success().context("image build failed").map(|_| ())
+        cmd.success_async()
+            .await
+            .context("image build failed")
+            .map(|_| ())
     };
 
     // Tolerate the classic "image already exists" race: two
@@ -451,7 +496,7 @@ pub(crate) fn run_buildx_build(
         if let Some((docker_host, docker_socket, local_tag)) = load_target.as_ref() {
             let msg = format!("{e:#}");
             let is_race = msg.contains("already exists")
-                && image_exists(local_tag, docker_host, *docker_socket);
+                && image_exists_async(local_tag, docker_host, *docker_socket).await;
             if is_race {
                 return Ok(());
             }
@@ -469,7 +514,7 @@ pub(crate) fn run_buildx_build(
         let push_tag = format!("{registry}:{tag}");
         let mut push = Command::new("podman");
         push.args(["push", &push_tag]);
-        push.success().context("podman push failed")?;
+        push.success_async().await.context("podman push failed")?;
     }
 
     Ok(())
@@ -479,66 +524,26 @@ pub(crate) fn run_buildx_build(
 ///
 /// Collects all output so it can be included in the error message on
 /// failure.
-fn run_and_stream(cmd: &mut Command, on_output: BuildOutputFn) -> Result<()> {
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-
-    let child_stdout = child.stdout.take().expect("stdout was piped");
-    let child_stderr = child.stderr.take().expect("stderr was piped");
-
-    let callback = Arc::new(Mutex::new(on_output));
-    let callback_for_stderr = callback.clone();
-
-    let stdout_buf = Arc::new(Mutex::new(String::new()));
-    let stderr_buf = Arc::new(Mutex::new(String::new()));
-    let stdout_buf_clone = stdout_buf.clone();
-    let stderr_buf_clone = stderr_buf.clone();
-
-    let stdout_thread = std::thread::spawn(move || {
-        for line in BufReader::new(child_stdout).lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            stdout_buf_clone.lock().unwrap().push_str(&line);
-            stdout_buf_clone.lock().unwrap().push('\n');
-            callback.lock().unwrap()(OutputLine::Stdout(line));
-        }
-    });
-
-    let stderr_thread = std::thread::spawn(move || {
-        for line in BufReader::new(child_stderr).lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            stderr_buf_clone.lock().unwrap().push_str(&line);
-            stderr_buf_clone.lock().unwrap().push('\n');
-            callback_for_stderr.lock().unwrap()(OutputLine::Stderr(line));
-        }
-    });
-
-    let status = child.wait()?;
-    stdout_thread.join().expect("stdout reader panicked");
-    stderr_thread.join().expect("stderr reader panicked");
-
-    if !status.success() {
-        let stdout = stdout_buf.lock().unwrap();
-        let stderr = stderr_buf.lock().unwrap();
-        return Err(anyhow::anyhow!(
-            "image build failed:\nSTDOUT: {stdout}\nSTDERR: {stderr}"
-        ));
-    }
-
-    Ok(())
+async fn run_and_stream(cmd: &mut Command, on_output: BuildOutputFn) -> Result<()> {
+    crate::async_command::stream_output(cmd, on_output).await
 }
 
 /// Pull a Docker image from its registry.
 ///
 /// Inherits stdout/stderr so the user sees download progress.
 pub fn pull_image(
+    image_name: &str,
+    docker_host: &Host,
+    docker_socket: Option<&Path>,
+) -> Result<()> {
+    crate::async_runtime::block_on(foreground(pull_image_async(
+        image_name,
+        docker_host,
+        docker_socket,
+    )))
+}
+
+pub async fn pull_image_async(
     image_name: &str,
     docker_host: &Host,
     docker_socket: Option<&Path>,
@@ -553,7 +558,7 @@ pub fn pull_image(
     apply_docker_host(&mut cmd, docker_host, docker_socket);
     cmd.args(["pull", image_name]);
 
-    let status = cmd.status()?;
+    let status = cmd.status_async().await?;
     if !status.success() {
         let engine = match docker_host.image_builder() {
             Some(ContainerEngine::Podman) => "podman",
@@ -570,8 +575,8 @@ pub fn pull_image(
 /// registry reports "not found".  All other errors (unreachable
 /// registry, auth failures) are propagated.
 ///
-pub(crate) fn registry_image_exists(registry_tag: &str) -> Result<bool> {
-    crate::registry::image_manifest_exists(registry_tag)
+pub(crate) async fn registry_image_exists_async(registry_tag: &str) -> Result<bool> {
+    crate::registry::image_manifest_exists_async(registry_tag).await
 }
 
 /// Query the USER directive from a Docker image's configuration.
@@ -580,7 +585,7 @@ pub(crate) fn registry_image_exists(registry_tag: &str) -> Result<bool> {
 /// is cached on the target Docker host).  Falls back to querying
 /// the OCI registry HTTP API, which downloads only the manifest
 /// and config blob (a few KB), not the image layers.
-pub(crate) fn inspect_image_user(
+pub(crate) async fn inspect_image_user_async(
     image: &str,
     docker_host: &Host,
     docker_socket: Option<&Path>,
@@ -589,7 +594,7 @@ pub(crate) fn inspect_image_user(
     // (Localhost or SSH), not against a Kubernetes API.  For k8s we
     // go straight to the registry.
     let raw = if !matches!(docker_host, Host::Kubernetes { .. })
-        && image_exists(image, docker_host, docker_socket)
+        && image_exists_async(image, docker_host, docker_socket).await
     {
         let mut cmd = Command::new("docker");
         match docker_host.image_builder() {
@@ -600,14 +605,17 @@ pub(crate) fn inspect_image_user(
         }
         apply_docker_host(&mut cmd, docker_host, docker_socket);
         cmd.args(["image", "inspect", "--format", "{{.Config.User}}", image]);
-        let output = cmd.output().context("inspecting image for USER")?;
+        let output = cmd
+            .output_async()
+            .await
+            .context("inspecting image for USER")?;
         if output.status.success() {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         } else {
-            crate::registry::fetch_image_user(image)?
+            crate::registry::fetch_image_user_async(image).await?
         }
     } else {
-        crate::registry::fetch_image_user(image)?
+        crate::registry::fetch_image_user_async(image).await?
     };
 
     Ok(normalize_image_user(&raw))
@@ -630,7 +638,7 @@ fn normalize_image_user(raw: &str) -> String {
 }
 
 /// Check whether a Docker image already exists on the target host.
-pub(crate) fn image_exists(
+pub(crate) async fn image_exists_async(
     image_name: &str,
     docker_host: &Host,
     docker_socket: Option<&Path>,
@@ -646,7 +654,7 @@ pub(crate) fn image_exists(
     cmd.args(["image", "inspect", image_name]);
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-    cmd.status().is_ok_and(|s| s.success())
+    cmd.status_async().await.is_ok_and(|s| s.success())
 }
 
 /// Compute a deterministic image tag based on the build configuration.

@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::async_command::AsyncCommandExt;
 use crate::config::{ContainerEngine, Host};
 use crate::devcontainer::{DevContainer, MountObject, MountType, StringOrArray};
 use crate::image::{apply_docker_host, OutputLine};
@@ -52,7 +53,7 @@ impl Source {
         })
     }
 
-    pub fn render(
+    pub async fn render_async(
         &self,
         project_name: &str,
         host: &Host,
@@ -72,14 +73,15 @@ impl Source {
             command.env("SSH_AUTH_SOCK", socket);
         }
         let output = command
-            .output()
+            .output_async()
+            .await
             .context("rendering docker compose configuration")?;
         let stdout = checked_output(output, "docker compose config")?;
         Model::parse(String::from_utf8(stdout).context("compose config returned non-UTF-8 JSON")?)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn build(
+    pub async fn build_async(
         &self,
         project_name: &str,
         host: &Host,
@@ -98,10 +100,10 @@ impl Source {
         if let Some(socket) = ssh_auth_sock {
             command.env("SSH_AUTH_SOCK", socket);
         }
-        run_with_progress(&mut command, "docker compose build", progress)
+        run_with_progress(&mut command, "docker compose build", progress).await
     }
 
-    pub fn service_image_id(
+    pub async fn service_image_id_async(
         &self,
         project_name: &str,
         host: &Host,
@@ -114,7 +116,8 @@ impl Source {
         let mut command = docker_command(host, docker_socket)?;
         let output = command
             .args(["image", "inspect", "--format", "{{.Id}}", image])
-            .output()
+            .output_async()
+            .await
             .context("querying compose service image")?;
         let stdout = checked_output(output, "docker image inspect")?;
         let image_id = String::from_utf8_lossy(&stdout).trim().to_string();
@@ -126,7 +129,7 @@ impl Source {
         Ok(image_id)
     }
 
-    pub fn tag_service_image(
+    pub async fn tag_service_image_async(
         &self,
         host: &Host,
         docker_socket: Option<&Path>,
@@ -137,7 +140,8 @@ impl Source {
         let mut command = docker_command(host, docker_socket)?;
         let output = command
             .args(["image", "tag", image, tag])
-            .output()
+            .output_async()
+            .await
             .with_context(|| format!("tagging compose service '{service}' build cache image"))?;
         checked_output(output, "docker image tag")?;
         Ok(())
@@ -174,6 +178,39 @@ impl Model {
 
     pub fn json(&self) -> &str {
         &self.json
+    }
+
+    fn label_creation(&mut self, creation: &str) -> Result<()> {
+        // Named volumes can outlive a launch and be adopted by another pod.
+        // Only resources with immutable backend IDs are safe to sweep later.
+        for kind in ["services", "networks"] {
+            if let Some(resources) = self.value.get_mut(kind) {
+                for resource in resources
+                    .as_object_mut()
+                    .context("invalid compose resources")?
+                    .values_mut()
+                {
+                    let resource = resource
+                        .as_object_mut()
+                        .context("invalid compose resource")?;
+                    if resource.get("external").and_then(Value::as_bool) == Some(true) {
+                        continue;
+                    }
+                    let labels = resource
+                        .entry("labels")
+                        .or_insert_with(|| serde_json::json!({}));
+                    labels
+                        .as_object_mut()
+                        .context("invalid compose resource labels")?
+                        .insert(
+                            crate::executor::LABEL_CREATION.to_string(),
+                            Value::String(creation.to_string()),
+                        );
+                }
+            }
+        }
+        self.json = serde_json::to_string(&self.value)?;
+        Ok(())
     }
 
     pub fn services(&self) -> HashSet<String> {
@@ -658,7 +695,7 @@ impl Project {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: &str,
-        model: Model,
+        mut model: Model,
         agent_service: &str,
         pod_name: &str,
         prepared_image: &str,
@@ -669,8 +706,10 @@ impl Project {
         host: &Host,
         docker_socket: Option<&Path>,
         client_env: &HashMap<String, String>,
+        creation: &str,
     ) -> Result<Self> {
         model.validate_service(agent_service)?;
+        model.label_creation(creation)?;
         let override_yaml = generate_override(
             &model,
             agent_service,
@@ -691,7 +730,7 @@ impl Project {
         })
     }
 
-    pub fn up(
+    pub async fn up_async(
         &self,
         services: &[String],
         progress: &std::sync::mpsc::Sender<OutputLine>,
@@ -702,38 +741,51 @@ impl Project {
             services,
             progress,
         )
+        .await
     }
 
     pub fn model(&self) -> &Model {
         &self.model
     }
 
-    pub fn start(&self) -> Result<()> {
-        self.run("docker compose start", &["start"], &[])?;
+    pub async fn start_async(&self) -> Result<()> {
+        self.run("docker compose start", &["start"], &[]).await?;
         Ok(())
     }
 
     pub fn stop(&self) -> Result<()> {
-        self.run("docker compose stop", &["stop", "--timeout", "0"], &[])?;
+        crate::async_runtime::block_on(self.stop_async())
+    }
+
+    pub async fn stop_async(&self) -> Result<()> {
+        self.run("docker compose stop", &["stop", "--timeout", "0"], &[])
+            .await?;
         Ok(())
     }
 
     pub fn down(&self) -> Result<()> {
+        crate::async_runtime::block_on(self.down_async())
+    }
+
+    pub async fn down_async(&self) -> Result<()> {
         self.run(
             "docker compose down",
             &["down", "--volumes", "--remove-orphans"],
             &[],
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
-    pub fn service_containers(&self, service: &str) -> Result<Vec<String>> {
+    pub async fn service_containers_async(&self, service: &str) -> Result<Vec<String>> {
         self.model.validate_service(service)?;
-        let stdout = self.run(
-            "docker compose ps",
-            &["ps", "--all", "--quiet"],
-            &[service.to_string()],
-        )?;
+        let stdout = self
+            .run(
+                "docker compose ps",
+                &["ps", "--all", "--quiet"],
+                &[service.to_string()],
+            )
+            .await?;
         Ok(String::from_utf8_lossy(&stdout)
             .lines()
             .map(str::trim)
@@ -743,7 +795,11 @@ impl Project {
     }
 
     pub fn one_service_container(&self, service: &str) -> Result<String> {
-        let containers = self.service_containers(service)?;
+        crate::async_runtime::block_on(self.one_service_container_async(service))
+    }
+
+    pub async fn one_service_container_async(&self, service: &str) -> Result<String> {
+        let containers = self.service_containers_async(service).await?;
         match containers.as_slice() {
             [container] => Ok(container.clone()),
             [] => Err(anyhow::anyhow!(
@@ -759,8 +815,14 @@ impl Project {
     }
 
     pub fn inject_rumpel_into_sidecars(&self, agent_service: &str) -> Result<()> {
-        let agent = self.one_service_container(agent_service)?;
-        let stdout = self.run("docker compose ps", &["ps", "--all", "--quiet"], &[])?;
+        crate::async_runtime::block_on(self.inject_rumpel_into_sidecars_async(agent_service))
+    }
+
+    pub async fn inject_rumpel_into_sidecars_async(&self, agent_service: &str) -> Result<()> {
+        let agent = self.one_service_container_async(agent_service).await?;
+        let stdout = self
+            .run("docker compose ps", &["ps", "--all", "--quiet"], &[])
+            .await?;
         for container in String::from_utf8_lossy(&stdout)
             .lines()
             .map(str::trim)
@@ -769,14 +831,14 @@ impl Project {
             if container == agent {
                 continue;
             }
-            let service = self.container_service(container)?;
-            self.inject_one(container, &service)?;
+            let service = self.container_service(container).await?;
+            self.inject_one(container, &service).await?;
         }
         Ok(())
     }
 
-    fn inject_one(&self, container: &str, service: &str) -> Result<()> {
-        let architecture = self.container_architecture(container)?;
+    async fn inject_one(&self, container: &str, service: &str) -> Result<()> {
+        let architecture = self.container_architecture(container).await?;
         let binary = crate::prepared_image::find_rumpel_binary(&architecture)
             .with_context(|| format!("selecting rumpel binary for compose service '{service}'"))?;
         let staged = tempfile::tempdir().context("creating sidecar binary staging directory")?;
@@ -799,7 +861,8 @@ impl Project {
         let destination_arg = format!("{container}:/");
         let output = command
             .args(["cp", &source, &destination_arg])
-            .output()
+            .output_async()
+            .await
             .context("copying rumpel binary into compose sidecar")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -810,12 +873,13 @@ impl Project {
         Ok(())
     }
 
-    fn container_service(&self, container: &str) -> Result<String> {
+    async fn container_service(&self, container: &str) -> Result<String> {
         let mut command = docker_command(&self.host, self.docker_socket.as_deref())?;
         let format_arg = format!("{{{{ index .Config.Labels {COMPOSE_SERVICE_LABEL:?} }}}}");
         let output = command
             .args(["container", "inspect", "--format", &format_arg, container])
-            .output()
+            .output_async()
+            .await
             .context("inspecting compose service label")?;
         let stdout = checked_output(output, "docker container inspect")?;
         let service = String::from_utf8_lossy(&stdout).trim().to_string();
@@ -827,11 +891,12 @@ impl Project {
         Ok(service)
     }
 
-    fn container_architecture(&self, container: &str) -> Result<String> {
+    async fn container_architecture(&self, container: &str) -> Result<String> {
         let mut command = docker_command(&self.host, self.docker_socket.as_deref())?;
         let output = command
             .args(["container", "inspect", container])
-            .output()
+            .output_async()
+            .await
             .context("inspecting compose container architecture")?;
         let stdout = checked_output(output, "docker container inspect")?;
         let mut inspected: Vec<ContainerInspect> =
@@ -853,7 +918,8 @@ impl Project {
         let mut image_command = docker_command(&self.host, self.docker_socket.as_deref())?;
         let output = image_command
             .args(["image", "inspect", &image])
-            .output()
+            .output_async()
+            .await
             .context("inspecting compose container image architecture")?;
         let stdout = checked_output(output, "docker image inspect")?;
         let mut images: Vec<ImageInspect> =
@@ -865,7 +931,7 @@ impl Project {
         validate_architecture(architecture)
     }
 
-    fn run(&self, label: &str, args: &[&str], services: &[String]) -> Result<Vec<u8>> {
+    async fn run(&self, label: &str, args: &[&str], services: &[String]) -> Result<Vec<u8>> {
         let materialized = self.materialize()?;
         let mut command = docker_compose_command(&self.host, self.docker_socket.as_deref())?;
         apply_project_files(&mut command, &self.name, &materialized);
@@ -873,12 +939,13 @@ impl Project {
         command.args(services);
         command.envs(&self.client_env);
         let output = command
-            .output()
+            .output_async()
+            .await
             .with_context(|| format!("running {label}"))?;
         checked_output(output, label)
     }
 
-    fn run_progress(
+    async fn run_progress(
         &self,
         label: &str,
         args: &[&str],
@@ -891,7 +958,7 @@ impl Project {
         command.args(args);
         command.args(services);
         command.envs(&self.client_env);
-        run_with_progress(&mut command, label, progress)
+        run_with_progress(&mut command, label, progress).await
     }
 
     fn materialize(&self) -> Result<MaterializedProject> {
@@ -991,13 +1058,14 @@ fn checked_output(output: Output, label: &str) -> Result<Vec<u8>> {
     Err(anyhow::anyhow!("{label} failed: {stderr}"))
 }
 
-fn run_with_progress(
+async fn run_with_progress(
     command: &mut Command,
     label: &str,
     progress: &std::sync::mpsc::Sender<OutputLine>,
 ) -> Result<()> {
     let output = command
-        .output()
+        .output_async()
+        .await
         .with_context(|| format!("running {label}"))?;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         progress.send(OutputLine::Stdout(line.to_string())).ok();

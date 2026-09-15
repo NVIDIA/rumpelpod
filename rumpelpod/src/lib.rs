@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod async_command;
 mod async_runtime;
 mod claude;
 mod cli;
@@ -15,6 +16,7 @@ mod cp;
 mod devcontainer;
 mod exec_proxy;
 mod executor;
+mod streaming_upload;
 
 pub use command_ext::CommandExt;
 pub mod daemon;

@@ -3,11 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::async_runtime::block_on;
 use crate::daemon::protocol::PodStatus;
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, DeleteParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, PostParams, Preconditions};
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Client, Config};
 use log::{info, trace};
@@ -91,7 +90,11 @@ impl K8sClient {
 
     /// Create a new Kubernetes client for the given context and namespace.
     pub fn new(context: &str, namespace: &str) -> Result<Self> {
-        let client = block_on(async {
+        crate::async_runtime::block_on(Self::new_async(context, namespace))
+    }
+
+    pub async fn new_async(context: &str, namespace: &str) -> Result<Self> {
+        let client = {
             let kubeconfig = Kubeconfig::read().context("reading kubeconfig")?;
             let config = Config::from_custom_kubeconfig(
                 kubeconfig,
@@ -102,8 +105,8 @@ impl K8sClient {
             )
             .await
             .context("building kube config from kubeconfig")?;
-            Client::try_from(config).context("creating kube client")
-        })?;
+            Client::try_from(config).context("creating kube client")?
+        };
 
         Ok(Self {
             client,
@@ -119,6 +122,25 @@ impl K8sClient {
     /// ENTRYPOINT).  When false, the image's own CMD is used.
     #[allow(clippy::too_many_arguments)]
     pub fn create_pod(
+        &self,
+        name: &str,
+        image: &str,
+        labels: BTreeMap<String, String>,
+        annotations: BTreeMap<String, String>,
+        env: &[(String, String)],
+        options: &K8sPodOptions,
+    ) -> Result<()> {
+        crate::async_runtime::block_on(self.create_pod_async(
+            name,
+            image,
+            labels,
+            annotations,
+            env,
+            options,
+        ))
+    }
+
+    pub async fn create_pod_async(
         &self,
         name: &str,
         image: &str,
@@ -298,12 +320,9 @@ impl K8sClient {
 
         let pod: Pod = serde_json::from_value(pod_spec).context("serializing pod spec")?;
 
-        block_on(async {
-            pods.create(&PostParams::default(), &pod)
-                .await
-                .context("creating pod")?;
-            Ok::<_, anyhow::Error>(())
-        })?;
+        pods.create(&PostParams::default(), &pod)
+            .await
+            .context("creating pod")?;
 
         info!("Created k8s pod '{name}'");
         Ok(())
@@ -311,13 +330,20 @@ impl K8sClient {
 
     /// Wait for a pod to reach the Running phase.
     ///
-    /// Polls indefinitely (the user can Ctrl-C).
+    /// Startup owns the polling future, so deleting the pod cancels it.
     pub fn wait_running(&self, name: &str) -> Result<()> {
+        crate::async_runtime::block_on(self.wait_running_async(name))
+    }
+
+    pub async fn wait_running_async(&self, name: &str) -> Result<()> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
         let mut last_log = std::time::Instant::now();
 
         loop {
-            let pod = block_on(pods.get(name)).with_context(|| format!("getting pod '{name}'"))?;
+            let pod = pods
+                .get(name)
+                .await
+                .with_context(|| format!("getting pod '{name}'"))?;
 
             let phase = pod
                 .status
@@ -365,7 +391,7 @@ impl K8sClient {
                 last_log = std::time::Instant::now();
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
@@ -375,14 +401,20 @@ impl K8sClient {
     /// out-of-band deletes (e.g. a user invoking `kubectl delete` or
     /// the cluster reaping the pod).
     pub fn delete_pod(&self, name: &str) -> Result<()> {
+        crate::async_runtime::block_on(self.delete_pod_async(name))
+    }
+
+    pub async fn delete_pod_async(&self, name: &str) -> Result<()> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-        let result = block_on(pods.delete(
-            name,
-            &DeleteParams {
-                grace_period_seconds: Some(0),
-                ..Default::default()
-            },
-        ));
+        let result = pods
+            .delete(
+                name,
+                &DeleteParams {
+                    grace_period_seconds: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await;
         match result {
             Ok(_) => {
                 info!("Deleted k8s pod '{name}'");
@@ -396,10 +428,45 @@ impl K8sClient {
         }
     }
 
+    pub(crate) async fn delete_creation_async(&self, creation: &str) -> Result<()> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
+        let selector = format!("{}={creation}", crate::executor::LABEL_CREATION);
+        for pod in pods.list(&ListParams::default().labels(&selector)).await? {
+            let name = pod
+                .metadata
+                .name
+                .context("cleanup pod is missing its name")?;
+            let uid = pod.metadata.uid.context("cleanup pod is missing its UID")?;
+            let result = pods
+                .delete(
+                    &name,
+                    &DeleteParams {
+                        grace_period_seconds: Some(0),
+                        preconditions: Some(Preconditions {
+                            uid: Some(uid),
+                            resource_version: None,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => {}
+                Err(kube::Error::Api(error)) if error.is_not_found() || error.code == 409 => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Get the status of a pod, mapped to PodStatus.
     pub fn get_pod_status(&self, name: &str) -> Result<PodStatus> {
+        crate::async_runtime::block_on(self.get_pod_status_async(name))
+    }
+
+    pub async fn get_pod_status_async(&self, name: &str) -> Result<PodStatus> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.namespace);
-        let pod = match block_on(pods.get_opt(name)).context("getting pod status")? {
+        let pod = match pods.get_opt(name).await.context("getting pod status")? {
             Some(pod) => pod,
             None => return Ok(PodStatus::Gone),
         };

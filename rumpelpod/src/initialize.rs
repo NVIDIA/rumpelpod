@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
+use crate::async_command::AsyncCommandExt;
 use crate::config::{ContainerEngine, Host};
 use crate::devcontainer::{
     collect_local_env_var_names, resolve_devcontainer_vars, DevContainer, LifecycleCommand,
@@ -25,7 +26,7 @@ use crate::image::OutputLine;
 /// before variable substitution so `${localEnv:DOCKER_HOST}` matches the
 /// child process and the configuration applied afterward.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run(
+pub(crate) async fn run_async(
     repo_path: &Path,
     devcontainer_path: Option<&Path>,
     pod_name: &str,
@@ -85,6 +86,7 @@ pub(crate) fn run(
         "running initializeCommand...".to_string(),
     ));
     run_command(command, repo_path, local_env, &remove_env, progress)
+        .await
         .context("initializeCommand in devcontainer.json failed")?;
     Ok(())
 }
@@ -154,7 +156,7 @@ struct EnvironmentOverrides {
     remove: HashSet<String>,
 }
 
-fn run_command(
+async fn run_command(
     command: &LifecycleCommand,
     workdir: &Path,
     env: &HashMap<String, String>,
@@ -172,29 +174,33 @@ fn run_command(
                 remove_env,
                 progress,
             )
+            .await
         }
-        LifecycleCommand::Array(args) => run_one(
-            "initializeCommand",
-            args,
-            workdir,
-            env,
-            remove_env,
-            progress,
-        ),
+        LifecycleCommand::Array(args) => {
+            run_one(
+                "initializeCommand",
+                args,
+                workdir,
+                env,
+                remove_env,
+                progress,
+            )
+            .await
+        }
         LifecycleCommand::Object(commands) => {
-            run_parallel(commands, workdir, env, remove_env, progress)
+            run_parallel(commands, workdir, env, remove_env, progress).await
         }
     }
 }
 
-fn run_parallel(
+async fn run_parallel(
     commands: &HashMap<String, StringOrArray>,
     workdir: &Path,
     env: &HashMap<String, String>,
     remove_env: &HashSet<String>,
     progress: &std::sync::mpsc::Sender<OutputLine>,
 ) -> Result<()> {
-    let handles: Vec<_> = commands
+    let pending: Vec<_> = commands
         .iter()
         .map(|(name, command)| {
             let name = name.clone();
@@ -208,19 +214,15 @@ fn run_parallel(
             let env = env.clone();
             let remove_env = remove_env.clone();
             let progress = progress.clone();
-            std::thread::spawn(move || {
+            async move {
                 let label = format!("initializeCommand/{name}");
-                run_one(&label, &args, &workdir, &env, &remove_env, &progress)
-            })
+                run_one(&label, &args, &workdir, &env, &remove_env, &progress).await
+            }
         })
         .collect();
 
     let mut first_error = None;
-    for handle in handles {
-        let result = match handle.join() {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("initializeCommand thread panicked")),
-        };
+    for result in futures_util::future::join_all(pending).await {
         if let Err(error) = result {
             if first_error.is_none() {
                 first_error = Some(error);
@@ -234,7 +236,7 @@ fn run_parallel(
     }
 }
 
-fn run_one(
+async fn run_one(
     name: &str,
     args: &[String],
     workdir: &Path,
@@ -266,7 +268,8 @@ fn run_one(
                 .reopen()
                 .context("opening initializer stderr buffer")?,
         ))
-        .status()
+        .status_async()
+        .await
         .with_context(|| format!("spawning {name}"))?;
 
     let stdout_len = stdout
