@@ -7,6 +7,9 @@ Send the effective bypass setting on the existing pod WebSocket request
 and refresh it when a frontend reuses the daemon's cached proxy. Apply
 permission defaults when the pod starts its Codex app-server so remote
 resumes no longer receive the frontend overrides that Codex rejects.
+Let new-thread requests inherit those defaults instead of the TUI's
+implicit local approval and sandbox settings. Explicit permission
+profiles and saved-thread permissions continue to reach Codex unchanged.
 
 A running app-server keeps its startup defaults, while saved threads
 retain their permissions. Each new connection supplies the setting again

@@ -131,6 +131,7 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
     assert!(!replacement.contains(" -c "), "{replacement}");
 
     third.send("/new");
+    third.dismiss_dialogs_with_timeout(Duration::from_secs(30));
     third.send("/status");
     third.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
 }

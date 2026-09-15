@@ -6,9 +6,9 @@
 //! The pod server exposes a `/codex` WebSocket endpoint. On the first
 //! connection, it spawns `codex app-server` on a fresh ephemeral
 //! loopback port. Subsequent connections reuse the same app-server,
-//! which persists thread state across client reconnections. All
-//! WebSocket frames are forwarded bidirectionally between the
-//! connecting client and the app-server.
+//! which persists thread state across client reconnections. New threads
+//! inherit the app-server's permission defaults; other WebSocket traffic
+//! passes through between the connecting client and the app-server.
 //!
 //! A separate monitoring connection tracks thread status independently
 //! of TUI client connections so that `rumpel list` always reflects the
@@ -330,6 +330,7 @@ async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
             msg = client_read.next() => {
                 match msg {
                     Some(Ok(msg)) => {
+                        let msg = use_app_server_permission_defaults(msg);
                         let tung_msg = axum_to_tungstenite(msg);
                         if server_write.send(tung_msg).await.is_err() {
                             break;
@@ -353,6 +354,39 @@ async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn use_app_server_permission_defaults(msg: Message) -> Message {
+    let Message::Text(text) = msg else {
+        return msg;
+    };
+    let Ok(mut request) = serde_json::from_str::<serde_json::Value>(&text) else {
+        // Leave malformed requests to the app-server's protocol error handling.
+        return Message::Text(text);
+    };
+    if request.get("method").and_then(|method| method.as_str()) != Some("thread/start") {
+        return Message::Text(text);
+    }
+    let Some(params) = request
+        .get_mut("params")
+        .and_then(|params| params.as_object_mut())
+    else {
+        return Message::Text(text);
+    };
+    if params
+        .get("permissions")
+        .is_some_and(|permissions| !permissions.is_null())
+    {
+        // Named profiles come from an explicit choice in the permission picker.
+        return Message::Text(text);
+    }
+
+    // Codex 0.154 sends these local defaults even without permission flags.
+    // Omitting them lets the app-server choose defaults for the pod, while
+    // resume requests keep the saved thread's permissions untouched.
+    params.remove("approvalPolicy");
+    params.remove("sandbox");
+    Message::Text(request.to_string().into())
 }
 
 fn app_server_http_url(port: u16, path: &str) -> String {

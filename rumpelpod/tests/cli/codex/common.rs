@@ -379,16 +379,25 @@ impl CodexSession {
         }
     }
 
+    fn input_echo(text: &str) -> String {
+        // Slash commands also appear in the welcome text. Wait for the
+        // composer to echo them before submitting.
+        if text.starts_with('/') {
+            format!("\u{203a} {text}")
+        } else {
+            let needle_len = text.len().min(40);
+            text[text.len() - needle_len..].to_owned()
+        }
+    }
+
     /// Type text into the prompt and press Enter.
     pub fn send(&mut self, text: &str) {
-        self.writer
-            .write_all(text.as_bytes())
-            .expect("write to PTY");
-        self.writer.flush().expect("flush PTY writer");
+        // Bracketed paste keeps Codex's paste-burst heuristic from treating
+        // the following Enter as a newline inside the pasted command.
+        self.write_raw(format!("\x1b[200~{text}\x1b[201~").as_bytes());
 
-        let needle_len = text.len().min(40);
-        let needle = &text[text.len() - needle_len..];
-        self.wait_for(needle);
+        let needle = Self::input_echo(text);
+        self.wait_for(&needle);
 
         self.writer.write_all(b"\r").expect("write Enter to PTY");
         self.writer.flush().expect("flush PTY writer");
@@ -397,14 +406,10 @@ impl CodexSession {
     /// Lifecycle tests need bounded echo waits when stale remote state
     /// prevents the TUI from accepting input.
     pub fn send_with_timeout(&mut self, text: &str, timeout: Duration) {
-        self.writer
-            .write_all(text.as_bytes())
-            .expect("write to PTY");
-        self.writer.flush().expect("flush PTY writer");
+        self.write_raw(format!("\x1b[200~{text}\x1b[201~").as_bytes());
 
-        let needle_len = text.len().min(40);
-        let needle = &text[text.len() - needle_len..];
-        self.wait_for_with_timeout(needle, timeout);
+        let needle = Self::input_echo(text);
+        self.wait_for_with_timeout(&needle, timeout);
 
         self.writer.write_all(b"\r").expect("write Enter to PTY");
         self.writer.flush().expect("flush PTY writer");
