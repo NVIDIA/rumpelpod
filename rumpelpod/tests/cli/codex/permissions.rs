@@ -38,7 +38,8 @@ fn codex_permissions_default_bypass_overrides_config() {
 
     let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     session.dismiss_dialogs();
-    assert!(session.screen().contents().contains("YOLO mode"));
+    let contents = session.screen().contents();
+    assert!(contents.contains("YOLO mode"), "{contents}");
     session.send("Run `printf %x 3735928559`.");
     session.wait_for_with_timeout("deadbeef", Duration::from_secs(30));
 }
@@ -103,8 +104,15 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
         &[],
     );
     second.wait_for_with_timeout("Paris", Duration::from_secs(30));
-    assert!(second.screen().contents().contains("YOLO mode"));
+    let contents = second.screen().contents();
+    assert!(contents.contains("YOLO mode"), "{contents}");
     assert_eq!(app_server_command(&repo, &daemon), original);
+    second.send("/new");
+    second.dismiss_dialogs_with_timeout(Duration::from_secs(30));
+    let contents = second.screen().contents();
+    assert!(contents.contains("YOLO mode"), "{contents}");
+    second.send("What is the capital of France? Reply with just the city name, nothing else.");
+    second.wait_for_with_timeout("Paris", Duration::from_secs(30));
     second.send("/exit");
     second.wait_for_exit();
 
@@ -125,7 +133,8 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
         &[],
     );
     third.wait_for_with_timeout("Paris", Duration::from_secs(30));
-    assert!(third.screen().contents().contains("YOLO mode"));
+    let contents = third.screen().contents();
+    assert!(contents.contains("YOLO mode"), "{contents}");
     let replacement = app_server_command(&repo, &daemon);
     assert_ne!(replacement.split_whitespace().next(), Some(pid));
     assert!(!replacement.contains(" -c "), "{replacement}");
@@ -158,7 +167,8 @@ fn codex_permissions_survive_pod_restart() {
 
     let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     resumed.wait_for_with_timeout("Paris", Duration::from_secs(30));
-    assert!(resumed.screen().contents().contains("YOLO mode"));
+    let contents = resumed.screen().contents();
+    assert!(contents.contains("YOLO mode"), "{contents}");
     let command = app_server_command(&repo, &daemon);
     assert!(command.contains("approval_policy=\"never\""), "{command}");
     assert!(

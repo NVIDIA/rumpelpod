@@ -20,7 +20,8 @@ fn codex_smoke() {
     // Dismiss any startup dialogs (model selection, announcements)
     // by pressing Enter whenever the TUI is waiting.
     session.dismiss_dialogs();
-    assert!(session.screen().contents().contains("YOLO mode"));
+    let contents = session.screen().contents();
+    assert!(contents.contains("YOLO mode"), "{contents}");
 
     session.send("Run `printf %x 3735928559`.");
     session.wait_for_with_timeout("deadbeef", Duration::from_secs(30));
