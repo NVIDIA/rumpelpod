@@ -99,6 +99,17 @@ impl CodexSession {
         pod_name: &str,
         codex_args: &[&str],
     ) -> Self {
+        Self::spawn_named_with_rumpel_args(repo, daemon, home, pod_name, &[], codex_args)
+    }
+
+    pub fn spawn_named_with_rumpel_args(
+        repo: &TestRepo,
+        daemon: &TestDaemon,
+        home: &Path,
+        pod_name: &str,
+        rumpel_args: &[&str],
+        codex_args: &[&str],
+    ) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -127,6 +138,7 @@ impl CodexSession {
         );
 
         cmd.args(["codex", "--create", pod_name]);
+        cmd.args(rumpel_args);
         if !codex_args.is_empty() {
             cmd.arg("--");
             for arg in codex_args {
