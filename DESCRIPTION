@@ -7,3 +7,13 @@ externally provided interactive Codex.
 Wait for the fresh-thread welcome screen before submitting test prompts.
 The startup draft composer accepts edits while discarding Enter, so an
 early submission otherwise stalls before exercising the remote session.
+
+The existing codex_relaunch_resumes_last_remote_session test now
+reproduces "Permission overrides are not supported when resuming a
+remote task." It passed with 0.147.0. Rumpel still passes its default
+permission bypass flag on resume, so this regression remains failing
+pending a fix.
+
+Validation: all four required smoke tests passed. On 0.154.0 the Codex
+filter passes 18 tests and fails only the resume reproducer, including
+its retry. The host-network test also passed in isolation.
