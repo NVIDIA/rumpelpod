@@ -17,6 +17,7 @@
 //!     remote thread, while the first frontend starts a new one.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -217,11 +218,6 @@ fn build_codex_spec(
     let json_config = load_json_config(repo_path)?;
     let bypass = !no_dangerously_bypass_approvals_and_sandbox
         && json_config.codex.dangerously_bypass_approvals_and_sandbox;
-    let mut codex_args = Vec::new();
-    if bypass {
-        codex_args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-    }
-    codex_args.extend(extra_args);
 
     // A non-empty state came from the pod's live event connection and means
     // its Codex app server already ran with the credentials copied before the
@@ -239,7 +235,8 @@ fn build_codex_spec(
     // Bind a per-pod loopback proxy that forwards to the pod's /codex.
     // The codex TUI dials it via `--remote`; we cannot use a Unix
     // socket here because we do not control the codex CLI.
-    let proxy = daemon.ensure_codex_proxy(repo_path, pod_name, container_url, container_token)?;
+    let proxy =
+        daemon.ensure_codex_proxy(repo_path, pod_name, container_url, container_token, bypass)?;
 
     let remote_url = format!("ws://127.0.0.1:{}", proxy.port);
     let mut cmd = vec![
@@ -254,7 +251,7 @@ fn build_codex_spec(
     // notifications or an app-server restart.
     cmd.push("resume".to_string());
     cmd.push("--last".to_string());
-    cmd.extend(codex_args);
+    cmd.extend(extra_args);
 
     Ok(Some(SessionSpec {
         name: codex_session_name(repo_path, pod_name),
@@ -331,6 +328,7 @@ pub async fn run_codex_proxy(
     container_url: String,
     container_token: String,
     client_token: String,
+    bypass: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::SyncSender<()>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -351,8 +349,11 @@ pub async fn run_codex_proxy(
         let url = container_url.clone();
         let container_token = container_token.clone();
         let client_token = client_token.clone();
+        let bypass = bypass.load(Ordering::Relaxed);
         tokio::spawn(async move {
-            if let Err(e) = proxy_connection(stream, &url, &container_token, &client_token).await {
+            if let Err(e) =
+                proxy_connection(stream, &url, &container_token, &client_token, bypass).await
+            {
                 eprintln!("codex proxy: connection error: {e:#}");
             }
         });
@@ -364,6 +365,7 @@ async fn proxy_connection(
     container_url: &str,
     container_token: &str,
     client_token: &str,
+    bypass: bool,
 ) -> Result<()> {
     let expected_auth = format!("Bearer {client_token}");
     let client_ws =
@@ -376,7 +378,7 @@ async fn proxy_connection(
     // slow container start does not cause a permanent failure.
     let mut server_ws = None;
     for _ in 0..50 {
-        let request = build_pod_ws_request(container_url, container_token)?;
+        let request = build_pod_ws_request(container_url, container_token, bypass)?;
         match tokio_tungstenite::connect_async(request).await {
             Ok((ws, _)) => {
                 server_ws = Some(ws);
@@ -462,6 +464,7 @@ fn unauthorized_ws_response() -> WsServerErrorResponse {
 fn build_pod_ws_request(
     container_url: &str,
     token: &str,
+    bypass: bool,
 ) -> Result<tungstenite::http::Request<()>> {
     let mut ws_url = Url::parse(container_url).context("parsing container URL")?;
     let scheme = match ws_url.scheme() {
@@ -473,6 +476,9 @@ fn build_pod_ws_request(
         .set_scheme(scheme)
         .expect("ws/wss are always valid schemes");
     ws_url.set_path("/codex");
+    ws_url
+        .query_pairs_mut()
+        .append_pair("bypass", if bypass { "true" } else { "false" });
 
     let host = match ws_url.port() {
         Some(port) => format!("{}:{port}", ws_url.host_str().unwrap_or("localhost")),

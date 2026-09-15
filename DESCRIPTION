@@ -1,19 +1,13 @@
-Test remote session recovery with current Codex
+Preserve Codex permissions across remote resumes
 
-Pin the isolated test package to Codex 0.154.0 so integration tests
-cover the CLI used in practical sessions without replacing the
-externally provided interactive Codex.
+Use Codex 0.154.0 in the isolated test package and wait for the ready
+screen before submitting test prompts.
 
-Wait for the fresh-thread welcome screen before submitting test prompts.
-The startup draft composer accepts edits while discarding Enter, so an
-early submission otherwise stalls before exercising the remote session.
+Send the effective bypass setting on the existing pod WebSocket request
+and refresh it when a frontend reuses the daemon's cached proxy. Apply
+permission defaults when the pod starts its Codex app-server so remote
+resumes no longer receive the frontend overrides that Codex rejects.
 
-The existing codex_relaunch_resumes_last_remote_session test now
-reproduces "Permission overrides are not supported when resuming a
-remote task." It passed with 0.147.0. Rumpel still passes its default
-permission bypass flag on resume, so this regression remains failing
-pending a fix.
-
-Validation: all four required smoke tests passed. On 0.154.0 the Codex
-filter passes 18 tests and fails only the resume reproducer, including
-its retry. The host-network test also passed in isolation.
+A running app-server keeps its startup defaults, while saved threads
+retain their permissions. Each new connection supplies the setting again
+so app-server and pod restarts do not require separate persisted state.

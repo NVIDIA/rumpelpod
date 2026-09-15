@@ -671,7 +671,7 @@ pub struct CodexCommand {
     #[arg(long)]
     pub create: bool,
 
-    /// Disable --dangerously-bypass-approvals-and-sandbox (which is on by default)
+    /// Use Codex's configured permissions when starting its app-server
     #[arg(long)]
     pub no_dangerously_bypass_approvals_and_sandbox: bool,
 

@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -51,14 +52,24 @@ pub fn new_codex_app_server() -> CodexAppServer {
     Arc::new(Mutex::new(None))
 }
 
+#[derive(Deserialize)]
+pub struct CodexQuery {
+    bypass: bool,
+}
+
 pub async fn codex_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<super::server::PodServerState>,
+    Query(query): Query<CodexQuery>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_codex_proxy(socket, state))
+    ws.on_upgrade(move |socket| handle_codex_proxy(socket, state, query.bypass))
 }
 
-async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodServerState) {
+async fn handle_codex_proxy(
+    mut client_ws: WebSocket,
+    state: super::server::PodServerState,
+    bypass: bool,
+) {
     let repo_path = match state.repo_path.lock().await.clone() {
         Some(repo_path) => repo_path,
         None => {
@@ -73,7 +84,7 @@ async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodS
         }
     };
 
-    let port = match ensure_app_server_running(&state.codex_app_server, &repo_path).await {
+    let port = match ensure_app_server_running(&state.codex_app_server, &repo_path, bypass).await {
         Ok(port) => port,
         Err(e) => {
             eprintln!("codex: failed to start app-server: {e:#}");
@@ -108,9 +119,13 @@ async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodS
 /// concurrent /codex connections do not race to spawn a second
 /// app-server, and so that the first arriving caller's captured
 /// stderr is the one every retry sees on failure.
-async fn ensure_app_server_running(app_server: &CodexAppServer, repo_path: &Path) -> Result<u16> {
+async fn ensure_app_server_running(
+    app_server: &CodexAppServer,
+    repo_path: &Path,
+    bypass: bool,
+) -> Result<u16> {
     let mut guard = app_server.lock().await;
-    let port = ensure_app_server_running_locked(&mut guard, repo_path).await?;
+    let port = ensure_app_server_running_locked(&mut guard, repo_path, bypass).await?;
     // Rewrite the advertisement on every path, not just fresh spawns:
     // an earlier attempt may have errored after the app-server came
     // up, leaving the file stale or missing.
@@ -123,6 +138,7 @@ async fn ensure_app_server_running(app_server: &CodexAppServer, repo_path: &Path
 async fn ensure_app_server_running_locked(
     guard: &mut Option<AppServerHandle>,
     repo_path: &Path,
+    bypass: bool,
 ) -> Result<u16> {
     // Reuse a live handle if its /healthz already answers.
     if let Some(handle) = guard.as_mut() {
@@ -146,8 +162,20 @@ async fn ensure_app_server_running_locked(
     let addr = format!("{CODEX_APP_SERVER_HOST}:{port}");
     let listen_url = format!("ws://{addr}");
     let repo_path_display = repo_path.display();
-    let mut child = Command::new(&codex_bin)
-        .args(["app-server", "--listen", &listen_url])
+    let mut command = Command::new(&codex_bin);
+    command.args(["app-server", "--listen", &listen_url]);
+    // Remote resumes reject permission overrides from the frontend. Server
+    // defaults let new threads bypass the pod's redundant inner sandbox while
+    // existing threads retain their saved permissions, including after restart.
+    if bypass {
+        command.args([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "default_permissions=\":danger-full-access\"",
+        ]);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
