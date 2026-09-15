@@ -74,6 +74,7 @@ pub fn setup_codex_test_repo() -> (TestHome, TestRepo, ExecutorResources, TestDa
 const PTY_ROWS: u16 = 500;
 const PTY_COLS: u16 = 80;
 const SCREEN_DUMP_INTERVAL: Duration = Duration::from_secs(5);
+const WELCOME_MESSAGE: &str = "To get started, describe a task";
 
 /// An interactive Codex session running via `rumpel codex`.
 pub struct CodexSession {
@@ -274,8 +275,7 @@ impl CodexSession {
         }
     }
 
-    /// Dismiss startup dialogs by pressing Enter until we reach the
-    /// main input prompt (not on the alternate screen).
+    /// Dismiss startup dialogs and wait for a fresh conversation to accept input.
     pub fn dismiss_dialogs(&mut self) {
         loop {
             self.wait_for("\u{203a}");
@@ -291,6 +291,12 @@ impl CodexSession {
 
             self.writer.write_all(b"\r").expect("write Enter");
             self.writer.flush().expect("flush");
+        }
+
+        // The startup composer accepts edits but discards Enter. The welcome
+        // instructions appear after the remote thread is ready for submissions.
+        if !self.parser.screen().contents().contains(WELCOME_MESSAGE) {
+            self.wait_for(WELCOME_MESSAGE);
         }
     }
 
@@ -311,6 +317,10 @@ impl CodexSession {
 
             self.writer.write_all(b"\r").expect("write Enter");
             self.writer.flush().expect("flush");
+        }
+
+        if !self.parser.screen().contents().contains(WELCOME_MESSAGE) {
+            self.wait_for_with_timeout(WELCOME_MESSAGE, timeout);
         }
     }
 

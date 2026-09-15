@@ -3,3 +3,7 @@ Test remote session recovery with current Codex
 Pin the isolated test package to Codex 0.154.0 so integration tests
 cover the CLI used in practical sessions without replacing the
 externally provided interactive Codex.
+
+Wait for the fresh-thread welcome screen before submitting test prompts.
+The startup draft composer accepts edits while discarding Enter, so an
+early submission otherwise stalls before exercising the remote session.
