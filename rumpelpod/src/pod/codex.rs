@@ -373,7 +373,7 @@ fn use_app_server_permission_defaults(msg: Message, use_server_defaults: &mut bo
         if [
             "approvalPolicy",
             "approvalsReviewer",
-            "sandbox",
+            "sandboxPolicy",
             "permissions",
         ]
         .iter()
