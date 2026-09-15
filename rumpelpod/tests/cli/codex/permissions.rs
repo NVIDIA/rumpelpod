@@ -79,6 +79,57 @@ fn codex_permissions_config_opt_out_preserves_config() {
 }
 
 #[test]
+fn codex_permissions_cli_opt_out_allows_permission_flags() {
+    let (home, repo, _executor, daemon) = setup_codex_test_repo();
+
+    let mut session = CodexSession::spawn_named_with_rumpel_args(
+        &repo,
+        &daemon,
+        home.path(),
+        "test",
+        &[NO_BYPASS],
+        &["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+    );
+    session.dismiss_dialogs();
+    session.send("/status");
+    session.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
+}
+
+#[test]
+fn codex_permissions_new_threads_keep_default_bypass() {
+    let (home, repo, _executor, daemon) = setup_codex_test_repo();
+    configure_read_only(&home);
+
+    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    session.dismiss_dialogs();
+    session.send("What is the capital of France? Reply with just the city name, nothing else.");
+    session.wait_for_with_timeout("Paris", Duration::from_secs(30));
+    session.send("/new");
+    // Codex prints the prior thread's usage after configuring the new thread.
+    session.wait_for_with_timeout("Token usage: total=", Duration::from_secs(30));
+    session.send("/status");
+    session.wait_for_with_timeout("Full Access", Duration::from_secs(30));
+}
+
+#[test]
+fn codex_permissions_picker_survives_new_thread() {
+    let (home, repo, _executor, daemon) = setup_codex_test_repo();
+
+    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    session.dismiss_dialogs();
+    session.send("What is the capital of France? Reply with just the city name, nothing else.");
+    session.wait_for_with_timeout("Paris", Duration::from_secs(30));
+    session.send("/permissions");
+    session.wait_for_with_timeout("4. Read Only", Duration::from_secs(30));
+    session.write_raw(b"4\r");
+    session.wait_for_with_timeout("Permissions updated to Read Only", Duration::from_secs(30));
+    session.send("/new");
+    session.wait_for_with_timeout("Token usage: total=", Duration::from_secs(30));
+    session.send("/status");
+    session.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
+}
+
+#[test]
 fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
     let (home, repo, _executor, daemon) = setup_codex_test_repo();
     configure_read_only(&home);
@@ -107,20 +158,6 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
     let contents = second.screen().contents();
     assert!(contents.contains("YOLO mode"), "{contents}");
     assert_eq!(app_server_command(&repo, &daemon), original);
-    second.send("/new");
-    second.wait_for_screen_with_timeout(
-        "configured header without the previous transcript",
-        Duration::from_secs(30),
-        |contents| {
-            contents.contains("/model to change")
-                && !contents.contains("loading")
-                && !contents.contains("Paris")
-        },
-    );
-    let contents = second.screen().contents();
-    assert!(contents.contains("YOLO mode"), "{contents}");
-    second.send("What is the capital of France? Reply with just the city name, nothing else.");
-    second.wait_for_with_timeout("Paris", Duration::from_secs(30));
     second.send("/exit");
     second.wait_for_exit();
 
@@ -148,15 +185,7 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
     assert!(!replacement.contains(" -c "), "{replacement}");
 
     third.send("/new");
-    third.wait_for_screen_with_timeout(
-        "configured header without the previous transcript",
-        Duration::from_secs(30),
-        |contents| {
-            contents.contains("/model to change")
-                && !contents.contains("loading")
-                && !contents.contains("Paris")
-        },
-    );
+    third.wait_for_with_timeout("Token usage: total=", Duration::from_secs(30));
     third.send("/status");
     third.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
 }

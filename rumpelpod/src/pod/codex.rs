@@ -6,9 +6,9 @@
 //! The pod server exposes a `/codex` WebSocket endpoint. On the first
 //! connection, it spawns `codex app-server` on a fresh ephemeral
 //! loopback port. Subsequent connections reuse the same app-server,
-//! which persists thread state across client reconnections. New threads
-//! inherit the app-server's permission defaults; other WebSocket traffic
-//! passes through between the connecting client and the app-server.
+//! which persists thread state across client reconnections. New threads use
+//! the app-server's permission defaults when bypass is requested, until the
+//! user makes an explicit permission selection in Codex.
 //!
 //! A separate monitoring connection tracks thread status independently
 //! of TUI client connections so that `rumpel list` always reflects the
@@ -108,7 +108,7 @@ async fn handle_codex_proxy(
         ));
     }
 
-    if let Err(e) = proxy_to_app_server(client_ws, port).await {
+    if let Err(e) = proxy_to_app_server(client_ws, port, bypass).await {
         eprintln!("codex: proxy error: {e:#}");
     }
 }
@@ -316,7 +316,7 @@ async fn health_check(port: u16) -> bool {
 }
 
 /// Connect to the app-server and bidirectionally forward WebSocket frames.
-async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
+async fn proxy_to_app_server(client_ws: WebSocket, port: u16, bypass: bool) -> Result<()> {
     let ws_url = app_server_ws_url(port);
     let (server_ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
@@ -324,13 +324,14 @@ async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
 
     let (mut server_write, mut server_read) = server_ws.split();
     let (mut client_write, mut client_read) = client_ws.split();
+    let mut use_server_defaults = bypass;
 
     loop {
         tokio::select! {
             msg = client_read.next() => {
                 match msg {
                     Some(Ok(msg)) => {
-                        let msg = use_app_server_permission_defaults(msg);
+                        let msg = use_app_server_permission_defaults(msg, &mut use_server_defaults);
                         let tung_msg = axum_to_tungstenite(msg);
                         if server_write.send(tung_msg).await.is_err() {
                             break;
@@ -356,7 +357,10 @@ async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn use_app_server_permission_defaults(msg: Message) -> Message {
+fn use_app_server_permission_defaults(msg: Message, use_server_defaults: &mut bool) -> Message {
+    if !*use_server_defaults {
+        return msg;
+    }
     let Message::Text(text) = msg else {
         return msg;
     };
@@ -364,7 +368,26 @@ fn use_app_server_permission_defaults(msg: Message) -> Message {
         // Leave malformed requests to the app-server's protocol error handling.
         return Message::Text(text);
     };
-    if request.get("method").and_then(|method| method.as_str()) != Some("thread/start") {
+    let method = request.get("method").and_then(|method| method.as_str());
+    if method == Some("thread/settings/update") {
+        if [
+            "approvalPolicy",
+            "approvalsReviewer",
+            "sandbox",
+            "permissions",
+        ]
+        .iter()
+        .any(|key| {
+            request["params"]
+                .get(*key)
+                .is_some_and(|value| !value.is_null())
+        }) {
+            // Later /new requests carry this explicit choice in legacy fields.
+            *use_server_defaults = false;
+        }
+        return Message::Text(text);
+    }
+    if method != Some("thread/start") {
         return Message::Text(text);
     }
     let Some(params) = request
@@ -378,12 +401,13 @@ fn use_app_server_permission_defaults(msg: Message) -> Message {
         .is_some_and(|permissions| !permissions.is_null())
     {
         // Named profiles come from an explicit choice in the permission picker.
+        *use_server_defaults = false;
         return Message::Text(text);
     }
 
     // Codex 0.154 sends these local defaults even without permission flags.
-    // Omitting them lets the app-server choose defaults for the pod, while
-    // resume requests keep the saved thread's permissions untouched.
+    // Omitting them lets the app-server choose defaults until the user makes
+    // an explicit permission selection. Resumes retain their saved permissions.
     params.remove("approvalPolicy");
     params.remove("sandbox");
     Message::Text(request.to_string().into())

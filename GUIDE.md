@@ -529,10 +529,12 @@ The `codex` object configures the `rumpel codex` command.
 | `dangerouslyBypassApprovalsAndSandbox` | bool | `true` | sets the Codex app-server's startup defaults to bypass approvals and sandboxing. The pod already provides an isolated environment, so Codex does not need its own sandbox on top. |
 
 `--no-dangerously-bypass-approvals-and-sandbox` disables these startup overrides.
-New threads inherit the app-server's defaults unless you select a permission
-profile in Codex. An existing app-server keeps its startup defaults; resumed
-threads keep their saved permissions. The effective setting travels with each
-connection to the pod, so it is supplied again when a connection starts an app-server after a restart.
+With bypass enabled, new threads inherit the app-server's defaults until you
+choose permissions in Codex. That choice also applies to subsequent `/new`
+commands. An existing app-server keeps its startup defaults; resumed threads
+keep their saved permissions. Use the opt-out flag when forwarding your own permission
+flags to Codex. The effective setting travels with each connection to the pod, so
+it is supplied again when a connection starts an app-server after a restart.
 
 ### `pi`
 
