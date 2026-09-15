@@ -14,3 +14,8 @@ in Codex. Saved threads retain their permissions.
 A running app-server keeps its startup defaults, while saved threads
 retain their permissions. Each new connection supplies the setting again
 so app-server and pod restarts do not require separate persisted state.
+
+Validation: cargo pipeline completed with 617 passed and 2 skipped. A
+setup-progress test passed on retry and again in isolation. Codex tests
+cover resumed command execution, opt-outs, permission choices, and
+app-server and pod restarts.
