@@ -108,7 +108,15 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
     assert!(contents.contains("YOLO mode"), "{contents}");
     assert_eq!(app_server_command(&repo, &daemon), original);
     second.send("/new");
-    second.dismiss_dialogs_with_timeout(Duration::from_secs(30));
+    second.wait_for_screen_with_timeout(
+        "configured header without the previous transcript",
+        Duration::from_secs(30),
+        |contents| {
+            contents.contains("/model to change")
+                && !contents.contains("loading")
+                && !contents.contains("Paris")
+        },
+    );
     let contents = second.screen().contents();
     assert!(contents.contains("YOLO mode"), "{contents}");
     second.send("What is the capital of France? Reply with just the city name, nothing else.");
@@ -140,7 +148,15 @@ fn codex_permissions_cached_proxy_refreshes_after_app_server_restart() {
     assert!(!replacement.contains(" -c "), "{replacement}");
 
     third.send("/new");
-    third.dismiss_dialogs_with_timeout(Duration::from_secs(30));
+    third.wait_for_screen_with_timeout(
+        "configured header without the previous transcript",
+        Duration::from_secs(30),
+        |contents| {
+            contents.contains("/model to change")
+                && !contents.contains("loading")
+                && !contents.contains("Paris")
+        },
+    );
     third.send("/status");
     third.wait_for_with_timeout("Read Only (Ask for approval)", Duration::from_secs(30));
 }

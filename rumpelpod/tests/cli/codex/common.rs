@@ -229,6 +229,15 @@ impl CodexSession {
     /// Restart tests use this so connection failures surface before
     /// xtest kills the whole test process.
     pub fn wait_for_with_timeout(&mut self, needle: &str, timeout: Duration) -> String {
+        self.wait_for_screen_with_timeout(needle, timeout, |contents| contents.contains(needle))
+    }
+
+    pub fn wait_for_screen_with_timeout(
+        &mut self,
+        needle: &str,
+        timeout: Duration,
+        ready: impl Fn(&str) -> bool,
+    ) -> String {
         let deadline = Instant::now() + timeout;
         let mut last_dump = Instant::now();
 
@@ -255,7 +264,7 @@ impl CodexSession {
                         self.parser.process(&more);
                     }
                     let contents = self.parser.screen().contents();
-                    if contents.contains(needle) {
+                    if ready(&contents) {
                         return contents;
                     }
                     if last_dump.elapsed() >= SCREEN_DUMP_INTERVAL {
