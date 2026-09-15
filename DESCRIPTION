@@ -1,0 +1,5 @@
+Test remote session recovery with current Codex
+
+Pin the isolated test package to Codex 0.154.0 so integration tests
+cover the CLI used in practical sessions without replacing the
+externally provided interactive Codex.
