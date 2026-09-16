@@ -74,6 +74,7 @@ pub fn setup_codex_test_repo() -> (TestHome, TestRepo, ExecutorResources, TestDa
 const PTY_ROWS: u16 = 500;
 const PTY_COLS: u16 = 80;
 const SCREEN_DUMP_INTERVAL: Duration = Duration::from_secs(5);
+const WELCOME_MESSAGE: &str = "To get started, describe a task";
 
 /// An interactive Codex session running via `rumpel codex`.
 pub struct CodexSession {
@@ -96,6 +97,17 @@ impl CodexSession {
         daemon: &TestDaemon,
         home: &Path,
         pod_name: &str,
+        codex_args: &[&str],
+    ) -> Self {
+        Self::spawn_named_with_rumpel_args(repo, daemon, home, pod_name, &[], codex_args)
+    }
+
+    pub fn spawn_named_with_rumpel_args(
+        repo: &TestRepo,
+        daemon: &TestDaemon,
+        home: &Path,
+        pod_name: &str,
+        rumpel_args: &[&str],
         codex_args: &[&str],
     ) -> Self {
         let pty_system = native_pty_system();
@@ -126,6 +138,7 @@ impl CodexSession {
         );
 
         cmd.args(["codex", "--create", pod_name]);
+        cmd.args(rumpel_args);
         if !codex_args.is_empty() {
             cmd.arg("--");
             for arg in codex_args {
@@ -274,8 +287,7 @@ impl CodexSession {
         }
     }
 
-    /// Dismiss startup dialogs by pressing Enter until we reach the
-    /// main input prompt (not on the alternate screen).
+    /// Dismiss startup dialogs and wait for a fresh conversation to accept input.
     pub fn dismiss_dialogs(&mut self) {
         loop {
             self.wait_for("\u{203a}");
@@ -291,6 +303,12 @@ impl CodexSession {
 
             self.writer.write_all(b"\r").expect("write Enter");
             self.writer.flush().expect("flush");
+        }
+
+        // The startup composer accepts edits but discards Enter. The welcome
+        // instructions appear after the remote thread is ready for submissions.
+        if !self.parser.screen().contents().contains(WELCOME_MESSAGE) {
+            self.wait_for(WELCOME_MESSAGE);
         }
     }
 
@@ -311,6 +329,10 @@ impl CodexSession {
 
             self.writer.write_all(b"\r").expect("write Enter");
             self.writer.flush().expect("flush");
+        }
+
+        if !self.parser.screen().contents().contains(WELCOME_MESSAGE) {
+            self.wait_for_with_timeout(WELCOME_MESSAGE, timeout);
         }
     }
 
@@ -357,16 +379,25 @@ impl CodexSession {
         }
     }
 
+    fn input_echo(text: &str) -> String {
+        // Slash commands also appear in the welcome text. Wait for the
+        // composer to echo them before submitting.
+        if text.starts_with('/') {
+            format!("\u{203a} {text}")
+        } else {
+            let needle_len = text.len().min(40);
+            text[text.len() - needle_len..].to_owned()
+        }
+    }
+
     /// Type text into the prompt and press Enter.
     pub fn send(&mut self, text: &str) {
-        self.writer
-            .write_all(text.as_bytes())
-            .expect("write to PTY");
-        self.writer.flush().expect("flush PTY writer");
+        // Bracketed paste keeps Codex's paste-burst heuristic from treating
+        // the following Enter as a newline inside the pasted command.
+        self.write_raw(format!("\x1b[200~{text}\x1b[201~").as_bytes());
 
-        let needle_len = text.len().min(40);
-        let needle = &text[text.len() - needle_len..];
-        self.wait_for(needle);
+        let needle = Self::input_echo(text);
+        self.wait_for(&needle);
 
         self.writer.write_all(b"\r").expect("write Enter to PTY");
         self.writer.flush().expect("flush PTY writer");
@@ -375,14 +406,10 @@ impl CodexSession {
     /// Lifecycle tests need bounded echo waits when stale remote state
     /// prevents the TUI from accepting input.
     pub fn send_with_timeout(&mut self, text: &str, timeout: Duration) {
-        self.writer
-            .write_all(text.as_bytes())
-            .expect("write to PTY");
-        self.writer.flush().expect("flush PTY writer");
+        self.write_raw(format!("\x1b[200~{text}\x1b[201~").as_bytes());
 
-        let needle_len = text.len().min(40);
-        let needle = &text[text.len() - needle_len..];
-        self.wait_for_with_timeout(needle, timeout);
+        let needle = Self::input_echo(text);
+        self.wait_for_with_timeout(&needle, timeout);
 
         self.writer.write_all(b"\r").expect("write Enter to PTY");
         self.writer.flush().expect("flush PTY writer");

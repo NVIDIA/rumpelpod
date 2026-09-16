@@ -776,10 +776,14 @@ impl PodConnection {
         &self,
         container_url: String,
         container_token: String,
+        bypass: bool,
     ) -> Result<CodexProxyEndpoint> {
         {
             let resources = self.resources.lock().unwrap();
             if let Some(handle) = resources.codex_proxy.as_ref() {
+                // A replacement frontend may choose different startup defaults.
+                // Reconnects through this cached proxy must carry that choice.
+                handle.bypass.store(bypass, Ordering::Relaxed);
                 return Ok(CodexProxyEndpoint {
                     port: handle.port,
                     token: handle.token.clone(),
@@ -800,11 +804,13 @@ impl PodConnection {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let token = crate::daemon::generate_codex_proxy_token();
+        let bypass = Arc::new(AtomicBool::new(bypass));
         tokio::task::spawn(crate::codex::run_codex_proxy(
             tokio_listener,
             container_url,
             container_token,
             token.clone(),
+            Arc::clone(&bypass),
             ready_tx,
             cancel_rx,
         ));
@@ -815,6 +821,7 @@ impl PodConnection {
         self.resources.lock().unwrap().codex_proxy = Some(CodexProxyHandle {
             port,
             token: token.clone(),
+            bypass,
             _cancel_tx: cancel_tx,
         });
 

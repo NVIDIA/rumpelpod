@@ -262,7 +262,7 @@ USER root
 # Keep the Codex used by CI outside the interactive PATH so developers can use
 # a different release without changing the test baseline. Download both
 # release executables because code mode resolves its host next to the CLI.
-ARG CODEX_VERSION=0.147.0
+ARG CODEX_VERSION=0.154.0
 ENV RUMPELPOD_TEST_CODEX_BIN_DIR=/opt/rumpelpod-test-codex/bin
 RUN case "$(uname -m)" in \
         x86_64) CODEX_TARGET=x86_64-unknown-linux-musl ;; \

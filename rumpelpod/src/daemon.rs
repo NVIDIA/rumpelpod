@@ -14,6 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -2301,6 +2302,7 @@ pub(crate) const GROK_CONTAINER_BIN: &str = "/opt/rumpelpod/bin/grok";
 struct CodexProxyHandle {
     port: u16,
     token: String,
+    bypass: Arc<AtomicBool>,
     _cancel_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -5547,12 +5549,13 @@ impl DaemonServer {
         pod_name: &str,
         container_url: String,
         container_token: String,
+        bypass: bool,
     ) -> Result<CodexProxyEndpoint> {
         let connection = self
             .connections
             .pod(repo_path, pod_name)
             .with_context(|| format!("no pod connection for pod '{pod_name}'"))?;
-        connection.ensure_codex_proxy(container_url, container_token)
+        connection.ensure_codex_proxy(container_url, container_token, bypass)
     }
 
     fn delete_pod_impl(

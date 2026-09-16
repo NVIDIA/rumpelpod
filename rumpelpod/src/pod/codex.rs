@@ -6,9 +6,9 @@
 //! The pod server exposes a `/codex` WebSocket endpoint. On the first
 //! connection, it spawns `codex app-server` on a fresh ephemeral
 //! loopback port. Subsequent connections reuse the same app-server,
-//! which persists thread state across client reconnections. All
-//! WebSocket frames are forwarded bidirectionally between the
-//! connecting client and the app-server.
+//! which persists thread state across client reconnections. New threads use
+//! the app-server's permission defaults when bypass is requested, until the
+//! user makes an explicit permission selection in Codex.
 //!
 //! A separate monitoring connection tracks thread status independently
 //! of TUI client connections so that `rumpel list` always reflects the
@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -51,14 +52,24 @@ pub fn new_codex_app_server() -> CodexAppServer {
     Arc::new(Mutex::new(None))
 }
 
+#[derive(Deserialize)]
+pub struct CodexQuery {
+    bypass: bool,
+}
+
 pub async fn codex_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<super::server::PodServerState>,
+    Query(query): Query<CodexQuery>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_codex_proxy(socket, state))
+    ws.on_upgrade(move |socket| handle_codex_proxy(socket, state, query.bypass))
 }
 
-async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodServerState) {
+async fn handle_codex_proxy(
+    mut client_ws: WebSocket,
+    state: super::server::PodServerState,
+    bypass: bool,
+) {
     let repo_path = match state.repo_path.lock().await.clone() {
         Some(repo_path) => repo_path,
         None => {
@@ -73,7 +84,7 @@ async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodS
         }
     };
 
-    let port = match ensure_app_server_running(&state.codex_app_server, &repo_path).await {
+    let port = match ensure_app_server_running(&state.codex_app_server, &repo_path, bypass).await {
         Ok(port) => port,
         Err(e) => {
             eprintln!("codex: failed to start app-server: {e:#}");
@@ -97,7 +108,7 @@ async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodS
         ));
     }
 
-    if let Err(e) = proxy_to_app_server(client_ws, port).await {
+    if let Err(e) = proxy_to_app_server(client_ws, port, bypass).await {
         eprintln!("codex: proxy error: {e:#}");
     }
 }
@@ -108,9 +119,13 @@ async fn handle_codex_proxy(mut client_ws: WebSocket, state: super::server::PodS
 /// concurrent /codex connections do not race to spawn a second
 /// app-server, and so that the first arriving caller's captured
 /// stderr is the one every retry sees on failure.
-async fn ensure_app_server_running(app_server: &CodexAppServer, repo_path: &Path) -> Result<u16> {
+async fn ensure_app_server_running(
+    app_server: &CodexAppServer,
+    repo_path: &Path,
+    bypass: bool,
+) -> Result<u16> {
     let mut guard = app_server.lock().await;
-    let port = ensure_app_server_running_locked(&mut guard, repo_path).await?;
+    let port = ensure_app_server_running_locked(&mut guard, repo_path, bypass).await?;
     // Rewrite the advertisement on every path, not just fresh spawns:
     // an earlier attempt may have errored after the app-server came
     // up, leaving the file stale or missing.
@@ -123,6 +138,7 @@ async fn ensure_app_server_running(app_server: &CodexAppServer, repo_path: &Path
 async fn ensure_app_server_running_locked(
     guard: &mut Option<AppServerHandle>,
     repo_path: &Path,
+    bypass: bool,
 ) -> Result<u16> {
     // Reuse a live handle if its /healthz already answers.
     if let Some(handle) = guard.as_mut() {
@@ -146,8 +162,20 @@ async fn ensure_app_server_running_locked(
     let addr = format!("{CODEX_APP_SERVER_HOST}:{port}");
     let listen_url = format!("ws://{addr}");
     let repo_path_display = repo_path.display();
-    let mut child = Command::new(&codex_bin)
-        .args(["app-server", "--listen", &listen_url])
+    let mut command = Command::new(&codex_bin);
+    command.args(["app-server", "--listen", &listen_url]);
+    // Remote resumes reject permission overrides from the frontend. Server
+    // defaults let new threads bypass the pod's redundant inner sandbox while
+    // existing threads retain their saved permissions, including after restart.
+    if bypass {
+        command.args([
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "default_permissions=\":danger-full-access\"",
+        ]);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
@@ -288,7 +316,7 @@ async fn health_check(port: u16) -> bool {
 }
 
 /// Connect to the app-server and bidirectionally forward WebSocket frames.
-async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
+async fn proxy_to_app_server(client_ws: WebSocket, port: u16, bypass: bool) -> Result<()> {
     let ws_url = app_server_ws_url(port);
     let (server_ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
@@ -296,12 +324,14 @@ async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
 
     let (mut server_write, mut server_read) = server_ws.split();
     let (mut client_write, mut client_read) = client_ws.split();
+    let mut use_server_defaults = bypass;
 
     loop {
         tokio::select! {
             msg = client_read.next() => {
                 match msg {
                     Some(Ok(msg)) => {
+                        let msg = use_app_server_permission_defaults(msg, &mut use_server_defaults);
                         let tung_msg = axum_to_tungstenite(msg);
                         if server_write.send(tung_msg).await.is_err() {
                             break;
@@ -325,6 +355,62 @@ async fn proxy_to_app_server(client_ws: WebSocket, port: u16) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn use_app_server_permission_defaults(msg: Message, use_server_defaults: &mut bool) -> Message {
+    if !*use_server_defaults {
+        return msg;
+    }
+    let Message::Text(text) = msg else {
+        return msg;
+    };
+    let Ok(mut request) = serde_json::from_str::<serde_json::Value>(&text) else {
+        // Leave malformed requests to the app-server's protocol error handling.
+        return Message::Text(text);
+    };
+    let method = request.get("method").and_then(|method| method.as_str());
+    if method == Some("thread/settings/update") {
+        if [
+            "approvalPolicy",
+            "approvalsReviewer",
+            "sandboxPolicy",
+            "permissions",
+        ]
+        .iter()
+        .any(|key| {
+            request["params"]
+                .get(*key)
+                .is_some_and(|value| !value.is_null())
+        }) {
+            // Later /new requests carry this explicit choice in legacy fields.
+            *use_server_defaults = false;
+        }
+        return Message::Text(text);
+    }
+    if method != Some("thread/start") {
+        return Message::Text(text);
+    }
+    let Some(params) = request
+        .get_mut("params")
+        .and_then(|params| params.as_object_mut())
+    else {
+        return Message::Text(text);
+    };
+    if params
+        .get("permissions")
+        .is_some_and(|permissions| !permissions.is_null())
+    {
+        // Named profiles come from an explicit choice in the permission picker.
+        *use_server_defaults = false;
+        return Message::Text(text);
+    }
+
+    // Codex 0.154 sends these local defaults even without permission flags.
+    // Omitting them lets the app-server choose defaults until the user makes
+    // an explicit permission selection. Resumes retain their saved permissions.
+    params.remove("approvalPolicy");
+    params.remove("sandbox");
+    Message::Text(request.to_string().into())
 }
 
 fn app_server_http_url(port: u16, path: &str) -> String {

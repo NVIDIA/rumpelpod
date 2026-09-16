@@ -25,4 +25,8 @@ fn codex_relaunch_resumes_last_remote_session() {
 
     let mut resumed = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
     resumed.wait_for_with_timeout("Paris", Duration::from_secs(30));
+    let contents = resumed.screen().contents();
+    assert!(contents.contains("YOLO mode"), "{contents}");
+    resumed.send("Run `printf %x 3735928559`.");
+    resumed.wait_for_with_timeout("deadbeef", Duration::from_secs(30));
 }
