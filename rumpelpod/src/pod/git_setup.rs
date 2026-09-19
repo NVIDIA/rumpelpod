@@ -6,6 +6,7 @@
 //! Sets up remotes, hooks, branches, submodules, and identity so that
 //! the pod can push/fetch through the gateway.
 
+use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -557,12 +558,46 @@ struct SubmoduleEntry {
     displaypath: String,
 }
 
+/// Paths among `paths` that the index of `repo_path` records as gitlinks.
+fn gitlink_paths(repo_path: &Path, paths: &[&str]) -> Result<HashSet<String>> {
+    // Without a pathspec, ls-files would list the whole index.
+    if paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let stdout = Command::new("git")
+        // Submodule paths are literal, but ls-files would otherwise
+        // treat glob characters in them as a pattern.
+        .args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"])
+        .args(paths)
+        .current_dir(repo_path)
+        .success()
+        .context("listing gitlinks in the index")?;
+    let mut gitlinks = HashSet::new();
+    // Records look like: 160000 <object> <stage>\t<path>\0
+    for record in String::from_utf8_lossy(&stdout).split('\0') {
+        if record.is_empty() {
+            continue;
+        }
+        let (meta, path) = match record.split_once('\t') {
+            Some(parts) => parts,
+            None => return Err(anyhow::anyhow!("unexpected git ls-files record: {record}")),
+        };
+        if meta.starts_with("160000 ") {
+            gitlinks.insert(path.to_string());
+        }
+    }
+    Ok(gitlinks)
+}
+
 /// Detect submodules by parsing .gitmodules, recursing into nested ones
 /// after they are cloned.  Returns entries sorted parents-before-children.
-fn detect_submodules_from_gitmodules(repo_path: &Path, prefix: &str) -> Vec<SubmoduleEntry> {
+fn detect_submodules_from_gitmodules(
+    repo_path: &Path,
+    prefix: &str,
+) -> Result<Vec<SubmoduleEntry>> {
     let gitmodules_path = repo_path.join(".gitmodules");
     if !gitmodules_path.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let output = match Command::new("git")
         .args([
@@ -576,7 +611,7 @@ fn detect_submodules_from_gitmodules(repo_path: &Path, prefix: &str) -> Vec<Subm
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
     let mut subs = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -607,11 +642,32 @@ fn detect_submodules_from_gitmodules(repo_path: &Path, prefix: &str) -> Vec<Subm
             displaypath,
         });
     }
-    subs
+
+    // Removing a submodule from the tree can leave its .gitmodules
+    // section behind.  Git only treats a path as a submodule when the
+    // index has a gitlink for it, and `git submodule init <path>` fails
+    // for any other path, so such entries must not be set up.
+    let paths: Vec<&str> = subs.iter().map(|sub| sub.path.as_str()).collect();
+    let gitlinks = gitlink_paths(repo_path, &paths)?;
+    subs.retain(|sub| {
+        let is_gitlink = gitlinks.contains(&sub.path);
+        if !is_gitlink {
+            let name = &sub.name;
+            let displaypath = &sub.displaypath;
+            eprintln!(
+                "warning: skipping .gitmodules entry '{name}': no gitlink at '{displaypath}'"
+            );
+        }
+        is_gitlink
+    });
+    Ok(subs)
 }
 
-fn detect_existing_submodules_recursive(parent_dir: &Path, prefix: &str) -> Vec<SubmoduleEntry> {
-    let submodules = detect_submodules_from_gitmodules(parent_dir, prefix);
+fn detect_existing_submodules_recursive(
+    parent_dir: &Path,
+    prefix: &str,
+) -> Result<Vec<SubmoduleEntry>> {
+    let submodules = detect_submodules_from_gitmodules(parent_dir, prefix)?;
     let mut all = Vec::new();
     for sub in submodules {
         let sub_worktree = parent_dir.join(&sub.path);
@@ -626,9 +682,9 @@ fn detect_existing_submodules_recursive(parent_dir: &Path, prefix: &str) -> Vec<
         all.extend(detect_existing_submodules_recursive(
             &sub_worktree,
             &sub.displaypath,
-        ));
+        )?);
     }
-    all
+    Ok(all)
 }
 
 fn submodule_parent_dir(container_repo_path: &Path, sub: &SubmoduleEntry) -> PathBuf {
@@ -649,7 +705,7 @@ fn refresh_submodule_gateway_urls(
     base_url: &str,
     token: &str,
 ) -> Result<()> {
-    let submodules = detect_existing_submodules_recursive(container_repo_path, "");
+    let submodules = detect_existing_submodules_recursive(container_repo_path, "")?;
     for sub in &submodules {
         refresh_submodule_gateway_url(container_repo_path, sub, base_url, token)?;
     }
@@ -698,7 +754,7 @@ pub fn setup_submodules_impl(req: &GitSetupSubmodulesRequest) -> Result<()> {
     let container_repo_path = &req.repo_path;
 
     // Detect submodules from .gitmodules in the repo.
-    let submodules = detect_submodules_from_gitmodules(container_repo_path, "");
+    let submodules = detect_submodules_from_gitmodules(container_repo_path, "")?;
     if submodules.is_empty() {
         return Ok(());
     }
@@ -711,7 +767,7 @@ pub fn setup_submodules_impl(req: &GitSetupSubmodulesRequest) -> Result<()> {
             base_url: &str,
             token: &str,
         ) -> Result<Vec<SubmoduleEntry>> {
-            let subs = detect_submodules_from_gitmodules(parent_dir, prefix);
+            let subs = detect_submodules_from_gitmodules(parent_dir, prefix)?;
             let mut all = Vec::new();
             for sub in &subs {
                 let displaypath = &sub.displaypath;
