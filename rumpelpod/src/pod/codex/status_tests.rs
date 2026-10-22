@@ -220,5 +220,16 @@ async fn codex_status_monitor_restores_loaded_threads_and_handles_snapshot_races
     .unwrap()
     .unwrap();
     ws.close(None).await.unwrap();
-    monitor.await.unwrap().unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(reply, Message::Close(_)));
+    drop(ws);
+    tokio::time::timeout(Duration::from_secs(5), monitor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
