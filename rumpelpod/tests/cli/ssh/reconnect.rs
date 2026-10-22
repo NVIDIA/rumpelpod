@@ -33,7 +33,9 @@ use crate::common::{
     TestHome, TestProcess, TestRepo, TEST_REPO_PATH,
 };
 use crate::executor;
-use rumpelpod::daemon::protocol::{Daemon, DaemonClient, PodListMode, PodStatus};
+use rumpelpod::daemon::protocol::{
+    ConnectPodRequest, Daemon, DaemonClient, PodListMode, PodStatus,
+};
 use rumpelpod::CommandExt;
 
 const FAST_PROBE_MS: &str = "3000";
@@ -504,20 +506,21 @@ fn mux_recovery_bounds_event_and_git_handshakes_together() {
     wait_for_refs(harness.repo.path(), &expected);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let status = client
-            .list_pods(
-                harness.repo.path().to_path_buf(),
-                PodListMode::Offline,
-                false,
-            )
-            .unwrap();
-        if status.iter().all(|pod| pod.status == PodStatus::Running) {
+        // Cached listing also calls connecting pods "running". The prepared
+        // endpoint is available only after the event greeting has arrived.
+        if pods.iter().all(|name| {
+            client
+                .prepared_pod_connection(ConnectPodRequest {
+                    pod_name: (*name).into(),
+                    repo_path: harness.repo.path().to_path_buf(),
+                    client_context: Default::default(),
+                })
+                .unwrap()
+                .is_some()
+        }) {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "event streams did not recover: {status:?}"
-        );
+        assert!(Instant::now() < deadline, "event streams did not recover");
         std::thread::sleep(Duration::from_millis(50));
     }
     let attempts = fs::read_to_string(fault.join("attempts")).unwrap();
