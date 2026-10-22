@@ -1,0 +1,10 @@
+Keep exec usable with older pod servers
+
+Fall back to enter's container transport when the pod server has no exec
+endpoint, so connected pods remain usable after a host-side upgrade.
+Preserve stdin until execution is accepted, and retain arguments,
+terminal selection, working directory, environment, and exit status
+in the fallback.
+Other failures remain errors because retrying could run a command twice.
+Document the older Docker transport's terminal stdin requirement with
+--tty. Cover fallback behavior and non-retryable errors in CLI tests.

@@ -157,6 +157,7 @@ pub enum Command {
     /// corresponds to your current directory relative to the repository root.
     /// Streams stdin, stdout, and stderr. Use --tty for terminal programs
     /// such as SSH password prompts; terminal output combines stdout and stderr.
+    /// Older pod servers use the same container transport as enter.
     /// Commands are never retried after a connection failure.
     ///
     /// Examples:
@@ -488,6 +489,7 @@ pub struct ExecCommand {
     ///
     /// Combines stdout and stderr. Use Ctrl-D for terminal EOF; closing piped
     /// stdin does not close the terminal.
+    /// With older pod servers, the Docker fallback requires terminal stdin.
     #[arg(short = 't', long)]
     pub tty: bool,
 

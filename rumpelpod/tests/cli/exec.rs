@@ -5,17 +5,27 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use axum::body::Body;
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::response::Response;
+use axum::routing::post;
+use axum::Router;
+use futures_util::StreamExt;
 use indoc::{formatdoc, indoc};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use rumpelpod::daemon::protocol::{ClientContext, ConnectPodRequest, Daemon, DaemonClient};
 use rumpelpod::CommandExt;
+use tokio::net::UnixListener;
+use tokio::runtime::Runtime;
 
 use crate::common::{
     create_commit, pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo,
@@ -40,6 +50,215 @@ fn wait_connected(repo: &TestRepo, daemon: &TestDaemon) {
         }
         assert!(Instant::now() < deadline, "pod did not connect");
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// Replace the forwarded pod response without needing an old release binary.
+// All other requests still reach the daemon and its real prepared pod.
+fn exec_response_proxy(daemon: &TestDaemon, status: StatusCode) -> (PathBuf, Runtime) {
+    let socket = daemon
+        .home_path
+        .join(format!("exec-{}.sock", status.as_u16()));
+    let runtime = Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = reqwest::Client::builder()
+            .unix_socket(daemon.socket_path.as_path())
+            .build()
+            .unwrap();
+        let app = Router::new()
+            .route(
+                "/pod/exec",
+                post(move |request: Request| async move {
+                    let mut body = request.into_body().into_data_stream();
+                    body.next().await.unwrap().unwrap();
+                    // Give an eager stdin reader time to consume the input
+                    // before rejecting the unsupported endpoint.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    status
+                }),
+            )
+            .fallback(move |request: Request| {
+                let client = client.clone();
+                async move {
+                    let url = format!("http://localhost{}", request.uri());
+                    let response = client
+                        .request(request.method().clone(), url)
+                        .headers(request.headers().clone())
+                        .body(reqwest::Body::wrap_stream(
+                            request.into_body().into_data_stream(),
+                        ))
+                        .send()
+                        .await
+                        .unwrap();
+                    Response::builder()
+                        .status(response.status())
+                        .body(Body::from_stream(response.bytes_stream()))
+                        .unwrap()
+                }
+            });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    (socket, runtime)
+}
+
+#[test]
+fn exec_fallback_preserves_input_arguments_environment_directory_and_status() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::create_dir(repo.path().join("nested dir")).unwrap();
+    fs::write(repo.path().join("nested dir/keep"), "").unwrap();
+    Command::new("git")
+        .current_dir(repo.path())
+        .args(["add", "nested dir/keep"])
+        .success()
+        .unwrap();
+    create_commit(
+        repo.path(),
+        "Keep the fallback working directory in the pod",
+    );
+    write_test_devcontainer(
+        &repo,
+        "",
+        r#", "remoteEnv": {"EXEC_REMOTE": "${localEnv:EXEC_LOCAL}"}"#,
+    );
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .env("EXEC_LOCAL", "from-launch")
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+    let (socket, _proxy) = exec_response_proxy(&daemon, StatusCode::NOT_FOUND);
+    // A fallback must use the existing connection without preparing the pod.
+    fs::write(
+        repo.path().join(".devcontainer/devcontainer.json"),
+        "invalid json",
+    )
+    .unwrap();
+    let mut child = pod_command(&repo, &daemon)
+        .env("RUMPELPOD_DAEMON_SOCKET", &socket)
+        .env("EXEC_LOCAL", "must-not-leak")
+        .current_dir(repo.path().join("nested dir"))
+        .args([
+            "exec", "test", "--", "sh", "-c",
+            "cat; id -un; pwd; printf '%s\\n' \"$EXEC_REMOTE\" \"$1\"; printf 'failure\\n' >&2; exit 42",
+            "sh", "$HOME; $(touch /tmp/exec-fallback-expanded) 'quoted'",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input: Vec<u8> = (0..128 * 1024).map(|index| index as u8).collect();
+    let mut expected = input.clone();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || stdin.write_all(&input).unwrap());
+    let output = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    assert_eq!(output.status.code(), Some(42), "{:?}", output.stderr);
+    expected.extend_from_slice(format!("{TEST_USER}\n{TEST_REPO_PATH}/nested dir\nfrom-launch\n$HOME; $(touch /tmp/exec-fallback-expanded) 'quoted'\n").as_bytes());
+    assert_eq!(output.stdout, expected);
+    assert_eq!(output.stderr, b"failure\n");
+    pod_command(&repo, &daemon)
+        .args([
+            "exec",
+            "test",
+            "--",
+            "test",
+            "!",
+            "-e",
+            "/tmp/exec-fallback-expanded",
+        ])
+        .success()
+        .unwrap();
+
+    let mut child = pod_command(&repo, &daemon)
+        .env("RUMPELPOD_DAEMON_SOCKET", &socket)
+        .args(["exec", "test", "--", "sh", "-c", "printf ready; cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut bytes = [0; 5];
+    stdout.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"ready");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"input").unwrap();
+    stdout.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"input");
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn exec_fallback_respects_explicit_terminal_selection() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "test", "--", "true"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+    let (socket, _proxy) = exec_response_proxy(&daemon, StatusCode::NOT_FOUND);
+    for tty in [false, true] {
+        let mut args = vec![
+            "-c",
+            "export RUMPELPOD_DAEMON_SOCKET=$1; shift; exec rumpel \"$@\"",
+            "sh",
+            socket.to_str().unwrap(),
+            "exec",
+        ];
+        if tty {
+            args.push("-t");
+        }
+        let check = if tty {
+            "test -t 0 && test -t 1 && test -t 2 || exit 1; printf terminal-ready; exit 42"
+        } else {
+            "test ! -t 0 && test ! -t 1 && test ! -t 2 || exit 1; printf terminal-ready; exit 42"
+        };
+        args.extend(["test", "--", "sh", "-c", check]);
+        let mut terminal = ExecTerminal::spawn_local(&repo, &daemon, "sh", &args);
+        terminal.wait_for("terminal-ready");
+        assert_eq!(terminal.wait().exit_code(), 42);
+        terminal.assert_restored();
+    }
+}
+
+#[test]
+fn exec_does_not_fall_back_on_other_http_errors() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let daemon = TestDaemon::start(&home);
+    for status in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::CONFLICT,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::BAD_GATEWAY,
+    ] {
+        let (socket, _proxy) = exec_response_proxy(&daemon, status);
+        let output = pod_command(&repo, &daemon)
+            .env("RUMPELPOD_DAEMON_SOCKET", &socket)
+            .args(["exec", "test", "--", "true"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("exec failed ({status})")),
+            "{stderr}"
+        );
     }
 }
 
