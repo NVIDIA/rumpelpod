@@ -22,6 +22,12 @@ This is a rust project implementing an isolated LLM agent runner (rumpelpod).
   due to compilation.  Subsequent runs reuse cached builds.
   Inside a rumpelpod, a parallel run in an adjacent devcontainer can slow things down.
   If a test fails flakily, rerun it in isolation to confirm before dismissing it as unrelated to your changes.
+  When adding or substantially changing integration tests, verify both runtime
+  and repeatability. Run them repeatedly in isolation via
+  `cargo pipeline --retries 0 <filter>` and inspect each run's duration.
+  Investigate unusually slow runs and any failures; a single pass or a pass
+  after an automatic retry does not establish reliability. Report the number
+  of repetitions and observed runtimes when handing off the change.
 - xtest is the test runner used by the pipeline.
   It builds cross-architecture binaries, sets up the test environment,
   and runs each test as a separate process with timeouts and retries.
