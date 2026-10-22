@@ -218,6 +218,7 @@ pub struct PodConnection {
     git_tunnel_repair_scheduled: AtomicBool,
     repair_state: Arc<PodRepairState>,
     event_loop: Mutex<Option<EventLoopHandle>>,
+    event_http_version: Mutex<Option<reqwest::Version>>,
     events_tx: broadcast::Sender<DaemonEvent>,
     /// The event stream keeps a transport open so executions avoid another
     /// remote handshake, including across concurrent CLI processes.
@@ -251,6 +252,7 @@ impl PodConnection {
             git_tunnel_repair_scheduled: AtomicBool::new(false),
             repair_state: Arc::new(PodRepairState::default()),
             event_loop: Mutex::new(None),
+            event_http_version: Mutex::new(None),
             events_tx,
             http_client: crate::exec_stream::client_builder()
                 .build()
@@ -332,6 +334,11 @@ impl PodConnection {
 
     pub fn subscribe(&self) -> broadcast::Receiver<ReconnectEvent> {
         self.tx.subscribe()
+    }
+
+    pub(crate) fn event_http_version(&self) -> Result<reqwest::Version> {
+        (*self.event_http_version.lock().unwrap())
+            .context("pod event connection has not established its HTTP version")
     }
 
     pub fn has_event_loop(&self) -> bool {
@@ -609,6 +616,7 @@ impl PodConnection {
     }
 
     pub(super) fn apply_greeting(&self, greeting: GreetingState) {
+        *self.event_http_version.lock().unwrap() = Some(greeting.http_version);
         self.set_claude_state(greeting.claude);
         self.set_codex_state(greeting.codex);
     }
@@ -792,6 +800,7 @@ impl PodConnection {
             handle.stop.store(true, Ordering::SeqCst);
             self.repair_state.signal();
         }
+        *self.event_http_version.lock().unwrap() = None;
     }
 }
 
@@ -940,6 +949,7 @@ impl PodConnectionRegistry {
 }
 
 pub(super) struct GreetingState {
+    pub(super) http_version: reqwest::Version,
     pub(super) claude: Option<ClaudeState>,
     pub(super) codex: Option<CodexState>,
 }
@@ -964,13 +974,28 @@ async fn connect_pod_events_with_timeout(
 ) -> Result<(PodEventReader, GreetingState)> {
     // Limit idle reads on this event stream, not on the shared client:
     // executions can legitimately remain silent for longer than this deadline.
-    let response = tokio::time::timeout(
-        read_timeout,
-        client
+    let response = tokio::time::timeout(read_timeout, async {
+        match client
             .get(format!("{url}/events"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send(),
-    )
+            .bearer_auth(token)
+            .send()
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                // Pre-exec pod servers only speak HTTP/1. Repeating this GET
+                // is safe because it cannot start a command.
+                log::debug!("pod event connection failed; trying HTTP/1: {error}");
+                crate::exec_stream::client_builder()
+                    .http1_only()
+                    .build()?
+                    .get(format!("{url}/events"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+            }
+        }
+    })
     .await
     .context("waiting for pod event headers")?
     .context("connecting to pod events")?;
@@ -980,6 +1005,7 @@ async fn connect_pod_events_with_timeout(
         return Err(anyhow::anyhow!("pod events returned {status}"));
     }
 
+    let http_version = response.version();
     let stream = futures_util::stream::try_unfold(response, move |mut response| async move {
         let chunk = tokio::time::timeout(read_timeout, response.chunk())
             .await
@@ -1011,21 +1037,23 @@ async fn connect_pod_events_with_timeout(
                 .await
                 .context("reading state separator")?;
 
-            let greeting = parse_greeting_state(&data_line);
+            let greeting = parse_greeting_state(&data_line, http_version);
             return Ok((Box::pin(reader), greeting));
         }
     }
 }
 
-fn parse_greeting_state(data_line: &str) -> GreetingState {
+fn parse_greeting_state(data_line: &str, http_version: reqwest::Version) -> GreetingState {
     let Some(json_str) = data_line.trim().strip_prefix("data: ") else {
         return GreetingState {
+            http_version,
             claude: None,
             codex: None,
         };
     };
     let Ok(obj) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return GreetingState {
+            http_version,
             claude: None,
             codex: None,
         };
@@ -1038,12 +1066,19 @@ fn parse_greeting_state(data_line: &str) -> GreetingState {
         .get("codex_state")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .flatten();
-    GreetingState { claude, codex }
+    GreetingState {
+        http_version,
+        claude,
+        codex,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use axum::body::Body;
+    use axum::http::StatusCode;
     use axum::routing::get;
     use axum::Router;
     use futures_util::StreamExt;
@@ -1079,7 +1114,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = crate::exec_stream::client_builder().build().unwrap();
-        let (mut reader, _) = connect_pod_events_with_timeout(
+        let (mut reader, greeting) = connect_pod_events_with_timeout(
             &client,
             &url,
             "test-token",
@@ -1087,6 +1122,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(greeting.http_version, reqwest::Version::HTTP_2);
         let mut event = String::new();
         let quiet = async {
             client
@@ -1104,6 +1140,33 @@ mod tests {
             std::io::ErrorKind::TimedOut
         );
         assert_eq!(quiet_result, "done");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pod_events_does_not_retry_http_errors_with_another_protocol() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = requests.clone();
+        let app = Router::new().route(
+            "/events",
+            get(move || {
+                received.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::BAD_GATEWAY }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = crate::exec_stream::client_builder().build().unwrap();
+        let error =
+            connect_pod_events_with_timeout(&client, &url, "test-token", Duration::from_secs(1))
+                .await
+                .err()
+                .expect("pod event HTTP error must fail the connection");
+        assert!(error.to_string().contains("502"), "{error:#}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 

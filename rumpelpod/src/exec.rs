@@ -293,9 +293,22 @@ async fn daemon_exec(
     let request: ExecRequest = exec_stream::read_request(&mut reader)
         .await
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
-    let (client, endpoint) = daemon
+    let (client, endpoint, http_version) = daemon
         .exec_connection(&request.connection)
         .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
+    match http_version {
+        reqwest::Version::HTTP_10 | reqwest::Version::HTTP_11 => {
+            // Streaming exec needs HTTP/2; reject before a command can start.
+            return Err((StatusCode::NOT_FOUND, "pod requires legacy exec".into()));
+        }
+        reqwest::Version::HTTP_2 => {}
+        version => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("unsupported pod HTTP version: {version:?}"),
+            ));
+        }
+    }
     let initial = exec_stream::encode_request(&request.spec)
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     let input = futures_util::stream::once(async { Ok::<_, io::Error>(initial.into()) })
@@ -341,7 +354,7 @@ async fn daemon_resize(
     State(daemon): State<Arc<DaemonServer>>,
     Query(request): Query<ExecResizeRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let (client, endpoint) = daemon
+    let (client, endpoint, _) = daemon
         .exec_connection(&ConnectPodRequest {
             repo_path: request.repo_path,
             pod_name: request.pod_name,
@@ -374,7 +387,7 @@ async fn daemon_signal(
     State(daemon): State<Arc<DaemonServer>>,
     Query(request): Query<ExecSignalRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let (client, endpoint) = daemon
+    let (client, endpoint, _) = daemon
         .exec_connection(&ConnectPodRequest {
             repo_path: request.repo_path,
             pod_name: request.pod_name,

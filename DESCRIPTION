@@ -1,9 +1,13 @@
 Keep exec usable with older pod servers
 
-Fall back to enter's container transport when the pod server has no exec
-endpoint, so connected pods remain usable after a host-side upgrade.
-Preserve stdin until execution is accepted, and retain arguments,
-terminal selection, working directory, environment, and exit status
-in the fallback.
-Other failures remain errors because retrying could run a command twice.
-Cover fallback behavior and non-retryable errors in CLI tests.
+Allow host upgrades without recreating pods that predate exec and
+HTTP/2. Retry the event connection over HTTP/1 when HTTP/2 is
+unavailable, and use enter's container transport for those pods before
+sending a command. Also fall back when an HTTP/2 pod has no exec
+endpoint. Leave stdin unread until execution is accepted, and do not
+retry ambiguous execution errors.
+
+Cover the upgrade from the published v0.13.0 release with a real pod,
+including its unchanged binary and container ID after the host
+upgrade. Check input, arguments, terminal selection, environment,
+directory, and exit status through the fallback.

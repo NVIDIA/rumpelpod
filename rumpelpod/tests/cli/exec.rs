@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -31,7 +31,7 @@ use crate::common::{
     create_commit, pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo,
     TEST_REPO_PATH, TEST_USER,
 };
-use crate::executor::{executor_supports_stop, ExecutorResources};
+use crate::executor::{executor_supports_stop, skip_test, ExecutorResources};
 
 fn wait_connected(repo: &TestRepo, daemon: &TestDaemon) {
     let client = DaemonClient::new_unix(&daemon.socket_path);
@@ -53,8 +53,7 @@ fn wait_connected(repo: &TestRepo, daemon: &TestDaemon) {
     }
 }
 
-// Replace the forwarded pod response without needing an old release binary.
-// All other requests still reach the daemon and its real prepared pod.
+// Inject exec errors before the daemon while forwarding its other RPCs.
 fn exec_response_proxy(daemon: &TestDaemon, status: StatusCode) -> (PathBuf, Runtime) {
     let socket = daemon
         .home_path
@@ -102,6 +101,135 @@ fn exec_response_proxy(daemon: &TestDaemon, status: StatusCode) -> (PathBuf, Run
         });
     });
     (socket, runtime)
+}
+
+#[test]
+fn exec_supports_pod_created_before_host_upgrade() {
+    // Use an extracted v0.13.0 release so ordinary tests need no download.
+    let Some(release) = std::env::var_os("RUMPELPOD_TEST_PRE_EXEC_RELEASE") else {
+        skip_test();
+        return;
+    };
+    let binary = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "rumpel-linux-amd64",
+        ("linux", "aarch64") => "rumpel-linux-arm64",
+        ("macos", "aarch64") => "rumpel-darwin-arm64",
+        platform => panic!("unsupported release platform: {platform:?}"),
+    };
+    let previous = PathBuf::from(release).join(binary).canonicalize().unwrap();
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let rumpel = home.bin_dir().join("rumpel");
+    let current = fs::read_link(&rumpel).unwrap();
+    fs::remove_file(&rumpel).unwrap();
+    symlink(previous, &rumpel).unwrap();
+    let mut daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let unsupported = pod_command(&repo, &daemon)
+        .args(["exec", "--help"])
+        .output()
+        .unwrap();
+    assert!(!unsupported.status.success());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("unrecognized subcommand 'exec'"));
+    let previous_version = pod_command(&repo, &daemon)
+        .arg("--version")
+        .success()
+        .unwrap();
+    let pod_version = pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "test",
+            "--",
+            "/opt/rumpelpod/bin/rumpel",
+            "--version",
+        ])
+        .success()
+        .unwrap();
+    let previous_version_text = String::from_utf8_lossy(&previous_version);
+    let pod_version_text = String::from_utf8_lossy(&pod_version);
+    eprintln!("previous host: {previous_version_text}pod before upgrade: {pod_version_text}");
+    assert_eq!(pod_version, previous_version);
+    wait_connected(&repo, &daemon);
+    let original_connection = DaemonClient::new_unix(&daemon.socket_path)
+        .prepared_pod_connection(ConnectPodRequest {
+            pod_name: "test".into(),
+            repo_path: repo.path().to_path_buf(),
+            client_context: ClientContext::default(),
+        })
+        .unwrap()
+        .unwrap();
+
+    // Drop before restarting so its cleanup cannot delete the upgraded daemon's pod.
+    daemon.kill();
+    drop(daemon);
+    fs::remove_file(&rumpel).unwrap();
+    symlink(current, &rumpel).unwrap();
+    let daemon = TestDaemon::start(&home);
+    let current_version = pod_command(&repo, &daemon)
+        .arg("--version")
+        .success()
+        .unwrap();
+    let current_version_text = String::from_utf8_lossy(&current_version);
+    eprintln!("upgraded host: {current_version_text}");
+    assert_ne!(current_version, previous_version);
+    pod_command(&repo, &daemon)
+        .args(["connect", "test"])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+    let connection = DaemonClient::new_unix(&daemon.socket_path)
+        .prepared_pod_connection(ConnectPodRequest {
+            pod_name: "test".into(),
+            repo_path: repo.path().to_path_buf(),
+            client_context: ClientContext::default(),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        connection.container_id.0,
+        original_connection.container_id.0
+    );
+    let container_id = &connection.container_id.0;
+    eprintln!("preserved container: {container_id}");
+
+    let mut child = pod_command(&repo, &daemon)
+        .args([
+            "exec",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "cat; printf '%s\\n' \"$1\"; /opt/rumpelpod/bin/rumpel --version; exit 42",
+            "sh",
+            "$HOME 'quoted'",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = b"upgrade input\0\xff\n";
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected = input.to_vec();
+    expected.extend_from_slice(b"$HOME 'quoted'\n");
+    expected.extend_from_slice(&previous_version);
+    assert_eq!(output.stdout, expected);
+    eprintln!("pod after upgrade: {previous_version_text}");
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -210,14 +338,9 @@ fn exec_fallback_respects_explicit_terminal_selection() {
         .unwrap();
     wait_connected(&repo, &daemon);
     let (socket, _proxy) = exec_response_proxy(&daemon, StatusCode::NOT_FOUND);
+    let socket_env = format!("RUMPELPOD_DAEMON_SOCKET={}", socket.display());
     for tty in [false, true] {
-        let mut args = vec![
-            "-c",
-            "export RUMPELPOD_DAEMON_SOCKET=$1; shift; exec rumpel \"$@\"",
-            "sh",
-            socket.to_str().unwrap(),
-            "exec",
-        ];
+        let mut args = vec![socket_env.as_str(), "rumpel", "exec"];
         if tty {
             args.push("-t");
         }
@@ -227,7 +350,7 @@ fn exec_fallback_respects_explicit_terminal_selection() {
             "test ! -t 0 && test ! -t 1 && test ! -t 2 || exit 1; printf terminal-ready; exit 42"
         };
         args.extend(["test", "--", "sh", "-c", check]);
-        let mut terminal = ExecTerminal::spawn_local(&repo, &daemon, "sh", &args);
+        let mut terminal = ExecTerminal::spawn_local(&repo, &daemon, "env", &args);
         terminal.wait_for("terminal-ready");
         assert_eq!(terminal.wait().exit_code(), 42);
         terminal.assert_restored();

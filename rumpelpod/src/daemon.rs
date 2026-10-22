@@ -404,7 +404,11 @@ impl DaemonServer {
     pub(crate) fn exec_connection(
         &self,
         request: &ConnectPodRequest,
-    ) -> Result<(reqwest::Client, crate::daemon::pod_connection::PodEndpoint)> {
+    ) -> Result<(
+        reqwest::Client,
+        crate::daemon::pod_connection::PodEndpoint,
+        reqwest::Version,
+    )> {
         self.remember_client_context(&request.client_context);
         let record = {
             let conn = self.db.lock().unwrap();
@@ -438,7 +442,11 @@ impl DaemonServer {
         if endpoint.token != record.token {
             return Err(unavailable());
         }
-        Ok((connection.http_client.clone(), endpoint))
+        Ok((
+            connection.http_client.clone(),
+            endpoint,
+            connection.event_http_version()?,
+        ))
     }
 
     fn prepared_connection(

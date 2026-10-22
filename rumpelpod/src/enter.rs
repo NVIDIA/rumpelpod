@@ -519,10 +519,8 @@ pub(crate) fn enter_prepared(
     };
     let container_id = result.container_id.0.clone();
 
-    // The host subdir may not exist in the container yet.  Docker only;
-    // on k8s the emptyDir mounts come up owned by the container user so
-    // arbitrary mkdir without --user root is ambiguous, and in practice
-    // none of the k8s callers hit this path.
+    // Enter allows local directories that have not reached the pod yet.
+    // Kubernetes exec cannot select root to create them.
     if create_workdir
         && matches!(result.host, Host::Localhost { .. } | Host::Ssh { .. })
         && workdir != container_repo_path
