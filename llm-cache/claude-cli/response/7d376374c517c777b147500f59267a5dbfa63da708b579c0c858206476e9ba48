@@ -1,0 +1,25 @@
+{"status":200,"path":"/v1/messages?beta=true","headers":{"anthropic-organization-id":"3fd0c5c4-8e2b-46b5-bc86-860fcbb2881e","anthropic-ratelimit-input-tokens-limit":"10000000","anthropic-ratelimit-input-tokens-remaining":"9980000","anthropic-ratelimit-input-tokens-reset":"2026-10-22T13:10:44Z","anthropic-ratelimit-output-tokens-limit":"2000000","anthropic-ratelimit-output-tokens-remaining":"2000000","anthropic-ratelimit-output-tokens-reset":"2026-10-22T13:10:44Z","anthropic-ratelimit-requests-limit":"10000","anthropic-ratelimit-requests-remaining":"9999","anthropic-ratelimit-requests-reset":"2026-10-22T13:10:44Z","anthropic-ratelimit-tokens-limit":"12000000","anthropic-ratelimit-tokens-remaining":"11980000","anthropic-ratelimit-tokens-reset":"2026-10-22T13:10:44Z","anthropic-workspace-id":"wrkspc_01EnYWdW8R1KX4cBPpRZWFXQ","cache-control":"no-cache","cf-cache-status":"DYNAMIC","cf-ray":"a4e8be706c166dd5-SJC","content-security-policy":"default-src 'none'; frame-ancestors 'none'","content-type":"text/event-stream; charset=utf-8","date":"Thu, 22 Oct 2026 13:10:44 GMT","request-id":"req_011CgHLAhYuSyZvQSmXebuhv","server":"cloudflare","strict-transport-security":"max-age=31536000; includeSubDomains; preload","traceresponse":"00-6ada0b540000000034f7a1b876aff6ba-cc775654f0a9943f-01","vary":"Accept-Encoding","x-robots-tag":"none"}}
+event: message_start
+data: {"type":"message_start","message":{"model":"claude-haiku-4-5-20251001","id":"msg_011CgHLAhvyvizDYHacauMMw","type":"message","role":"assistant","content":[],"container":null,"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":7,"cache_creation_input_tokens":913,"cache_read_input_tokens":35028,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":913},"output_tokens":1,"service_tier":"standard","inference_geo":"not_available","speed":"standard"},"diagnostics":null,"context_management":null}  }
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}             }
+
+event: ping
+data: {"type": "ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"deleg"}           }
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ated"}            }
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0               }
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"stop_details":null,"container":null},"usage":{"input_tokens":7,"cache_creation_input_tokens":913,"cache_read_input_tokens":35028,"output_tokens":5},"context_management":{"applied_edits":[]}  }
+
+event: message_stop
+data: {"type":"message_stop"     }
+

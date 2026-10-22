@@ -46,6 +46,7 @@ strum = { version = ">= 0", features = ["derive"] }
 backoff = ">= 0"
 ctrlc = { version = ">= 0", features = ["termination"] }
 retry = ">= 0"
+regex = ">= 0"
 rand = ">= 0"
 tempfile = ">= 0"
 listenfd = ">= 0"
