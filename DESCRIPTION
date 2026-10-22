@@ -21,3 +21,9 @@ foreground git setup and back off streams that close after a greeting.
 Cover selective SSH recovery, dormant frontend subscriptions, persisted
 processing activity, stale observations, fast success, failure cooldown,
 and readiness that depends on queued git repair.
+
+Preserve existing pod databases when adding activity tracking, and keep
+recovery commands available if one stored pod can no longer initialize.
+Negotiate HTTP/1 for older pod servers without bypassing event
+generation checks or delaying release of transport admission during pod
+setup.

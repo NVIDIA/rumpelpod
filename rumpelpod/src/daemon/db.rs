@@ -163,6 +163,14 @@ const SCHEMA_SQL: &str = indoc! {"
 const PRE_COMPOSE_SCHEMA_HASH: &str =
     "ec97b2b08dddd29a2db5e026fb8bdaf2f2458743a797d713dcf72ad98b40d80e";
 
+const PRE_ACTIVITY_SCHEMA_HASH: &str =
+    "6a7f9bd88d8806b6478f319de1854599504a3df0b02349ed5d10faab621ac337";
+
+const PRE_ACTIVITY_MIGRATION_SQL: &str = indoc! {"
+    ALTER TABLE pods
+        ADD COLUMN agent_processing INTEGER NOT NULL DEFAULT 0;
+"};
+
 const PRE_COMPOSE_MIGRATION_SQL: &str = indoc! {"
     ALTER TABLE pods
         ADD COLUMN agent_service TEXT NOT NULL DEFAULT '';
@@ -215,7 +223,11 @@ pub fn open_db(path: &Path) -> Result<Connection> {
         Ok(hash) => {
             if hash != current_hash {
                 if hash == PRE_COMPOSE_SCHEMA_HASH {
-                    migrate_pre_compose_schema(&mut conn, &current_hash)?;
+                    migrate_schema(&mut conn, PRE_COMPOSE_MIGRATION_SQL, &current_hash)?;
+                    return Ok(conn);
+                }
+                if hash == PRE_ACTIVITY_SCHEMA_HASH {
+                    migrate_schema(&mut conn, PRE_ACTIVITY_MIGRATION_SQL, &current_hash)?;
                     return Ok(conn);
                 }
                 let path = path.display();
@@ -248,12 +260,10 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn migrate_pre_compose_schema(conn: &mut Connection, current_hash: &str) -> Result<()> {
-    let tx = conn
-        .transaction()
-        .context("starting pre-Compose database migration")?;
-    tx.execute_batch(PRE_COMPOSE_MIGRATION_SQL)
-        .context("adding Compose database columns")?;
+fn migrate_schema(conn: &mut Connection, migration_sql: &str, current_hash: &str) -> Result<()> {
+    let tx = conn.transaction().context("starting database migration")?;
+    tx.execute_batch(migration_sql)
+        .context("adding database columns")?;
     let updated = tx
         .execute(
             "UPDATE db_meta SET value = ? WHERE key = 'schema_version'",
@@ -265,8 +275,7 @@ fn migrate_pre_compose_schema(conn: &mut Connection, current_hash: &str) -> Resu
             "database migration updated {updated} schema version rows; expected one"
         ));
     }
-    tx.commit()
-        .context("committing pre-Compose database migration")?;
+    tx.commit().context("committing database migration")?;
     Ok(())
 }
 

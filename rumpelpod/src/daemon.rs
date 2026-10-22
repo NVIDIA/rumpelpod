@@ -404,7 +404,11 @@ impl DaemonServer {
     pub(crate) fn exec_connection(
         &self,
         request: &ConnectPodRequest,
-    ) -> Result<(reqwest::Client, crate::daemon::pod_connection::PodEndpoint)> {
+    ) -> Result<(
+        reqwest::Client,
+        crate::daemon::pod_connection::PodEndpoint,
+        reqwest::Version,
+    )> {
         self.remember_client_context(&request.client_context);
         let record = {
             let conn = self.db.lock().unwrap();
@@ -438,7 +442,11 @@ impl DaemonServer {
         if endpoint.token != record.token {
             return Err(unavailable());
         }
-        Ok((connection.http_client.clone(), endpoint))
+        Ok((
+            connection.http_client.clone(),
+            endpoint,
+            connection.event_http_version()?,
+        ))
     }
 
     fn prepared_connection(
@@ -2808,18 +2816,27 @@ impl DaemonServer {
     fn restore_processing_pods(&self) -> Result<()> {
         let pods = db::list_pods_by_status(&self.db.lock().unwrap(), db::PodStatus::Ready)?;
         for pod in pods.into_iter().filter(|pod| pod.agent_processing) {
-            let host: Host = serde_json::from_str(&pod.host)?;
-            let host = host.resolve_docker_engine()?;
-            let connection = self.configure_pod_connection_ssh_agent(
-                &PodName(pod.name),
-                Path::new(&pod.repo_path),
-                &host,
-                &pod.token,
-            )?;
-            connection.restore_agent_processing();
-            connection.enable_git_tunnel_supervision();
-            self.connections.get_or_create_host(&host)?.request_probe();
+            if let Err(error) = self.restore_processing_pod(&pod) {
+                let name = &pod.name;
+                let repo = &pod.repo_path;
+                log::warn!("cannot restore processing pod '{name}' in '{repo}': {error:#}");
+            }
         }
+        Ok(())
+    }
+
+    fn restore_processing_pod(&self, pod: &db::PodRecord) -> Result<()> {
+        let host: Host = serde_json::from_str(&pod.host)?;
+        let host = host.resolve_docker_engine()?;
+        let connection = self.configure_pod_connection_ssh_agent(
+            &PodName(pod.name.clone()),
+            Path::new(&pod.repo_path),
+            &host,
+            &pod.token,
+        )?;
+        connection.restore_agent_processing();
+        connection.enable_git_tunnel_supervision();
+        self.connections.get_or_create_host(&host)?.request_probe();
         Ok(())
     }
 

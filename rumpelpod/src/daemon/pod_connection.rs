@@ -236,9 +236,12 @@ pub struct PodConnection {
     connection_requested: AtomicBool,
     last_agent_processing: AtomicBool,
     activity_observer: Mutex<Option<ActivityObserver>>,
+    // Lock before changing the event epoch, publishing a greeting, or retiring
+    // demand, so a late observation cannot revive an invalidated connection.
     activity_update: Mutex<()>,
     repair_state: Arc<PodRepairState>,
     event_loop: Mutex<Option<EventLoopHandle>>,
+    event_http_version: Mutex<Option<reqwest::Version>>,
     events_tx: broadcast::Sender<DaemonEvent>,
     /// The event stream keeps a transport open so executions avoid another
     /// remote handshake, including across concurrent CLI processes.
@@ -276,6 +279,7 @@ impl PodConnection {
             activity_update: Mutex::new(()),
             repair_state: Arc::new(PodRepairState::default()),
             event_loop: Mutex::new(None),
+            event_http_version: Mutex::new(None),
             events_tx,
             http_client: crate::exec_stream::client_builder()
                 .build()
@@ -356,12 +360,13 @@ impl PodConnection {
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ReconnectEvent> {
+        let _guard = self.activity_update.lock().unwrap();
         let rx = self.tx.subscribe();
         if self.repair_state.is_paused() || self.status() != PodConnectionStatus::Connected {
             self.repair_state.resume();
         }
         if self.status() == PodConnectionStatus::Connected {
-            self.finish_connection_request();
+            self.finish_connection_request_locked();
         }
         rx
     }
@@ -381,9 +386,11 @@ impl PodConnection {
     }
 
     fn update_agent_activity(&self, epoch: Option<u64>, update: impl FnOnce()) -> bool {
-        // Stop/recreate and observations must persist in the same order. An
-        // old event reader must not write Processing after stop wrote idle.
         let _guard = self.activity_update.lock().unwrap();
+        self.update_agent_activity_locked(epoch, update)
+    }
+
+    fn update_agent_activity_locked(&self, epoch: Option<u64>, update: impl FnOnce()) -> bool {
         if epoch.is_some_and(|epoch| epoch != self.pod_repair_epoch()) {
             return false;
         }
@@ -413,10 +420,11 @@ impl PodConnection {
     }
 
     pub fn request_connection(&self) {
+        let _guard = self.activity_update.lock().unwrap();
         // Foreground preparation returns before its event observer is ready.
         // Keep this one request alive until both transports finish connecting.
         self.connection_requested.store(true, Ordering::SeqCst);
-        self.finish_connection_request();
+        self.finish_connection_request_locked();
         if self.connection_requested.load(Ordering::SeqCst)
             && (self.repair_state.is_paused() || self.status() != PodConnectionStatus::Connected)
         {
@@ -425,6 +433,11 @@ impl PodConnection {
     }
 
     pub(super) fn finish_connection_request(&self) {
+        let _guard = self.activity_update.lock().unwrap();
+        self.finish_connection_request_locked();
+    }
+
+    fn finish_connection_request_locked(&self) {
         if self.status() == PodConnectionStatus::Connected {
             let resources = self.resources.lock().unwrap();
             if !resources.supervise_git_tunnel
@@ -437,6 +450,11 @@ impl PodConnection {
                 self.emit_reconnect(ReconnectEvent::Connected);
             }
         }
+    }
+
+    pub(crate) fn event_http_version(&self) -> Result<reqwest::Version> {
+        (*self.event_http_version.lock().unwrap())
+            .context("pod event connection has not established its HTTP version")
     }
 
     pub fn has_event_loop(&self) -> bool {
@@ -600,6 +618,7 @@ impl PodConnection {
     }
 
     pub fn set_git_tunnel(&self, handle: crate::tunnel::TunnelHandle) {
+        let _guard = self.activity_update.lock().unwrap();
         let mut resources = self.resources.lock().unwrap();
         resources.git_tunnel = Some(handle);
         resources.supervise_git_tunnel = true;
@@ -608,10 +627,11 @@ impl PodConnection {
         if self.repair_state.is_paused() {
             self.repair_state.resume();
         }
-        self.finish_connection_request();
+        self.finish_connection_request_locked();
     }
 
     pub fn enable_git_tunnel_supervision(&self) {
+        let _guard = self.activity_update.lock().unwrap();
         let mut resources = self.resources.lock().unwrap();
         resources.supervise_git_tunnel = true;
         resources.validate_pod_before_git_tunnel_repair = resources.git_tunnel.is_none();
@@ -689,6 +709,7 @@ impl PodConnection {
     }
 
     pub fn pause_pod_repair(&self) {
+        let _guard = self.activity_update.lock().unwrap();
         self.connection_requested.store(false, Ordering::SeqCst);
         self.repair_state.pause();
     }
@@ -765,6 +786,7 @@ impl PodConnection {
 
     pub(super) fn apply_greeting_at_epoch(&self, greeting: GreetingState, epoch: u64) -> bool {
         self.update_agent_activity(Some(epoch), || {
+            *self.event_http_version.lock().unwrap() = Some(greeting.http_version);
             *self.claude_state.lock().unwrap() = greeting.claude;
             *self.codex_state.lock().unwrap() = greeting.codex;
             self.set_status(PodConnectionStatus::Connected);
@@ -799,6 +821,7 @@ impl PodConnection {
     }
 
     pub(super) fn resume_repair(&self) {
+        let _guard = self.activity_update.lock().unwrap();
         self.repair_state.resume();
     }
 
@@ -905,6 +928,7 @@ impl PodConnection {
     }
 
     pub fn notify_host_connected(&self) {
+        let _guard = self.activity_update.lock().unwrap();
         if self.status() == PodConnectionStatus::Stopped || !self.wants_reconnect() {
             return;
         }
@@ -918,6 +942,7 @@ impl PodConnection {
     }
 
     pub fn notify_host_disconnected(&self) {
+        let _guard = self.activity_update.lock().unwrap();
         if self.status() == PodConnectionStatus::Stopped {
             return;
         }
@@ -942,8 +967,9 @@ impl PodConnection {
     }
 
     pub fn stop_events(&self) {
-        self.stop_event_loop();
-        self.update_agent_activity(None, || {
+        let _guard = self.activity_update.lock().unwrap();
+        self.stop_event_loop_locked();
+        self.update_agent_activity_locked(None, || {
             *self.claude_state.lock().unwrap() = None;
             *self.codex_state.lock().unwrap() = None;
         });
@@ -970,11 +996,17 @@ impl PodConnection {
     }
 
     fn stop_event_loop(&self) {
+        let _guard = self.activity_update.lock().unwrap();
+        self.stop_event_loop_locked();
+    }
+
+    fn stop_event_loop_locked(&self) {
         let mut event_loop = self.event_loop.lock().unwrap();
         if let Some(handle) = event_loop.take() {
             handle.stop.store(true, Ordering::SeqCst);
         }
         self.repair_state.signal();
+        *self.event_http_version.lock().unwrap() = None;
     }
 }
 
@@ -1109,6 +1141,7 @@ impl PodConnectionRegistry {
 }
 
 pub(super) struct GreetingState {
+    pub(super) http_version: reqwest::Version,
     pub(super) claude: Option<ClaudeState>,
     pub(super) codex: Option<CodexState>,
 }
@@ -1135,13 +1168,28 @@ async fn connect_pod_events_with_timeout(
 ) -> Result<(PodEventReader, GreetingState)> {
     // Limit idle reads on this event stream, not on the shared client:
     // executions can legitimately remain silent for longer than this deadline.
-    let response = tokio::time::timeout(
-        read_timeout,
-        client
+    let response = tokio::time::timeout(read_timeout, async {
+        match client
             .get(format!("{url}/events"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send(),
-    )
+            .bearer_auth(token)
+            .send()
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                // Pre-exec pod servers only speak HTTP/1. Repeating this GET
+                // is safe because it cannot start a command.
+                log::debug!("pod event connection failed; trying HTTP/1: {error}");
+                crate::exec_stream::client_builder()
+                    .http1_only()
+                    .build()?
+                    .get(format!("{url}/events"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+            }
+        }
+    })
     .await
     .context("waiting for pod event headers")?
     .context("connecting to pod events")?;
@@ -1151,10 +1199,9 @@ async fn connect_pod_events_with_timeout(
         return Err(anyhow::anyhow!("pod events returned {status}"));
     }
 
-    // A live transport may stream setup progress indefinitely. Release host
-    // admission before readiness, since setup itself may need git repair.
+    // Setup can depend on git repair, so it cannot retain host admission.
     on_connected();
-
+    let http_version = response.version();
     let stream = futures_util::stream::try_unfold(response, move |mut response| async move {
         let chunk = tokio::time::timeout(read_timeout, response.chunk())
             .await
@@ -1186,21 +1233,23 @@ async fn connect_pod_events_with_timeout(
                 .await
                 .context("reading state separator")?;
 
-            let greeting = parse_greeting_state(&data_line);
+            let greeting = parse_greeting_state(&data_line, http_version);
             return Ok((Box::pin(reader), greeting));
         }
     }
 }
 
-fn parse_greeting_state(data_line: &str) -> GreetingState {
+fn parse_greeting_state(data_line: &str, http_version: reqwest::Version) -> GreetingState {
     let Some(json_str) = data_line.trim().strip_prefix("data: ") else {
         return GreetingState {
+            http_version,
             claude: None,
             codex: None,
         };
     };
     let Ok(obj) = serde_json::from_str::<serde_json::Value>(json_str) else {
         return GreetingState {
+            http_version,
             claude: None,
             codex: None,
         };
@@ -1213,12 +1262,21 @@ fn parse_greeting_state(data_line: &str) -> GreetingState {
         .get("codex_state")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .flatten();
-    GreetingState { claude, codex }
+    GreetingState {
+        http_version,
+        claude,
+        codex,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
     use axum::body::Body;
+    use axum::http::StatusCode;
     use axum::routing::get;
     use axum::Router;
     use futures_util::StreamExt;
@@ -1263,6 +1321,7 @@ mod tests {
         pod.restore_agent_processing();
         assert!(pod.wants_reconnect());
         pod.apply_greeting(GreetingState {
+            http_version: reqwest::Version::HTTP_2,
             claude: None,
             codex: Some(CodexState::Idle),
         });
@@ -1285,6 +1344,77 @@ mod tests {
         assert!(!pod.agent_is_processing());
         assert_eq!(*observed.lock().unwrap(), [true, false]);
         assert!(pod.begin_event_loop_at_epoch(Some(old_epoch)).is_none());
+    }
+
+    #[test]
+    fn host_loss_serializes_with_greeting_and_preserves_pending_demand() {
+        let (events, _) = broadcast::channel(16);
+        let pod = Arc::new(PodConnection::new(
+            events,
+            PodConnectionKey::new("/repo", "pod"),
+            Host::Localhost {
+                engine: ContainerEngine::Docker,
+            },
+            "token".into(),
+            PodConnectionStatus::PodDisconnected,
+            None,
+        ));
+        pod.request_connection();
+        let epoch = pod.pod_repair_epoch();
+        let greeting_barrier = pod.claude_state.lock().unwrap();
+        let greeting_pod = pod.clone();
+        let greeting = std::thread::spawn(move || {
+            greeting_pod.apply_greeting_at_epoch(
+                GreetingState {
+                    http_version: reqwest::Version::HTTP_2,
+                    claude: None,
+                    codex: None,
+                },
+                epoch,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pod.event_http_version().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "greeting did not reach publication"
+            );
+            std::thread::yield_now();
+        }
+        // The greeting has passed its epoch check but is blocked before state
+        // publication. Host loss must serialize with the remaining publication.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let lost_pod = pod.clone();
+        let loss = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            lost_pod.notify_host_disconnected();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let premature_loss = done_rx.recv_timeout(Duration::from_millis(50));
+        drop(greeting_barrier);
+        assert!(greeting.join().unwrap());
+        loss.join().unwrap();
+        assert!(matches!(
+            premature_loss,
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        pod.finish_connection_request();
+        assert_eq!(pod.status(), PodConnectionStatus::HostDisconnected);
+        assert!(pod.wants_reconnect());
+        assert!(!pod.apply_greeting_at_epoch(
+            GreetingState {
+                http_version: reqwest::Version::HTTP_11,
+                claude: None,
+                codex: None
+            },
+            epoch,
+        ));
+        assert_eq!(pod.status(), PodConnectionStatus::HostDisconnected);
+        assert_eq!(pod.event_http_version().unwrap(), reqwest::Version::HTTP_2);
+        pod.stop_events();
+        assert!(pod.event_http_version().is_err());
     }
 
     #[tokio::test]
@@ -1312,7 +1442,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let client = crate::exec_stream::client_builder().build().unwrap();
-        let (mut reader, _) = connect_pod_events_with_timeout(
+        let (mut reader, greeting) = connect_pod_events_with_timeout(
             &client,
             &url,
             "test-token",
@@ -1321,6 +1451,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(greeting.http_version, reqwest::Version::HTTP_2);
         let mut event = String::new();
         let quiet = async {
             client
@@ -1338,6 +1469,38 @@ mod tests {
             std::io::ErrorKind::TimedOut
         );
         assert_eq!(quiet_result, "done");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pod_events_does_not_retry_http_errors_with_another_protocol() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let received = requests.clone();
+        let app = Router::new().route(
+            "/events",
+            get(move || {
+                received.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::BAD_GATEWAY }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = crate::exec_stream::client_builder().build().unwrap();
+        let error = connect_pod_events_with_timeout(
+            &client,
+            &url,
+            "test-token",
+            Duration::from_secs(1),
+            || {},
+        )
+        .await
+        .err()
+        .expect("pod event HTTP error must fail the connection");
+        assert!(error.to_string().contains("502"), "{error:#}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
         server.abort();
     }
 

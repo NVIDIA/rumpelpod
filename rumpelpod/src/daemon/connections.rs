@@ -120,9 +120,8 @@ impl Connections {
         RUNTIME.spawn(host_event_reader(inner, rx));
     }
 
-    /// Poll for git tunnels that need repair and hand each one to
-    /// `repair`.  `repair` is daemon code (it needs the DB and the
-    /// localhost git port); this loop only decides *when* to call it.
+    /// Repair transports for pods with current demand or processing agents.
+    /// The callback owns backend setup, including routes missing after restart.
     pub fn start_git_supervisor<F>(&self, repair: F)
     where
         F: Fn(&Arc<PodConnection>, &HostKey) -> Result<()> + Send + Sync + 'static,
