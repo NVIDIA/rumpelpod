@@ -38,7 +38,7 @@ use crate::executor::PodBackendInfo;
 use crate::gateway;
 use crate::git_http_server::{AmbientSshAgents, GitHttpServer, SharedGitServerState};
 use connections::Connections;
-use pod_connection::{PodConnection, PodConnectionStatus, PodEndpoint, PodRepairBackoff};
+use pod_connection::{PodConnection, PodConnectionStatus, PodEndpoint};
 use protocol::{
     AddForwardedPortRequest, ClaudeConnection, ClientContext, ConnectPodRequest, ContainerId,
     Daemon, DaemonEvent, EnsureClaudeConfigRequest, EnsurePiConfigRequest, ForkPodRequest, Image,
@@ -2762,41 +2762,6 @@ impl DaemonServer {
         ))?;
         pod_connection.install_repaired_git_tunnel(tunnel, repair_epoch);
         Ok(())
-    }
-
-    fn supervise_git_tunnel(&self, pod_connection: Arc<PodConnection>) {
-        let mut backoff = PodRepairBackoff::new();
-        let mut repair_epoch = pod_connection.pod_repair_epoch();
-        loop {
-            if !pod_connection.git_tunnel_supervision_enabled()
-                || pod_connection.pod_repair_is_paused()
-                || pod_connection.git_tunnel_is_alive()
-                || !self.connections.pod_host_is_connected(&pod_connection)
-            {
-                break;
-            }
-
-            match self.try_repair_git_tunnel(&pod_connection) {
-                Ok(()) => break,
-                Err(e) => {
-                    let name = pod_connection.key().pod_name();
-                    log::warn!("git tunnel repair for pod '{name}' failed: {e:#}");
-                    let Some(delay) = backoff.next_delay() else {
-                        log::warn!(
-                            "git tunnel repair for pod '{name}' paused after repeated failures"
-                        );
-                        pod_connection.pause_pod_repair();
-                        break;
-                    };
-                    let next_epoch = pod_connection.wait_for_pod_repair_change(repair_epoch, delay);
-                    if next_epoch != repair_epoch {
-                        repair_epoch = next_epoch;
-                        backoff.reset();
-                    }
-                }
-            }
-        }
-        pod_connection.finish_git_tunnel_repair();
     }
 
     /// The unix socket that engine CLI invocations (builds, inspects)
@@ -6847,7 +6812,7 @@ pub fn run_daemon() -> Result<()> {
     let git_daemon = daemon.clone();
     daemon
         .connections
-        .start_git_supervisor(move |pod| git_daemon.supervise_git_tunnel(pod));
+        .start_git_supervisor(move |pod| git_daemon.try_repair_git_tunnel(pod));
 
     // Keep the server alive for the lifetime of the daemon.
     let _localhost_server = localhost_server;

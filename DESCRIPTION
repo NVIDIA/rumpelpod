@@ -1,0 +1,13 @@
+Limit pod recovery bursts after host outages
+
+Host recovery wakes every known pod, including detached pods that need
+their git tunnels for automatic synchronization. Share a per-host budget
+between background event-stream handshakes and git tunnel repair: at
+most two attempts in flight, with admissions at least 250 ms apart.
+Release admission before backoff and after the handshake so established
+streams do not prevent other pods from recovering.
+
+Wait for git repair admission asynchronously to avoid allocating a
+thread for every disconnected pod. Keep host-loss cancellation and
+independent budgets for different hosts. Cover admission, cancellation,
+and concurrent event/git recovery after an SSH packet blackhole.
