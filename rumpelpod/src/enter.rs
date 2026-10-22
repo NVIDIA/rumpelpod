@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -446,8 +447,33 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
         }
     };
 
+    let status = enter_prepared(
+        &result,
+        &repo_root,
+        &cmd.command,
+        io::stdin().is_terminal(),
+        true,
+    )?;
+
+    let elapsed = t_total.elapsed();
+    trace!("total enter startup: {elapsed:?}");
+
+    if !status.success() {
+        return Err(anyhow::anyhow!("exec exited with status {status}"));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn enter_prepared(
+    result: &PreparedPodConnection,
+    repo_root: &Path,
+    command: &[String],
+    tty: bool,
+    create_workdir: bool,
+) -> Result<ExitStatus> {
     let container_repo_path = result.container_repo_path.clone();
-    let workdir = container_workdir(&container_repo_path, &repo_root)?;
+    let workdir = container_workdir(&container_repo_path, repo_root)?;
 
     // Wrap in `rumpel container-exec` so the pod server's resolved
     // environment is applied inside the container without passing
@@ -462,7 +488,7 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
         workdir_str.to_string(),
         "--".to_string(),
     ];
-    exec_cmd.extend(cmd.command.clone());
+    exec_cmd.extend_from_slice(command);
 
     // Local Docker reuses the socket the daemon resolved before it
     // entered the test or user runtime environment.  SSH Docker and
@@ -493,11 +519,10 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
     };
     let container_id = result.container_id.0.clone();
 
-    // The host subdir may not exist in the container yet.  Docker only;
-    // on k8s the emptyDir mounts come up owned by the container user so
-    // arbitrary mkdir without --user root is ambiguous, and in practice
-    // none of the k8s callers hit this path.
-    if matches!(result.host, Host::Localhost { .. } | Host::Ssh { .. })
+    // Enter allows local directories that have not reached the pod yet.
+    // Kubernetes exec cannot select root to create them.
+    if create_workdir
+        && matches!(result.host, Host::Localhost { .. } | Host::Ssh { .. })
         && workdir != container_repo_path
     {
         let mkdir_status = executor
@@ -526,23 +551,14 @@ pub fn enter(cmd: &EnterCommand) -> Result<()> {
     // to the container user (from /opt/rumpelpod/user) before running
     // the actual command.  Kubernetes has no --user override so the
     // executor ignores user_root there and enters as the image USER.
-    let status = executor.exec_interactive(
+    executor.exec_interactive(
         &container_id,
         &exec_cmd,
         crate::executor::ExecInteractiveOptions {
-            tty: std::io::stdin().is_terminal(),
+            tty,
             user_root: true,
         },
-    )?;
-
-    let elapsed = t_total.elapsed();
-    trace!("total enter startup: {elapsed:?}");
-
-    if !status.success() {
-        return Err(anyhow::anyhow!("exec exited with status {status}"));
-    }
-
-    Ok(())
+    )
 }
 
 #[cfg(test)]

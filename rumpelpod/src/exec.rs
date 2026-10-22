@@ -3,6 +3,7 @@
 
 use std::env::VarError;
 use std::io::{self, IsTerminal};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use tokio_util::task::AbortOnDropHandle;
 
 use crate::async_runtime::block_on;
 use crate::cli::ExecCommand;
-use crate::daemon::protocol::{ClientContext, ConnectPodRequest};
+use crate::daemon::protocol::{ClientContext, ConnectPodRequest, Daemon, DaemonClient};
 use crate::daemon::{self, DaemonServer};
 use crate::exec_pty::RawTerminal;
 use crate::exec_stream::{
@@ -58,10 +59,7 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
         .context("current directory is outside the repository")?
         .to_path_buf();
     let socket = daemon::socket_path()?;
-    block_on(async {
-        let mut interrupt = signal(SignalKind::interrupt())?;
-        let mut terminate = signal(SignalKind::terminate())?;
-        let mut hangup = signal(SignalKind::hangup())?;
+    let exit_code = block_on(async {
         let window_change = if terminal_fd.is_some() {
             Some(signal(SignalKind::window_change())?)
         } else {
@@ -87,7 +85,7 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
         let request = ExecRequest {
             connection: ConnectPodRequest {
                 pod_name: command.name.clone(),
-                repo_path,
+                repo_path: repo_path.clone(),
                 client_context: ClientContext::current(),
             },
             spec: ExecSpec {
@@ -98,34 +96,43 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
             },
         };
         let initial = exec_stream::encode_request(&request)?;
-        let client = exec_stream::client_builder().unix_socket(socket).build()?;
+        let client = exec_stream::client_builder()
+            .unix_socket(socket.as_path())
+            .build()?;
         let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
         tx.send(Ok(initial)).await.context("sending exec request")?;
 
-        let stdin_tx = tx;
-        let _stdin = AbortOnDropHandle::new(tokio::spawn(async move {
-            if let Err(error) = forward_stdin(&stdin_tx).await {
-                if let Err(send_error) = stdin_tx.send(Err(error)).await {
-                    log::debug!("exec input closed after stdin error: {send_error}");
-                }
-            }
-        }));
-        let send = client
+        let response = client
             .post("http://localhost/pod/exec")
             .header("content-type", CONTENT_TYPE)
             .body(reqwest::Body::wrap_stream(ReceiverStream::new(rx)))
-            .send();
-        let response = tokio::select! {
-            response = send => response.context(UNKNOWN_OUTCOME)?,
-            _ = interrupt.recv() => return Err(anyhow::anyhow!("exec interrupted before startup was acknowledged; command outcome is unknown")),
-            _ = terminate.recv() => return Err(anyhow::anyhow!("exec terminated before startup was acknowledged; command outcome is unknown")),
-            _ = hangup.recv() => return Err(anyhow::anyhow!("exec disconnected before startup was acknowledged; command outcome is unknown")),
-        };
+            .send()
+            .await
+            .context(UNKNOWN_OUTCOME)?;
+        // Only a missing endpoint proves that the command was never started.
+        // Retrying other failures could execute a command twice.
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await.context(UNKNOWN_OUTCOME)?;
             return Err(anyhow::anyhow!("exec failed ({status}): {error}"));
         }
+        // Leave stdin untouched until the server accepts the execution so an
+        // older pod can receive the original input through enter's transport.
+        let _stdin = AbortOnDropHandle::new(tokio::spawn(async move {
+            if let Err(error) = forward_stdin(&tx).await {
+                if let Err(send_error) = tx.send(Err(error)).await {
+                    log::debug!("exec input closed after stdin error: {send_error}");
+                }
+            }
+        }));
+        // Tokio's handlers outlive their streams. Keep native signal handling
+        // until acceptance so the enter fallback retains its usual behavior.
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut hangup = signal(SignalKind::hangup())?;
         // Keep local Ctrl-C available during startup. Switch before displaying
         // any prompt so password input cannot be echoed by the local terminal.
         let _terminal = if interactive {
@@ -190,12 +197,41 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
                 }
             }
         };
-        tokio::select! {
+        let result = tokio::select! {
             result = read_output(response) => result,
             result = signals => result,
             result = resizes => result,
+        };
+        result.map(Some)
+    })?;
+    if let Some(code) = exit_code {
+        return Ok(code);
+    }
+
+    let connection = DaemonClient::new_unix(&socket)
+        .prepared_pod_connection(ConnectPodRequest {
+            pod_name: command.name.clone(),
+            repo_path: repo_path.clone(),
+            client_context: ClientContext::current(),
+        })?
+        .context("pod is no longer connected for exec fallback")?;
+    let status = crate::enter::enter_prepared(
+        &connection,
+        &repo_path,
+        &command.command,
+        command.tty,
+        false,
+    )?;
+    let code = match (status.code(), status.signal()) {
+        (Some(code), None) => code,
+        (None, Some(signal)) => 128 + signal,
+        (code, signal) => {
+            return Err(anyhow::anyhow!(
+                "unexpected exec status: {code:?}, {signal:?}"
+            ));
         }
-    })
+    };
+    u8::try_from(code).context("exec exit status is outside 0..=255")
 }
 
 async fn read_output(response: reqwest::Response) -> Result<u8> {
@@ -257,9 +293,22 @@ async fn daemon_exec(
     let request: ExecRequest = exec_stream::read_request(&mut reader)
         .await
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
-    let (client, endpoint) = daemon
+    let (client, endpoint, http_version) = daemon
         .exec_connection(&request.connection)
         .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
+    match http_version {
+        reqwest::Version::HTTP_10 | reqwest::Version::HTTP_11 => {
+            // Streaming exec needs HTTP/2; reject before a command can start.
+            return Err((StatusCode::NOT_FOUND, "pod requires legacy exec".into()));
+        }
+        reqwest::Version::HTTP_2 => {}
+        version => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("unsupported pod HTTP version: {version:?}"),
+            ));
+        }
+    }
     let initial = exec_stream::encode_request(&request.spec)
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     let input = futures_util::stream::once(async { Ok::<_, io::Error>(initial.into()) })
@@ -305,7 +354,7 @@ async fn daemon_resize(
     State(daemon): State<Arc<DaemonServer>>,
     Query(request): Query<ExecResizeRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let (client, endpoint) = daemon
+    let (client, endpoint, _) = daemon
         .exec_connection(&ConnectPodRequest {
             repo_path: request.repo_path,
             pod_name: request.pod_name,
@@ -338,7 +387,7 @@ async fn daemon_signal(
     State(daemon): State<Arc<DaemonServer>>,
     Query(request): Query<ExecSignalRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let (client, endpoint) = daemon
+    let (client, endpoint, _) = daemon
         .exec_connection(&ConnectPodRequest {
             repo_path: request.repo_path,
             pod_name: request.pod_name,
