@@ -2698,7 +2698,11 @@ impl DaemonServer {
         Ok(())
     }
 
-    fn try_repair_git_tunnel(&self, pod_connection: &PodConnection) -> Result<()> {
+    fn try_repair_git_tunnel(
+        &self,
+        pod_connection: &PodConnection,
+        admitted_host: &host_connection::HostKey,
+    ) -> Result<()> {
         let _setup = pod_connection.git_tunnel_setup_guard();
         let repair_epoch = pod_connection.pod_repair_epoch();
         if !pod_connection.git_tunnel_supervision_enabled()
@@ -2709,6 +2713,11 @@ impl DaemonServer {
         }
 
         let host = pod_connection.host();
+        // Recreation can move this connection while repair waits for setup.
+        // Only use the host whose repair budget admitted this attempt.
+        if host_connection::HostKey::from_host(&host) != *admitted_host {
+            return Ok(());
+        }
         let executor = self.host_executor(&host)?;
         let pod_name = PodName(pod_connection.key().pod_name().to_string());
         let pod_id = crate::executor::pod_id_for(&pod_name, pod_connection.key().repo_path());
@@ -6812,7 +6821,7 @@ pub fn run_daemon() -> Result<()> {
     let git_daemon = daemon.clone();
     daemon
         .connections
-        .start_git_supervisor(move |pod| git_daemon.try_repair_git_tunnel(pod));
+        .start_git_supervisor(move |pod, host| git_daemon.try_repair_git_tunnel(pod, host));
 
     // Keep the server alive for the lifetime of the daemon.
     let _localhost_server = localhost_server;

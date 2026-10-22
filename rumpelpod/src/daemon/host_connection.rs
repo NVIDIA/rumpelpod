@@ -222,6 +222,20 @@ pub enum HostConnection {
 }
 
 impl HostConnection {
+    // State-machine tests need stable liveness without a real container engine.
+    #[cfg(test)]
+    pub(super) fn connected_for_test() -> Self {
+        let (status_tx, _) = watch::channel(HostStatus::Connected);
+        HostConnection::Localhost(Arc::new(LocalhostConnection {
+            engine: ContainerEngine::Docker,
+            events_tx: mpsc::unbounded_channel().0,
+            status_tx,
+            probe: Arc::new(Notify::new()),
+            bring_up: tokio::sync::Mutex::new(()),
+            _monitor: AbortOnDrop(RUNTIME.spawn(std::future::pending())),
+        }))
+    }
+
     /// Spawn a connection with one background liveness monitor for its host.
     pub fn new(host: &Host, events_tx: HostConnectionEventTx) -> Result<Self> {
         match host {

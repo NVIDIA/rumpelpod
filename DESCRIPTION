@@ -11,3 +11,7 @@ Wait for git repair admission asynchronously to avoid allocating a
 thread for every disconnected pod. Keep host-loss cancellation and
 independent budgets for different hosts. Cover admission, cancellation,
 and concurrent event/git recovery after an SSH packet blackhole.
+
+Retire queued repairs when recreation moves a pod to another host, and
+check the admitted host again after acquiring the tunnel setup lock so
+old work cannot consume a different host's connection capacity.

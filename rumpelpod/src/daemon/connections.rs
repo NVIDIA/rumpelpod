@@ -109,7 +109,7 @@ impl Connections {
     /// localhost git port); this loop only decides *when* to call it.
     pub fn start_git_supervisor<F>(&self, repair: F)
     where
-        F: Fn(&PodConnection) -> Result<()> + Send + Sync + 'static,
+        F: Fn(&PodConnection, &HostKey) -> Result<()> + Send + Sync + 'static,
     {
         let this = self.clone();
         let repair = Arc::new(repair);
@@ -294,8 +294,9 @@ async fn supervise_git_tunnel<F>(
     limiter: Arc<PodRepairLimiter>,
     repair: Arc<F>,
 ) where
-    F: Fn(&PodConnection) -> Result<()> + Send + Sync + 'static,
+    F: Fn(&PodConnection, &HostKey) -> Result<()> + Send + Sync + 'static,
 {
+    let host_key = host.key();
     let mut backoff = PodRepairBackoff::new();
     let mut repair_epoch = pod.pod_repair_epoch();
     loop {
@@ -303,6 +304,7 @@ async fn supervise_git_tunnel<F>(
             || pod.pod_repair_is_paused()
             || pod.git_tunnel_is_alive()
             || !host.is_connected()
+            || HostKey::from_host(&pod.host()) != host_key
         {
             break;
         }
@@ -316,16 +318,17 @@ async fn supervise_git_tunnel<F>(
             }
             permit = limiter.acquire() => permit,
         };
-        if !host.is_connected() {
+        if !host.is_connected() || HostKey::from_host(&pod.host()) != host_key {
             break;
         }
         // Waiting for admission must not allocate one OS thread per pod.
         // Release admission after each attempt, including before backoff.
         let attempt_pod = pod.clone();
         let attempt_repair = repair.clone();
+        let attempt_host = host_key.clone();
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            attempt_repair(&attempt_pod)
+            attempt_repair(&attempt_pod, &attempt_host)
         })
         .await
         .expect("git tunnel repair task panicked");
@@ -622,6 +625,62 @@ mod tests {
             .await
             .expect("cancelled repairs must release admission");
         drop(recovered);
+    }
+
+    #[tokio::test]
+    async fn pod_repair_admission_does_not_follow_a_pod_to_another_host() {
+        let (events_tx, _) = broadcast::channel(4);
+        let connections = Connections::new(events_tx);
+        let docker = Host::Localhost {
+            engine: ContainerEngine::Docker,
+        };
+        let host = Arc::new(HostConnection::connected_for_test());
+        let pod = connections
+            .inner
+            .pods
+            .get_or_create_async(
+                Path::new("/repo"),
+                "moving",
+                docker,
+                "token".into(),
+                PodConnectionStatus::PodDisconnected,
+                None,
+            )
+            .await
+            .unwrap();
+        pod.enable_git_tunnel_supervision();
+        assert!(pod.try_schedule_git_tunnel_repair());
+        let limiter = connections.pod_repair_limiter(&host);
+        let first = limiter.acquire().await;
+        let second = limiter.acquire().await;
+        let repair = supervise_git_tunnel(
+            pod.clone(),
+            host,
+            limiter,
+            Arc::new(|_: &PodConnection, _: &HostKey| -> Result<()> {
+                panic!("a moved pod must not use the old host's repair budget")
+            }),
+        );
+        tokio::pin!(repair);
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut repair)
+            .await
+            .is_err());
+
+        // Restored remote pods need git repair without having an event loop
+        // whose cancellation would otherwise wake this queued supervisor.
+        pod.update_host_and_token(
+            Host::Ssh {
+                ssh_destination: "new-host".into(),
+                engine: ContainerEngine::Docker,
+            },
+            "token".into(),
+        );
+        drop(first);
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), repair)
+            .await
+            .expect("stale repair must release the scheduling flag");
+        assert!(pod.try_schedule_git_tunnel_repair());
     }
 
     #[test]
