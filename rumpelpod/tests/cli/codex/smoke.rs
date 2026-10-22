@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use super::common::{setup_codex_test_repo, CodexSession};
+use crate::common::pod_command;
 
 #[test]
 fn codex_smoke() {
@@ -35,4 +36,28 @@ fn codex_wait_accepts_the_current_screen() {
     // must not depend on Codex emitting another terminal update.
     session.wait_for_with_timeout("Permissions:", Duration::ZERO);
     session.wait_for_absent_with_timeout("Waiting for startup", Duration::ZERO);
+}
+
+#[test]
+fn codex_status_reports_an_idle_native_thread() {
+    let (home, repo, _executor, daemon) = setup_codex_test_repo();
+    let mut session = CodexSession::spawn(&repo, &daemon, home.path(), &[]);
+    session.wait_for_ready();
+
+    // This needs no inference: the monitor must learn about the loaded thread
+    // from native lifecycle events or its startup snapshot alone.
+    retry::retry(retry::delay::Fixed::from_millis(100).take(100), || {
+        let output = pod_command(&repo, &daemon)
+            .arg("list")
+            .output()
+            .expect("rumpel list failed");
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if stdout.contains("CODEX") && stdout.contains("idle") {
+            retry::OperationResult::Ok(())
+        } else {
+            retry::OperationResult::Retry(stdout)
+        }
+    })
+    .expect("loaded Codex thread never appeared as idle");
 }

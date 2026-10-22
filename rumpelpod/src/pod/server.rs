@@ -99,6 +99,7 @@ pub struct PodServerState {
     pub codex_app_server: super::codex::CodexAppServer,
     /// Current Claude Code session state, updated by hooks.
     pub claude_state: tokio::sync::watch::Sender<Option<super::types::ClaudeState>>,
+    claude_sessions: std::sync::Arc<std::sync::Mutex<super::claude::ClaudeSessions>>,
     /// Current Codex session state, updated by the state monitor.
     pub codex_state: tokio::sync::watch::Sender<Option<super::types::CodexState>>,
     /// Whether the codex state monitor task has been spawned.
@@ -191,6 +192,7 @@ pub fn run_container_server(
         pod_name: pod_name.clone(),
         codex_app_server: super::codex::new_codex_app_server(),
         claude_state: claude_state_tx,
+        claude_sessions: Default::default(),
         codex_state: codex_state_tx,
         codex_monitor_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         push_gate: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1014,7 +1016,8 @@ async fn claude_state_handler(
     State(state): State<PodServerState>,
     Json(req): Json<super::types::NotifyClaudeStateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state.claude_state.send_replace(Some(req.state));
+    let mut sessions = state.claude_sessions.lock().unwrap();
+    state.claude_state.send_replace(Some(sessions.update(req)));
     ok_json(serde_json::json!({}))
 }
 
@@ -2260,38 +2263,25 @@ fn rewrite_claude_settings(
         .unwrap_or_default();
 
     let bin = "/opt/rumpelpod/bin/rumpel";
-    hooks.insert(
-        "UserPromptSubmit".to_string(),
-        serde_json::json!([{
-            "matcher": "",
-            "hooks": [{ "type": "command", "command":
-                format!("{bin} claude-hook notify-state processing") }]
-        }]),
-    );
-    hooks.insert(
-        "Stop".to_string(),
-        serde_json::json!([{
-            "matcher": "",
-            "hooks": [{ "type": "command", "command":
-                format!("{bin} claude-hook notify-state waiting_for_input") }]
-        }]),
-    );
-    hooks.insert(
-        "StopFailure".to_string(),
-        serde_json::json!([{
-            "matcher": "authentication_failed",
-            "hooks": [{ "type": "command", "command":
-                format!("{bin} claude-hook notify-state auth_error") }]
-        }]),
-    );
-    hooks.insert(
-        "SessionEnd".to_string(),
-        serde_json::json!([{
-            "matcher": "",
-            "hooks": [{ "type": "command", "command":
-                format!("{bin} claude-hook notify-state stopped") }]
-        }]),
-    );
+    for (event, matcher) in [
+        // Compaction also emits SessionStart but does not end ongoing work.
+        ("SessionStart", "startup|resume|clear"),
+        ("UserPromptSubmit", ""),
+        ("Stop", ""),
+        ("StopFailure", "authentication_failed"),
+        ("SessionEnd", ""),
+        ("SubagentStart", ""),
+        ("SubagentStop", ""),
+    ] {
+        hooks.insert(
+            event.to_string(),
+            serde_json::json!([{
+                "matcher": matcher,
+                "hooks": [{ "type": "command", "command":
+                    format!("{bin} claude-hook notify-state") }]
+            }]),
+        );
+    }
 
     if let Some(want) = permission_hook_override {
         if want {

@@ -320,10 +320,11 @@ fn k8s_list_shows_claude_state() {
             "--create",
             "claude-st",
             "--",
-            "/opt/rumpelpod/bin/rumpel",
-            "claude-hook",
-            "notify-state",
-            "processing",
+            "sh",
+            "-c",
+            r#"printf '%s' "$1" | /opt/rumpelpod/bin/rumpel claude-hook notify-state"#,
+            "sh",
+            r#"{"session_id":"main","hook_event_name":"UserPromptSubmit"}"#,
         ])
         .success()
         .expect("claude-hook notify-state failed");

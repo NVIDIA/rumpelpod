@@ -1,0 +1,9 @@
+Keep agent status busy during delegated work
+
+An idle parent or a finished subagent does not mean the whole task has
+finished. Track Claude subagents per session and aggregate Codex thread
+statuses so outstanding work continues to show as processing.
+
+Restore loaded Codex thread states after monitor reconnects and treat
+user input and approval waits as idle. Cover overlapping agents, session
+shutdown, and reconnect snapshots with regression tests.
