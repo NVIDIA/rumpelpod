@@ -655,14 +655,14 @@ pub trait Daemon: Send + Sync + 'static {
 
     // POST /pod/reconnect-events
     // Subscribe to reconnection events for a pod.
-    // Returns None if no event listener is active for the pod.
+    // Returns None if the pod was stopped or removed.
     fn subscribe_pod_reconnect(
         &self,
         _repo_path: &Path,
         _pod_name: &str,
         _client_context: &ClientContext,
-    ) -> Option<tokio::sync::broadcast::Receiver<ReconnectEvent>> {
-        None
+    ) -> Result<Option<tokio::sync::broadcast::Receiver<ReconnectEvent>>> {
+        Ok(None)
     }
 
     // GET /events
@@ -1960,7 +1960,13 @@ fn reconnect_sse_response(rx: tokio::sync::broadcast::Receiver<ReconnectEvent>) 
     tokio::spawn(async move {
         let mut rx = rx;
         loop {
-            match rx.recv().await {
+            // A disconnected frontend must release its demand even when no
+            // reconnect event arrives to reveal the closed response body.
+            let event = tokio::select! {
+                _ = event_tx.closed() => break,
+                event = rx.recv() => event,
+            };
+            match event {
                 Ok(event) => {
                     let is_terminal =
                         matches!(event, ReconnectEvent::Connected | ReconnectEvent::Stopped);
@@ -2000,24 +2006,26 @@ fn reconnect_sse_response(rx: tokio::sync::broadcast::Receiver<ReconnectEvent>) 
 
 /// Handler for POST /pod/reconnect-events endpoint.
 ///
-/// When no event listener is active the pod was already stopped (or
-/// never started).  Return a single `Stopped` event so the client
-/// exits instead of retrying forever.
+/// A live subscriber is explicit demand, including for a dormant pod restored
+/// from the database. Stopped or removed pods terminate the subscriber.
 async fn pod_reconnect_events_handler<D: Daemon>(
     State(daemon): State<Arc<D>>,
     Json(request): Json<PodReconnectRequest>,
 ) -> Response {
-    match daemon.subscribe_pod_reconnect(
-        &request.repo_path,
-        &request.pod_name,
-        &request.client_context,
-    ) {
-        Some(rx) => reconnect_sse_response(rx),
-        None => {
+    match block_in_place(|| {
+        daemon.subscribe_pod_reconnect(
+            &request.repo_path,
+            &request.pod_name,
+            &request.client_context,
+        )
+    }) {
+        Ok(Some(rx)) => reconnect_sse_response(rx),
+        Ok(None) => {
             let (tx, rx) = tokio::sync::broadcast::channel(1);
             let _ = tx.send(ReconnectEvent::Stopped);
             reconnect_sse_response(rx)
         }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response(),
     }
 }
 
@@ -2099,6 +2107,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reconnect_stream_releases_demand_when_client_leaves_during_silence() {
+        let (source, rx) = tokio::sync::broadcast::channel(1);
+        let response = reconnect_sse_response(rx);
+        assert_eq!(source.receiver_count(), 1);
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while source.receiver_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed reconnect stream retained demand without any events");
+    }
 
     #[tokio::test]
     async fn daemon_event_stream_resyncs_initially_and_after_lag() {

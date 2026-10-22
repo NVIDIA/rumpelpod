@@ -29,13 +29,14 @@ use indoc::formatdoc;
 use super::{write_ssh_config, SshRemoteHost};
 use crate::codex::common::{setup_controlled_home, CodexSession};
 use crate::common::{
-    assert_process_exited, pod_command, wait_for_pid, write_test_devcontainer, TestDaemon,
-    TestHome, TestProcess, TestRepo, TEST_REPO_PATH,
+    assert_process_exited, pod_command, set_pod_codex_state, wait_for_pid, write_test_devcontainer,
+    TestDaemon, TestHome, TestProcess, TestRepo, TEST_REPO_PATH,
 };
 use crate::executor;
 use rumpelpod::daemon::protocol::{
     ConnectPodRequest, Daemon, DaemonClient, PodListMode, PodStatus,
 };
+use rumpelpod::daemon::reconnect::ReconnectEvent;
 use rumpelpod::CommandExt;
 
 const FAST_PROBE_MS: &str = "3000";
@@ -122,6 +123,7 @@ fn start_mux_harness_with_env(pod_names: &[&str], extra_env: &[(&str, &str)]) ->
             .args(["enter", "--create", name, "--", "true"])
             .success()
             .unwrap_or_else(|e| panic!("creating pod {name} failed: {e:#}"));
+        set_pod_codex_state(&repo, &daemon, name, "processing");
     }
 
     let harness = MuxHarness {
@@ -413,6 +415,76 @@ fn mux_both_pods_sync_after_client_blackhole() {
     drop(hole);
     wait_for_ref(harness.repo.path(), &pod_ref("alpha"), &oid_a);
     wait_for_ref(harness.repo.path(), &pod_ref("beta"), &oid_b);
+}
+
+#[test]
+fn mux_reconnect_only_wakes_processing_or_explicitly_requested_pods() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let harness = start_mux_harness(&["working", "requested", "idle"]);
+    set_pod_codex_state(&harness.repo, &harness.daemon, "requested", "idle");
+    set_pod_codex_state(&harness.repo, &harness.daemon, "idle", "idle");
+    let Some(hole) = ClientBlackhole::install(&harness.remote) else {
+        executor::skip_test();
+        return;
+    };
+    TestProcess::spawn(pod_command(&harness.repo, &harness.daemon).args(["connect", "working"]))
+        .failure(Duration::from_secs(10), "host probe must report outage");
+    let client = DaemonClient::new_unix(&harness.daemon.socket_path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pods = client
+            .list_pods(
+                harness.repo.path().to_path_buf(),
+                PodListMode::Offline,
+                false,
+            )
+            .unwrap();
+        if pods.iter().all(|pod| pod.status == PodStatus::Disconnected) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host loss not observed: {pods:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let working_commit = commit_in_pod(&harness.remote, "working", "active-offline");
+    let idle_commit = commit_in_pod(&harness.remote, "idle", "idle-offline");
+    drop(hole);
+    wait_for_ref(harness.repo.path(), &pod_ref("working"), &working_commit);
+
+    pod_command(&harness.repo, &harness.daemon)
+        .args(["connect", "requested"])
+        .success()
+        .unwrap();
+    // Allow several supervisor ticks; entering one sibling must not revive
+    // another idle pod or flush its pending commits.
+    std::thread::sleep(Duration::from_secs(3));
+    let pods = client
+        .list_pods(
+            harness.repo.path().to_path_buf(),
+            PodListMode::Offline,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        pods.iter().find(|pod| pod.name == "idle").unwrap().status,
+        PodStatus::Disconnected
+    );
+    let idle_ref = Command::new("git")
+        .args(["rev-parse", &pod_ref("idle")])
+        .current_dir(harness.repo.path())
+        .success()
+        .unwrap();
+    assert_ne!(String::from_utf8_lossy(&idle_ref).trim(), idle_commit);
+
+    assert!(client
+        .pod_reconnect_events(harness.repo.path(), "idle")
+        .unwrap()
+        .any(|event| matches!(event.unwrap(), ReconnectEvent::Connected)));
+    wait_for_ref(harness.repo.path(), &pod_ref("idle"), &idle_commit);
 }
 
 #[test]

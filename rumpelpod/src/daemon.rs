@@ -494,6 +494,7 @@ impl DaemonServer {
             &local_env,
         )?;
         let host = connection.host();
+        connection.request_connection();
         Ok(Some(PreparedPodConnection {
             container_id: ContainerId(container_id),
             docker_socket: initialize_docker_socket(&host),
@@ -2662,19 +2663,6 @@ impl DaemonServer {
         )?))
     }
 
-    fn ensure_git_tunnel(
-        &self,
-        pod_connection: &PodConnection,
-        executor: &crate::executor::Executor,
-        backend_container: &str,
-    ) -> Result<()> {
-        crate::async_runtime::block_on(self.ensure_git_tunnel_async(
-            pod_connection,
-            executor,
-            backend_container,
-        ))
-    }
-
     async fn ensure_git_tunnel_async(
         &self,
         pod_connection: &PodConnection,
@@ -2700,20 +2688,27 @@ impl DaemonServer {
 
     fn try_repair_git_tunnel(
         &self,
-        pod_connection: &PodConnection,
+        pod_connection: &Arc<PodConnection>,
         admitted_host: &host_connection::HostKey,
     ) -> Result<()> {
-        let _setup = pod_connection.git_tunnel_setup_guard();
+        // Foreground setup already owns this pod's repair. Waiting behind it
+        // would consume host capacity without doing any transport work.
+        let Some(_setup) = pod_connection.try_git_tunnel_setup_guard() else {
+            return Ok(());
+        };
         let repair_epoch = pod_connection.pod_repair_epoch();
         if !pod_connection.git_tunnel_supervision_enabled()
-            || pod_connection.git_tunnel_is_alive()
+            || !pod_connection.wants_reconnect()
+            || (pod_connection.git_tunnel_is_alive()
+                && pod_connection.has_alive_pod_server()
+                && pod_connection.has_event_loop())
             || !self.connections.pod_host_is_connected(pod_connection)
         {
             return Ok(());
         }
 
         let host = pod_connection.host();
-        // Recreation can move this connection while repair waits for setup.
+        // Recreation can move this connection after host admission.
         // Only use the host whose repair budget admitted this attempt.
         if host_connection::HostKey::from_host(&host) != *admitted_host {
             return Ok(());
@@ -2754,6 +2749,7 @@ impl DaemonServer {
                 | PodStatus::Stopping
                 | PodStatus::Deleting
                 | PodStatus::Broken => {
+                    pod_connection.stop_events();
                     pod_connection.pause_pod_repair();
                     return Ok(());
                 }
@@ -2762,14 +2758,68 @@ impl DaemonServer {
                 }
             }
         }
-        pod_connection.remove_git_tunnel();
-        let target = format!("127.0.0.1:{}", self.localhost_server_port);
-        let tunnel = block_on(crate::tunnel::try_start_tunnel(
-            &executor,
-            &backend_container,
-            &target,
-        ))?;
-        pod_connection.install_repaired_git_tunnel(tunnel, repair_epoch);
+        if !pod_connection.git_tunnel_is_alive() {
+            pod_connection.remove_git_tunnel();
+            let target = format!("127.0.0.1:{}", self.localhost_server_port);
+            let tunnel = block_on(crate::tunnel::try_start_tunnel(
+                &executor,
+                &backend_container,
+                &target,
+            ))?;
+            pod_connection.install_repaired_git_tunnel(tunnel, repair_epoch);
+        }
+        if !pod_connection.has_alive_pod_server() {
+            let record = record
+                .as_ref()
+                .context("pod removed during connection repair")?;
+            let serve_port = read_container_server_port(&executor, &backend_container)?;
+            let proxy = block_on(crate::exec_proxy::start_pod_http_proxy_in_container(
+                executor.clone(),
+                backend_container.clone(),
+                serve_port,
+            ))?;
+            let handles = if pod_connection.has_forwarded_ports() {
+                None
+            } else {
+                Some(setup_port_forwarding(
+                    &self.db,
+                    &executor,
+                    &backend_container,
+                    record.id,
+                    &[],
+                    &HashMap::new(),
+                    &None,
+                    if record.agent_service.is_empty() {
+                        None
+                    } else {
+                        Some(&record.agent_service)
+                    },
+                    compose_project.as_ref().map(crate::compose::Project::model),
+                    compose_project.as_ref(),
+                )?)
+            };
+            pod_connection.install_repaired_routes(proxy, handles, repair_epoch);
+        }
+        self.connections
+            .ensure_repaired_event_loop(pod_connection, repair_epoch);
+        Ok(())
+    }
+
+    fn restore_processing_pods(&self) -> Result<()> {
+        let pods = db::list_pods_by_status(&self.db.lock().unwrap(), db::PodStatus::Ready)?;
+        for pod in pods.into_iter().filter(|pod| pod.agent_processing) {
+            let host: Host = serde_json::from_str(&pod.host)?;
+            let host = host.resolve_docker_engine()?;
+            let connection = self.configure_pod_connection_ssh_agent(
+                &PodName(pod.name),
+                Path::new(&pod.repo_path),
+                &host,
+                &pod.token,
+            )?;
+            connection.restore_agent_processing();
+            connection.enable_git_tunnel_supervision();
+            self.connections.get_or_create_host(&host)?.request_probe();
+        }
         Ok(())
     }
 
@@ -2988,11 +3038,6 @@ impl DaemonServer {
                     Ok(result) => result,
                     Err(e) => return ReconnectPodResult::Unavailable(e),
                 };
-                self.spawn_reconnect_k8s_siblings(
-                    context.clone(),
-                    namespace.clone(),
-                    (repo_path.to_path_buf(), pod_name.0.clone()),
-                );
                 ReconnectPodResult::Connected(Box::new(result))
             }
             Host::Localhost { .. } | Host::Ssh { .. } => {
@@ -3335,131 +3380,6 @@ impl DaemonServer {
             container_token: token,
             container_repo_path: container_repo_path.to_path_buf(),
         })
-    }
-
-    // Run sibling reconnection off the enter path so the user is not
-    // blocked on N kubectl-exec setups.  Siblings race to a steady
-    // state on their own; a subsequent enter whose sibling reconnect
-    // is still mid-flight finds an alive-or-in-progress tunnel and
-    // is a no-op.
-    fn spawn_reconnect_k8s_siblings(
-        &self,
-        context: String,
-        namespace: String,
-        exclude: (PathBuf, String),
-    ) {
-        let this = self.handle();
-        std::thread::spawn(move || {
-            this.reconnect_k8s_siblings(&context, &namespace, &exclude);
-        });
-    }
-
-    // The daemon does not auto-restore k8s pods on startup, so pending
-    // pushes from pods that were running across a restart would only
-    // land when the user re-enters each pod individually.  Piggy-back
-    // on any enter into cluster+namespace to reconnect the rest, so
-    // touching a single pod heals its siblings.
-    fn reconnect_k8s_siblings(&self, context: &str, namespace: &str, exclude: &(PathBuf, String)) {
-        let pods = {
-            let conn = self.db.lock().unwrap();
-            match db::list_pods_by_status(&conn, db::PodStatus::Ready) {
-                Ok(pods) => pods,
-                Err(e) => {
-                    eprintln!("reconnect_k8s_siblings: failed to list pods: {e:#}");
-                    return;
-                }
-            }
-        };
-
-        for pod in pods {
-            let key = (PathBuf::from(&pod.repo_path), pod.name.clone());
-            if &key == exclude {
-                continue;
-            }
-
-            let host: Host = match serde_json::from_str(&pod.host) {
-                Ok(h) => h,
-                Err(e) => {
-                    let name = &pod.name;
-                    eprintln!("reconnect_k8s_siblings: parse host for {name}: {e:#}");
-                    continue;
-                }
-            };
-
-            match &host {
-                Host::Kubernetes {
-                    context: c,
-                    namespace: n,
-                    ..
-                } if c == context && n == namespace => {}
-                Host::Kubernetes { .. } | Host::Localhost { .. } | Host::Ssh { .. } => continue,
-            }
-
-            let already_live = self
-                .connections
-                .pod(&key.0, &pod.name)
-                .is_some_and(|connection| connection.git_tunnel_is_alive());
-            if already_live {
-                continue;
-            }
-
-            let pod_name = PodName(pod.name.clone());
-            let repo_path = PathBuf::from(&pod.repo_path);
-            let executor = match self.host_executor(&host) {
-                Ok(executor) => executor,
-                Err(e) => {
-                    let name = &pod.name;
-                    let path = &pod.repo_path;
-                    log::warn!(
-                        "reconnect_k8s_siblings: failed to open host for {name} at {path}: {e:#}"
-                    );
-                    continue;
-                }
-            };
-            let backend_pod_id = crate::executor::pod_id_for(&pod_name, &repo_path);
-            let status = match executor.status(&backend_pod_id) {
-                Ok(status) => status,
-                Err(e) => {
-                    let name = &pod.name;
-                    let path = &pod.repo_path;
-                    log::warn!(
-                        "reconnect_k8s_siblings: failed to read status for {name} at {path}: {e:#}"
-                    );
-                    continue;
-                }
-            };
-            match status {
-                PodStatus::Starting => {
-                    panic!("container backend returned a daemon-only startup status")
-                }
-                PodStatus::Running => {}
-                PodStatus::Gone
-                | PodStatus::Stopped
-                | PodStatus::Disconnected
-                | PodStatus::Stopping
-                | PodStatus::Deleting
-                | PodStatus::Broken => continue,
-            }
-            // container_repo_path is only threaded into the discarded
-            // LaunchResult, so any path works here.
-            if let Err(e) = block_on(self.reconnect_k8s(
-                &pod_name,
-                &repo_path,
-                &host,
-                context,
-                namespace,
-                &executor,
-                &backend_pod_id,
-                &repo_path,
-                &HashMap::new(),
-                &pod,
-                false,
-            )) {
-                let name = &pod.name;
-                let path = &pod.repo_path;
-                log::warn!("reconnect_k8s_siblings: failed to reconnect {name} at {path}: {e:#}");
-            }
-        }
     }
 
     /// Reconnect to an existing Docker container.
@@ -4593,10 +4513,7 @@ impl DaemonServer {
         let ports_attributes = devcontainer.ports_attributes.clone().unwrap_or_default();
         let other_ports_attributes = devcontainer.other_ports_attributes.clone();
 
-        if let Host::Kubernetes {
-            context, namespace, ..
-        } = &docker_host
-        {
+        if matches!(&docker_host, Host::Kubernetes { .. }) {
             let result = self
                 .launch_pod_k8s(
                     &pod_name,
@@ -4611,11 +4528,6 @@ impl DaemonServer {
                     &progress_tx,
                 )
                 .await?;
-            self.spawn_reconnect_k8s_siblings(
-                context.clone(),
-                namespace.clone(),
-                (repo_path.clone(), pod_name.0.clone()),
-            );
             return Ok(result);
         }
 
@@ -5477,123 +5389,6 @@ impl DaemonServer {
         Ok(launch_result)
     }
 
-    /// Re-establish connections to pods that were running before the
-    /// daemon restarted.  Without this, commits made while the daemon
-    /// was down would never be pushed to the host repo until someone
-    /// manually re-entered the pod.
-    fn restore_running_pods(&self) {
-        let pods = {
-            let conn = self.db.lock().unwrap();
-            match db::list_pods_by_status(&conn, db::PodStatus::Ready) {
-                Ok(pods) => pods,
-                Err(e) => {
-                    eprintln!("restore_running_pods: failed to list pods: {e:#}");
-                    return;
-                }
-            }
-        };
-
-        for pod in pods {
-            let host: Host = match serde_json::from_str(&pod.host) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!(
-                        "restore_running_pods: failed to parse host for {}: {e:#}",
-                        pod.name
-                    );
-                    continue;
-                }
-            };
-
-            let repo_path = Path::new(&pod.repo_path);
-            let pod_name = PodName(pod.name.clone());
-            let pod_connection = match self
-                .configure_pod_connection_ssh_agent(&pod_name, repo_path, &host, &pod.token)
-            {
-                Ok(connection) => connection,
-                Err(e) => {
-                    eprintln!(
-                        "restore_running_pods: failed to configure connection for {}: {e:#}",
-                        pod.name
-                    );
-                    continue;
-                }
-            };
-
-            match host {
-                Host::Localhost { .. } => {}
-                Host::Ssh { .. } | Host::Kubernetes { .. } => {
-                    pod_connection.enable_git_tunnel_supervision();
-                    continue;
-                }
-            }
-
-            if let Err(e) = self.restore_one_pod(&pod, &host) {
-                eprintln!(
-                    "restore_running_pods: failed to restore {}: {e:#}",
-                    pod.name
-                );
-            }
-        }
-    }
-
-    fn restore_one_pod(&self, pod: &db::PodRecord, host: &Host) -> Result<()> {
-        let repo_path = PathBuf::from(&pod.repo_path);
-        let pod_name = PodName(pod.name.clone());
-
-        let executor = self.host_executor(host)?;
-        let pod_id = crate::executor::pod_id_for(&pod_name, &repo_path);
-        let compose_project = self.compose_project_from_record(pod, host)?;
-        let agent_container = match compose_project.as_ref() {
-            Some(project) => project.one_service_container(&pod.agent_service)?,
-            None => pod_id.as_str().to_string(),
-        };
-        if executor.status(&agent_container)? != PodStatus::Running {
-            return Ok(());
-        }
-        if let Some(project) = compose_project.as_ref() {
-            project.inject_rumpel_into_sidecars(&pod.agent_service)?;
-        }
-        let serve_port = read_container_server_port(&executor, &agent_container)
-            .context("reading server-port file while restoring running pod")?;
-
-        let pod_connection =
-            self.configure_pod_connection_ssh_agent(&pod_name, &repo_path, host, &pod.token)?;
-        self.ensure_git_tunnel(&pod_connection, &executor, &agent_container)
-            .context("starting docker tunnel")?;
-
-        let proxy = block_on(crate::exec_proxy::start_pod_http_proxy_in_container(
-            executor.clone(),
-            agent_container.clone(),
-            serve_port,
-        ))
-        .context("starting exec proxy")?;
-        pod_connection.set_pod_server(host.clone(), pod.token.clone(), proxy)?;
-
-        let handles = {
-            setup_port_forwarding(
-                &self.db,
-                &executor,
-                &agent_container,
-                pod.id,
-                &[],
-                &std::collections::HashMap::new(),
-                &None,
-                if pod.agent_service.is_empty() {
-                    None
-                } else {
-                    Some(pod.agent_service.as_str())
-                },
-                compose_project.as_ref().map(crate::compose::Project::model),
-                compose_project.as_ref(),
-            )?
-        };
-        pod_connection.set_forwarded_ports(handles);
-        self.connections.ensure_event_loop(&pod_connection);
-
-        Ok(())
-    }
-
     /// Reference to the daemon's screen-session registry, exposed
     /// for the codex WS handler.
     pub(crate) fn pty_sessions(&self) -> crate::pty_session::PtySessions {
@@ -5616,6 +5411,16 @@ impl DaemonServer {
         }
         let endpoint = connection.endpoint()?;
         Some((endpoint.url, endpoint.token, connection.codex_state()))
+    }
+
+    pub(crate) fn frontend_reconnect_demand(
+        &self,
+        repo_path: &Path,
+        pod_name: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<reconnect::ReconnectEvent>> {
+        self.connections
+            .pod(repo_path, pod_name)
+            .map(|pod| pod.subscribe())
     }
 
     fn cleanup_codex_runtime(&self, repo_path: &Path, pod_name: &str) {
@@ -5897,7 +5702,8 @@ impl DaemonServer {
                 config.ssh_agent.keys.as_deref().unwrap_or_default(),
             )?),
         };
-        self.connections
+        let connection = self
+            .connections
             .get_or_create_pod_async(
                 repo_path,
                 &pod_name.0,
@@ -5905,7 +5711,20 @@ impl DaemonServer {
                 token.to_string(),
                 keys.as_deref(),
             )
-            .await
+            .await?;
+        let database = self.db.clone();
+        let token = token.to_owned();
+        connection.set_activity_observer(Arc::new(move |key, processing| {
+            db::record_agent_activity(
+                &database.lock().unwrap(),
+                key.repo_path(),
+                key.pod_name(),
+                &token,
+                processing,
+            )
+            .expect("persisting observed pod activity");
+        }));
+        Ok(connection)
     }
 }
 
@@ -6697,9 +6516,47 @@ impl Daemon for DaemonServer {
         repo_path: &Path,
         pod_name: &str,
         client_context: &ClientContext,
-    ) -> Option<tokio::sync::broadcast::Receiver<reconnect::ReconnectEvent>> {
+    ) -> Result<Option<tokio::sync::broadcast::Receiver<reconnect::ReconnectEvent>>> {
         self.remember_client_context(client_context);
-        self.connections.subscribe_pod(repo_path, pod_name)
+        let lifecycle = self.lifecycle_locks.for_pod(repo_path, pod_name);
+        let _guard = lifecycle.queue()?.acquire(|| {})?;
+        if let Some(connection) = self.connections.pod(repo_path, pod_name) {
+            if connection.status() == PodConnectionStatus::Stopped {
+                return Ok(None);
+            }
+            let receiver = connection.subscribe();
+            if !connection.git_tunnel_supervision_enabled() {
+                connection.enable_git_tunnel_supervision();
+            }
+            self.connections
+                .get_or_create_host(&connection.host())?
+                .request_probe();
+            return Ok(Some(receiver));
+        }
+        let record = db::get_pod(&self.db.lock().unwrap(), repo_path, pod_name)?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        match record.status {
+            db::PodStatus::Ready => {}
+            db::PodStatus::Initializing
+            | db::PodStatus::Error
+            | db::PodStatus::Stopping
+            | db::PodStatus::Deleting
+            | db::PodStatus::DeleteFailed => return Ok(None),
+        }
+        let host: Host = serde_json::from_str(&record.host)?;
+        let host = host.resolve_docker_engine()?;
+        let connection = self.configure_pod_connection_ssh_agent(
+            &PodName(pod_name.into()),
+            repo_path,
+            &host,
+            &record.token,
+        )?;
+        let receiver = connection.subscribe();
+        connection.enable_git_tunnel_supervision();
+        self.connections.get_or_create_host(&host)?.request_probe();
+        Ok(Some(receiver))
     }
 
     fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<DaemonEvent>> {
@@ -6813,9 +6670,7 @@ pub fn run_daemon() -> Result<()> {
         ambient_ssh_agents,
     });
 
-    // Re-establish connections to pods that were running before we
-    // (re)started so that pending pushes land without manual re-entry.
-    daemon.restore_running_pods();
+    daemon.restore_processing_pods()?;
     daemon.connections.start();
     daemon.start_creation_cleanup();
     let git_daemon = daemon.clone();

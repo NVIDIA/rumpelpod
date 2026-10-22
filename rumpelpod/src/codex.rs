@@ -286,6 +286,12 @@ struct FrontendRecovery {
 
 impl FrontendRecovery {
     async fn monitor(self, mut watch: SessionWatch) -> Result<()> {
+        // A live frontend is explicit demand even while idle or while its
+        // upstream WebSocket is down. Drop that demand when this session ends.
+        let _demand = self
+            .daemon
+            .upgrade()
+            .and_then(|daemon| daemon.frontend_reconnect_demand(&self.repo_path, &self.pod_name));
         loop {
             if reconnect_failed(watch.screen.lock().await.screen()) {
                 break;

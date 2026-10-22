@@ -1,17 +1,23 @@
-Limit pod recovery bursts after host outages
+Reconnect pods only for demand or active agents
 
-Host recovery wakes every known pod, including detached pods that need
-their git tunnels for automatic synchronization. Share a per-host budget
-between background event-stream handshakes and git tunnel repair: at
-most two attempts in flight, with admissions at least 250 ms apart.
-Release admission before backoff and after the handshake so established
-streams do not prevent other pods from recovering.
+Connecting to a host or entering a pod must not wake every idle sibling.
+Resume a pod only for an explicit connection request, a live frontend or
+reconnect subscriber, or an agent last observed processing. Keep healthy
+idle transports open, but leave idle and unknown pods dormant after
+loss. Remove Kubernetes sibling recovery and persist observed processing
+activity so daemon startup restores only those pods, on any backend.
 
-Wait for git repair admission asynchronously to avoid allocating a
-thread for every disconnected pod. Keep host-loss cancellation and
-independent budgets for different hosts. Cover admission, cancellation,
-and concurrent event/git recovery after an SSH packet blackhole.
+Expire one-shot connection requests after both event and git transports
+are ready. Release subscriber demand when its response closes, and keep
+Codex frontend demand scoped to its process. Protect persisted activity
+and restored resources against late results from stop or recreation.
 
-Retire queued repairs when recreation moves a pod to another host, and
-check the admitted host again after acquiring the tunnel setup lock so
-old work cannot consume a different host's connection capacity.
+Share two transport setup slots per host as a secondary burst limit.
+Successful handshakes release capacity immediately; failed or cancelled
+attempts retain slots for a 500 ms cooldown. Release event admission at
+HTTP headers, before readiness that may depend on git repair. Skip busy
+foreground git setup and back off streams that close after a greeting.
+
+Cover selective SSH recovery, dormant frontend subscriptions, persisted
+processing activity, stale observations, fast success, failure cooldown,
+and readiness that depends on queued git repair.

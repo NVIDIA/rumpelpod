@@ -12,13 +12,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use log::{debug, info};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{broadcast, OwnedSemaphorePermit, Semaphore};
-use tokio::time::Instant;
 
 use crate::async_runtime::RUNTIME;
 use crate::config::Host;
@@ -34,32 +33,49 @@ use crate::daemon::protocol::DaemonEvent;
 use crate::daemon::reconnect::ReconnectEvent;
 use crate::pod::types::{ClaudeState, CodexState};
 
-// A recovered host can have many pods waiting on it. Bound both slow
-// handshakes and fast failures, sharing the budget with git tunnel repair.
+// Successful handshakes can release capacity immediately. Failed or cancelled
+// attempts retain their slots briefly so fast failures cannot spin on the host.
 const POD_REPAIR_CONCURRENCY: usize = 2;
-const POD_REPAIR_SPACING: Duration = Duration::from_millis(250);
+const POD_REPAIR_FAILURE_COOLDOWN: Duration = Duration::from_millis(500);
 
 struct PodRepairLimiter {
     slots: Arc<Semaphore>,
-    next_start: tokio::sync::Mutex<Instant>,
 }
 
 impl PodRepairLimiter {
     fn new() -> Self {
         Self {
             slots: Arc::new(Semaphore::new(POD_REPAIR_CONCURRENCY)),
-            next_start: tokio::sync::Mutex::new(Instant::now()),
         }
     }
 
-    async fn acquire(&self) -> OwnedSemaphorePermit {
-        let permit = self.slots.clone().acquire_owned().await.unwrap();
-        let mut next_start = self.next_start.lock().await;
-        tokio::time::sleep_until(*next_start).await;
-        // Base the next start on admission, so an idle or stalled runtime
-        // cannot accumulate credits that all become usable at once.
-        *next_start = Instant::now() + POD_REPAIR_SPACING;
-        permit
+    async fn acquire(&self) -> PodRepairPermit {
+        PodRepairPermit {
+            slot: Some(self.slots.clone().acquire_owned().await.unwrap()),
+        }
+    }
+}
+
+struct PodRepairPermit {
+    slot: Option<OwnedSemaphorePermit>,
+}
+
+impl PodRepairPermit {
+    fn connected(mut self) {
+        drop(self.slot.take());
+    }
+}
+
+impl Drop for PodRepairPermit {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            // Cancellation is not evidence of a healthy transport. Keep the
+            // cooldown even when the observer gives up on its request.
+            RUNTIME.spawn(async move {
+                tokio::time::sleep(POD_REPAIR_FAILURE_COOLDOWN).await;
+                drop(slot);
+            });
+        }
     }
 }
 
@@ -109,7 +125,7 @@ impl Connections {
     /// localhost git port); this loop only decides *when* to call it.
     pub fn start_git_supervisor<F>(&self, repair: F)
     where
-        F: Fn(&PodConnection, &HostKey) -> Result<()> + Send + Sync + 'static,
+        F: Fn(&Arc<PodConnection>, &HostKey) -> Result<()> + Send + Sync + 'static,
     {
         let this = self.clone();
         let repair = Arc::new(repair);
@@ -214,14 +230,6 @@ impl Connections {
         self.inner.pods.endpoint(repo_path, pod_name)
     }
 
-    pub fn subscribe_pod(
-        &self,
-        repo_path: &Path,
-        pod_name: &str,
-    ) -> Option<broadcast::Receiver<ReconnectEvent>> {
-        self.inner.pods.subscribe(repo_path, pod_name)
-    }
-
     pub fn claude_state(&self, repo_path: &Path, pod_name: &str) -> Option<ClaudeState> {
         self.inner.pods.claude_state(repo_path, pod_name)
     }
@@ -254,17 +262,29 @@ impl Connections {
     }
 
     pub fn ensure_event_loop(&self, pod: &Arc<PodConnection>) {
+        pod.request_connection();
+        self.start_event_loop(pod, None);
+    }
+
+    pub fn ensure_repaired_event_loop(&self, pod: &Arc<PodConnection>, epoch: u64) {
+        self.start_event_loop(pod, Some(epoch));
+    }
+
+    fn start_event_loop(&self, pod: &Arc<PodConnection>, epoch: Option<u64>) {
         let Some(endpoint) = pod.endpoint() else {
             return;
         };
         let Some(host) = self.host(&pod.host()) else {
             return;
         };
-        let Some(stop) = pod.begin_event_loop() else {
+        let stop = match epoch {
+            Some(epoch) => pod.begin_event_loop_at_epoch(Some(epoch)),
+            None => pod.begin_event_loop(),
+        };
+        let Some(stop) = stop else {
             return;
         };
 
-        pod.set_status(PodConnectionStatus::Connecting);
         let thread_stop = stop.clone();
         let pod_name = pod.key().pod_name().to_string();
         let loop_pod = pod.clone();
@@ -294,7 +314,7 @@ async fn supervise_git_tunnel<F>(
     limiter: Arc<PodRepairLimiter>,
     repair: Arc<F>,
 ) where
-    F: Fn(&PodConnection, &HostKey) -> Result<()> + Send + Sync + 'static,
+    F: Fn(&Arc<PodConnection>, &HostKey) -> Result<()> + Send + Sync + 'static,
 {
     let host_key = host.key();
     let mut backoff = PodRepairBackoff::new();
@@ -302,7 +322,8 @@ async fn supervise_git_tunnel<F>(
     loop {
         if !pod.git_tunnel_supervision_enabled()
             || pod.pod_repair_is_paused()
-            || pod.git_tunnel_is_alive()
+            || !pod.wants_reconnect()
+            || (pod.git_tunnel_is_alive() && pod.has_alive_pod_server() && pod.has_event_loop())
             || !host.is_connected()
             || HostKey::from_host(&pod.host()) != host_key
         {
@@ -318,17 +339,23 @@ async fn supervise_git_tunnel<F>(
             }
             permit = limiter.acquire() => permit,
         };
-        if !host.is_connected() || HostKey::from_host(&pod.host()) != host_key {
+        if !host.is_connected()
+            || !pod.wants_reconnect()
+            || HostKey::from_host(&pod.host()) != host_key
+        {
             break;
         }
-        // Waiting for admission must not allocate one OS thread per pod.
-        // Release admission after each attempt, including before backoff.
+        // Waiting for admission or backoff must not allocate one OS thread per
+        // pod. Blocking workers are only needed for the transport work itself.
         let attempt_pod = pod.clone();
         let attempt_repair = repair.clone();
         let attempt_host = host_key.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            attempt_repair(&attempt_pod, &attempt_host)
+            let result = attempt_repair(&attempt_pod, &attempt_host);
+            if result.is_ok() {
+                permit.connected();
+            }
+            result
         })
         .await
         .expect("git tunnel repair task panicked");
@@ -410,26 +437,25 @@ fn run_pod_event_loop(
         )) else {
             continue;
         };
-        if !host.is_connected() {
+        if !host.is_connected() || !pod.wants_reconnect() {
             continue;
         }
         let Some(connected) = crate::async_runtime::block_on(pod.event_request(
             &stop,
             connection_epoch,
-            connect_pod_events(&pod.http_client, &endpoint.url, &endpoint.token),
+            connect_pod_events(&pod.http_client, &endpoint.url, &endpoint.token, || {
+                permit.connected();
+            }),
         )) else {
             continue;
         };
-        // Established streams are long-lived; only their handshake consumes
-        // admission so other pods can recover while this one stays attached.
-        drop(permit);
         let mut reader = match connected {
             Ok((reader, greeting)) => {
-                pod.apply_greeting(greeting);
-                pod.set_status(PodConnectionStatus::Connected);
+                if !pod.apply_greeting_at_epoch(greeting, connection_epoch) {
+                    continue;
+                }
+                pod.finish_connection_request();
                 info!("pod connection for '{pod_name}' established");
-                pod.emit_reconnect(ReconnectEvent::Connected);
-                backoff.reset();
                 reader
             }
             Err(e) => {
@@ -438,27 +464,17 @@ fn run_pod_event_loop(
                 } else {
                     debug!("pod event connection for '{pod_name}' failed: {e:#}");
                 }
-                pod.set_status(PodConnectionStatus::PodDisconnected);
+                pod.mark_event_disconnected(connection_epoch);
                 pod.emit_reconnect(ReconnectEvent::Failed {
                     error: format!("{e:#}"),
                 });
                 host.request_probe();
-                let Some(delay) = backoff.next_delay() else {
-                    log::warn!(
-                        "pod connection repair for '{pod_name}' paused after repeated failures"
-                    );
-                    pod.pause_pod_repair();
-                    continue;
-                };
-                let next_epoch = pod.wait_for_pod_repair_change(repair_epoch, delay);
-                if next_epoch != repair_epoch {
-                    repair_epoch = next_epoch;
-                    backoff.reset();
-                }
+                wait_after_pod_failure(&pod, &mut backoff, &mut repair_epoch);
                 continue;
             }
         };
 
+        let connected_at = Instant::now();
         let mut pending_event: Option<String> = None;
         loop {
             if stop.load(Ordering::SeqCst) {
@@ -479,10 +495,12 @@ fn run_pod_event_loop(
             };
             match read {
                 Ok(0) => {
+                    pod.mark_event_disconnected(connection_epoch);
                     info!("pod event stream for '{pod_name}' closed; reconnecting");
                     break;
                 }
                 Err(e) => {
+                    pod.mark_event_disconnected(connection_epoch);
                     info!("pod event stream for '{pod_name}' failed; reconnecting: {e}");
                     break;
                 }
@@ -494,12 +512,12 @@ fn run_pod_event_loop(
                         match pending_event.as_deref() {
                             Some("claude_state") => {
                                 if let Ok(cs) = serde_json::from_str::<Option<ClaudeState>>(data) {
-                                    pod.set_claude_state(cs);
+                                    pod.set_claude_state_at_epoch(cs, connection_epoch);
                                 }
                             }
                             Some("codex_state") => {
                                 if let Ok(xs) = serde_json::from_str::<Option<CodexState>>(data) {
-                                    pod.set_codex_state(xs);
+                                    pod.set_codex_state_at_epoch(xs, connection_epoch);
                                 }
                             }
                             Some("state") | None => {}
@@ -512,6 +530,27 @@ fn run_pod_event_loop(
                 }
             }
         }
+        if host.is_connected() && pod.pod_repair_epoch() == connection_epoch {
+            // A greeting followed immediately by EOF is not sustained recovery.
+            if connected_at.elapsed() >= Duration::from_secs(30) {
+                backoff.reset();
+            }
+            wait_after_pod_failure(&pod, &mut backoff, &mut repair_epoch);
+        }
+    }
+}
+
+fn wait_after_pod_failure(pod: &PodConnection, backoff: &mut PodRepairBackoff, epoch: &mut u64) {
+    let Some(delay) = backoff.next_delay() else {
+        let name = pod.key().pod_name();
+        log::warn!("pod connection repair for '{name}' paused after repeated failures");
+        pod.pause_pod_repair();
+        return;
+    };
+    let next_epoch = pod.wait_for_pod_repair_change(*epoch, delay);
+    if next_epoch != *epoch {
+        *epoch = next_epoch;
+        backoff.reset();
     }
 }
 
@@ -520,7 +559,7 @@ fn wait_for_pod_repair_resume(
     stop: &AtomicBool,
     repair_epoch: &mut u64,
 ) -> bool {
-    while pod.pod_repair_is_paused() {
+    while pod.pod_repair_is_paused() || !pod.wants_reconnect() {
         if stop.load(Ordering::SeqCst) {
             return false;
         }
@@ -550,34 +589,186 @@ fn wait_for_host(
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::routing::get;
+    use axum::Router;
+    use futures_util::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio::time::Instant;
+
     use super::*;
     use crate::config::ContainerEngine;
 
     #[tokio::test]
-    async fn pod_repair_admission_bounds_concurrency_and_spaces_fast_attempts() {
+    async fn pod_repair_admission_bounds_concurrency_and_cools_failed_attempts() {
         let limiter = PodRepairLimiter::new();
-        let started = Instant::now();
         let first = limiter.acquire().await;
         let second = limiter.acquire().await;
-        assert!(started.elapsed() >= POD_REPAIR_SPACING);
 
-        // Even after the spacing window, a slow handshake must keep its slot.
+        // A slow handshake must keep its slot even without failures.
         assert!(
-            tokio::time::timeout(POD_REPAIR_SPACING * 2, limiter.acquire(),)
+            tokio::time::timeout(Duration::from_millis(20), limiter.acquire())
                 .await
                 .is_err()
         );
+        let started = Instant::now();
         drop(first);
         let third = limiter.acquire().await;
-        drop(second);
-        drop(third);
+        assert!(started.elapsed() >= POD_REPAIR_FAILURE_COOLDOWN);
 
-        // Idle time cannot build up a burst allowance.
-        tokio::time::sleep(POD_REPAIR_SPACING * 2).await;
+        // Cancellation and errors both release capacity only after cooldown.
         let started = Instant::now();
-        drop(limiter.acquire().await);
-        drop(limiter.acquire().await);
-        assert!(started.elapsed() >= POD_REPAIR_SPACING);
+        drop(second);
+        let fourth = limiter.acquire().await;
+        assert!(started.elapsed() >= POD_REPAIR_FAILURE_COOLDOWN);
+        third.connected();
+        fourth.connected();
+    }
+
+    #[tokio::test]
+    async fn pod_repair_admission_fast_success_has_no_fixed_delay() {
+        let limiter = PodRepairLimiter::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for _ in 0..100 {
+                limiter.acquire().await.connected();
+            }
+        })
+        .await
+        .expect("healthy recovery must follow handshake speed, not a fixed rate");
+    }
+
+    #[tokio::test]
+    async fn reconnect_stream_that_closes_after_greeting_keeps_failure_backoff() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = PodEndpoint {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "token".into(),
+        };
+        let (attempt_tx, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/events",
+            get(move || {
+                let attempt_tx = attempt_tx.clone();
+                async move {
+                    attempt_tx.send(Instant::now()).unwrap();
+                    "event: state\ndata: {\"codex_state\":\"processing\"}\n\n"
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (events, _) = broadcast::channel(8);
+        let pods = PodConnectionRegistry::new(events);
+        let pod = pods
+            .get_or_create_async(
+                Path::new("/repo"),
+                "flapping",
+                Host::Localhost {
+                    engine: ContainerEngine::Docker,
+                },
+                "token".into(),
+                PodConnectionStatus::PodDisconnected,
+                None,
+            )
+            .await
+            .unwrap();
+        pod.set_codex_state(Some(CodexState::Processing));
+        let stop = pod.begin_event_loop().unwrap();
+        let thread_pod = pod.clone();
+        let thread = std::thread::spawn(move || {
+            run_pod_event_loop(
+                thread_pod,
+                Arc::new(HostConnection::connected_for_test()),
+                Arc::new(PodRepairLimiter::new()),
+                endpoint,
+                stop,
+            )
+        });
+        let times = tokio::time::timeout(Duration::from_secs(5), async {
+            let first = attempts.recv().await.unwrap();
+            let second = attempts.recv().await.unwrap();
+            let third = attempts.recv().await.unwrap();
+            [first, second, third]
+        })
+        .await
+        .expect("flapping stream never retried");
+        pod.stop_events();
+        tokio::task::spawn_blocking(move || thread.join().unwrap())
+            .await
+            .unwrap();
+        server.abort();
+        assert!(times[1] - times[0] >= Duration::from_millis(500));
+        assert!(times[2] - times[1] >= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn pod_repair_admission_releases_transport_before_setup_needs_git() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (git_ready, git_rx) = tokio::sync::watch::channel(false);
+        let app = Router::new().route(
+            "/events",
+            get(move || {
+                let mut git_rx = git_rx.clone();
+                async move {
+                    let progress = futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>("event: progress\ndata: waiting for git\n\n")
+                    });
+                    let greeting = futures_util::stream::once(async move {
+                        git_rx.wait_for(|ready| *ready).await.unwrap();
+                        Ok::<_, std::io::Error>("event: state\ndata: {}\n\n")
+                    });
+                    Body::from_stream(
+                        progress
+                            .chain(greeting)
+                            .chain(futures_util::stream::pending()),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let limiter = Arc::new(PodRepairLimiter::new());
+        let (connected_tx, mut connected_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut events = Vec::new();
+        for _ in 0..POD_REPAIR_CONCURRENCY {
+            let limiter = limiter.clone();
+            let url = url.clone();
+            let connected_tx = connected_tx.clone();
+            events.push(tokio::spawn(async move {
+                let client = crate::exec_stream::client_builder().build().unwrap();
+                let permit = limiter.acquire().await;
+                connect_pod_events(&client, &url, "token", || {
+                    permit.connected();
+                    connected_tx.send(()).unwrap();
+                })
+                .await
+                .unwrap();
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..POD_REPAIR_CONCURRENCY {
+                connected_rx.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("transport admission must be released before the readiness greeting");
+        assert!(events.iter().all(|event| !event.is_finished()));
+
+        // Both streams need git before they can become ready. Their transport
+        // slots must be free so the work that unblocks setup can run.
+        let git_permit = tokio::time::timeout(Duration::from_secs(1), limiter.acquire())
+            .await
+            .expect("setup streams deadlocked git repair behind their own admission");
+        git_ready.send(true).unwrap();
+        git_permit.connected();
+        for event in events {
+            tokio::time::timeout(Duration::from_secs(1), event)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        server.abort();
     }
 
     #[tokio::test]
@@ -649,6 +840,7 @@ mod tests {
             .await
             .unwrap();
         pod.enable_git_tunnel_supervision();
+        pod.request_connection();
         assert!(pod.try_schedule_git_tunnel_repair());
         let limiter = connections.pod_repair_limiter(&host);
         let first = limiter.acquire().await;
@@ -657,7 +849,7 @@ mod tests {
             pod.clone(),
             host,
             limiter,
-            Arc::new(|_: &PodConnection, _: &HostKey| -> Result<()> {
+            Arc::new(|_: &Arc<PodConnection>, _: &HostKey| -> Result<()> {
                 panic!("a moved pod must not use the old host's repair budget")
             }),
         );
@@ -684,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn host_reconnect_resumes_every_pod_on_that_host() {
+    fn host_reconnect_only_resumes_processing_or_requested_pods() {
         let (daemon_events_tx, mut daemon_events_rx) = broadcast::channel(4);
         let connections = Connections::new(daemon_events_tx);
         let docker_host = Host::Localhost {
@@ -714,6 +906,8 @@ mod tests {
             connection.mark_pod_validated_for_git_tunnel_repair();
             connection.pause_pod_repair();
         }
+        docker_a.set_codex_state(Some(CodexState::Processing));
+        podman.set_claude_state(Some(ClaudeState::Processing));
         while daemon_events_rx.try_recv().is_ok() {}
 
         let docker_key = HostKey::Localhost {
@@ -740,20 +934,34 @@ mod tests {
         connections.inner.pods.notify_host_connected(&docker_key);
 
         assert!(!docker_a.pod_repair_is_paused());
-        assert!(!docker_b.pod_repair_is_paused());
+        assert!(docker_b.pod_repair_is_paused());
         assert!(podman.pod_repair_is_paused());
         assert!(docker_a.try_schedule_git_tunnel_repair());
-        assert!(docker_b.try_schedule_git_tunnel_repair());
+        assert!(!docker_b.try_schedule_git_tunnel_repair());
         assert!(!podman.try_schedule_git_tunnel_repair());
         let mut connected_pods = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..1 {
             match daemon_events_rx.try_recv().expect("receive connect event") {
                 DaemonEvent::PodStatusChanged { pod, .. } => connected_pods.push(pod),
                 event => panic!("unexpected connect event: {event:?}"),
             }
         }
         connected_pods.sort();
-        assert_eq!(connected_pods, ["a", "b"]);
+        assert_eq!(connected_pods, ["a"]);
+        assert!(daemon_events_rx.try_recv().is_err());
+
+        let subscriber = docker_b.subscribe();
+        assert!(!docker_b.pod_repair_is_paused());
+        assert!(docker_b.try_schedule_git_tunnel_repair());
+        drop(subscriber);
+        assert!(!docker_b.wants_reconnect());
+
+        docker_b.request_connection();
+        assert!(docker_b.wants_reconnect());
+        docker_b.disable_git_tunnel_supervision();
+        docker_b.set_status(PodConnectionStatus::Connected);
+        docker_b.finish_connection_request();
+        assert!(!docker_b.wants_reconnect());
     }
 
     #[test]

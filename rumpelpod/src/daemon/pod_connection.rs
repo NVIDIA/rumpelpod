@@ -37,6 +37,21 @@ const POD_REPAIR_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const POD_REPAIR_MAX_DELAY: Duration = Duration::from_secs(30);
 const POD_REPAIR_FAILURE_LIMIT: usize = 10;
 
+fn claude_is_processing(state: Option<ClaudeState>) -> bool {
+    match state {
+        Some(ClaudeState::Processing) => true,
+        Some(ClaudeState::WaitingForInput | ClaudeState::AuthError | ClaudeState::Stopped)
+        | None => false,
+    }
+}
+
+fn codex_is_processing(state: Option<CodexState>) -> bool {
+    match state {
+        Some(CodexState::Processing) => true,
+        Some(CodexState::Idle | CodexState::Error) | None => false,
+    }
+}
+
 pub(super) struct PodRepairBackoff {
     pub(super) failures: usize,
     delay: Duration,
@@ -201,6 +216,8 @@ struct EventLoopHandle {
     _thread: Option<JoinHandle<()>>,
 }
 
+type ActivityObserver = Arc<dyn Fn(&PodConnectionKey, bool) + Send + Sync>;
+
 pub struct PodConnection {
     key: PodConnectionKey,
     host: Mutex<Host>,
@@ -216,6 +233,10 @@ pub struct PodConnection {
     ssh_agent_setup: tokio::sync::Mutex<()>,
     git_tunnel_setup: tokio::sync::Mutex<()>,
     git_tunnel_repair_scheduled: AtomicBool,
+    connection_requested: AtomicBool,
+    last_agent_processing: AtomicBool,
+    activity_observer: Mutex<Option<ActivityObserver>>,
+    activity_update: Mutex<()>,
     repair_state: Arc<PodRepairState>,
     event_loop: Mutex<Option<EventLoopHandle>>,
     events_tx: broadcast::Sender<DaemonEvent>,
@@ -249,6 +270,10 @@ impl PodConnection {
             ssh_agent_setup: tokio::sync::Mutex::new(()),
             git_tunnel_setup: tokio::sync::Mutex::new(()),
             git_tunnel_repair_scheduled: AtomicBool::new(false),
+            connection_requested: AtomicBool::new(false),
+            last_agent_processing: AtomicBool::new(false),
+            activity_observer: Mutex::new(None),
+            activity_update: Mutex::new(()),
             repair_state: Arc::new(PodRepairState::default()),
             event_loop: Mutex::new(None),
             events_tx,
@@ -331,7 +356,87 @@ impl PodConnection {
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ReconnectEvent> {
-        self.tx.subscribe()
+        let rx = self.tx.subscribe();
+        if self.repair_state.is_paused() || self.status() != PodConnectionStatus::Connected {
+            self.repair_state.resume();
+        }
+        if self.status() == PodConnectionStatus::Connected {
+            self.finish_connection_request();
+        }
+        rx
+    }
+
+    pub fn agent_is_processing(&self) -> bool {
+        self.last_agent_processing.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn restore_agent_processing(&self) {
+        let _update = self.activity_update.lock().unwrap();
+        self.last_agent_processing.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn set_activity_observer(&self, observer: ActivityObserver) {
+        let _update = self.activity_update.lock().unwrap();
+        *self.activity_observer.lock().unwrap() = Some(observer);
+    }
+
+    fn update_agent_activity(&self, epoch: Option<u64>, update: impl FnOnce()) -> bool {
+        // Stop/recreate and observations must persist in the same order. An
+        // old event reader must not write Processing after stop wrote idle.
+        let _guard = self.activity_update.lock().unwrap();
+        if epoch.is_some_and(|epoch| epoch != self.pod_repair_epoch()) {
+            return false;
+        }
+        update();
+        let processing =
+            claude_is_processing(self.claude_state()) || codex_is_processing(self.codex_state());
+        let previous = self
+            .last_agent_processing
+            .swap(processing, Ordering::SeqCst);
+        if previous != processing {
+            let observer = self.activity_observer.lock().unwrap().clone();
+            if let Some(observer) = observer {
+                observer(&self.key, processing);
+            }
+        }
+        let _ = self.events_tx.send(DaemonEvent::PodStatusChanged {
+            repository: self.key.repo_path.to_string_lossy().into_owned(),
+            pod: self.key.pod_name.clone(),
+        });
+        true
+    }
+
+    pub fn wants_reconnect(&self) -> bool {
+        self.connection_requested.load(Ordering::SeqCst)
+            || self.tx.receiver_count() > 0
+            || self.agent_is_processing()
+    }
+
+    pub fn request_connection(&self) {
+        // Foreground preparation returns before its event observer is ready.
+        // Keep this one request alive until both transports finish connecting.
+        self.connection_requested.store(true, Ordering::SeqCst);
+        self.finish_connection_request();
+        if self.connection_requested.load(Ordering::SeqCst)
+            && (self.repair_state.is_paused() || self.status() != PodConnectionStatus::Connected)
+        {
+            self.repair_state.resume();
+        }
+    }
+
+    pub(super) fn finish_connection_request(&self) {
+        if self.status() == PodConnectionStatus::Connected {
+            let resources = self.resources.lock().unwrap();
+            if !resources.supervise_git_tunnel
+                || resources
+                    .git_tunnel
+                    .as_ref()
+                    .is_some_and(|tunnel| tunnel.is_alive())
+            {
+                self.connection_requested.store(false, Ordering::SeqCst);
+                self.emit_reconnect(ReconnectEvent::Connected);
+            }
+        }
     }
 
     pub fn has_event_loop(&self) -> bool {
@@ -424,8 +529,12 @@ impl PodConnection {
     /// Reserve the event-loop slot. Returns the stop flag for the
     /// thread `Connections` will spawn.
     pub(super) fn begin_event_loop(&self) -> Option<Arc<AtomicBool>> {
+        self.begin_event_loop_at_epoch(None)
+    }
+
+    pub(super) fn begin_event_loop_at_epoch(&self, epoch: Option<u64>) -> Option<Arc<AtomicBool>> {
         let mut event_loop = self.event_loop.lock().unwrap();
-        if event_loop.is_some() {
+        if event_loop.is_some() || epoch.is_some_and(|epoch| epoch != self.pod_repair_epoch()) {
             return None;
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -433,7 +542,33 @@ impl PodConnection {
             stop: stop.clone(),
             _thread: None,
         });
+        self.set_status(PodConnectionStatus::Connecting);
         Some(stop)
+    }
+
+    pub(super) fn install_repaired_routes(
+        &self,
+        proxy: crate::exec_proxy::ExecProxyHandle,
+        ports: Option<Vec<crate::exec_proxy::ExecProxyHandle>>,
+        epoch: u64,
+    ) -> bool {
+        let mut resources = self.resources.lock().unwrap();
+        if !resources.supervise_git_tunnel
+            || self.pod_repair_epoch() != epoch
+            || resources
+                .pod_server
+                .as_ref()
+                .is_some_and(|proxy| proxy.is_alive())
+        {
+            return false;
+        }
+        // Publish a complete set without changing identity. Stop/recreation
+        // invalidates the epoch and disposes of any superseded resources.
+        resources.pod_server = Some(proxy);
+        if let Some(ports) = ports {
+            resources.forwarded_ports = Some(ports);
+        }
+        true
     }
 
     pub(super) fn finish_event_loop(&self, thread: JoinHandle<()>) {
@@ -470,7 +605,10 @@ impl PodConnection {
         resources.supervise_git_tunnel = true;
         resources.validate_pod_before_git_tunnel_repair = false;
         drop(resources);
-        self.repair_state.resume();
+        if self.repair_state.is_paused() {
+            self.repair_state.resume();
+        }
+        self.finish_connection_request();
     }
 
     pub fn enable_git_tunnel_supervision(&self) {
@@ -478,7 +616,9 @@ impl PodConnection {
         resources.supervise_git_tunnel = true;
         resources.validate_pod_before_git_tunnel_repair = resources.git_tunnel.is_none();
         drop(resources);
-        self.repair_state.resume();
+        if self.repair_state.is_paused() {
+            self.repair_state.resume();
+        }
     }
 
     pub fn git_tunnel_supervision_enabled(&self) -> bool {
@@ -506,8 +646,8 @@ impl PodConnection {
         resources.git_tunnel = None;
     }
 
-    pub fn git_tunnel_setup_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        crate::async_runtime::block_on(self.git_tunnel_setup_guard_async())
+    pub fn try_git_tunnel_setup_guard(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.git_tunnel_setup.try_lock().ok()
     }
 
     pub async fn git_tunnel_setup_guard_async(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -515,15 +655,20 @@ impl PodConnection {
     }
 
     pub fn try_schedule_git_tunnel_repair(&self) -> bool {
-        if self.repair_state.is_paused() {
+        if self.repair_state.is_paused() || !self.wants_reconnect() {
             return false;
         }
         let resources = self.resources.lock().unwrap();
         if !resources.supervise_git_tunnel
-            || resources
+            || (resources
                 .git_tunnel
                 .as_ref()
                 .is_some_and(|handle| handle.is_alive())
+                && resources
+                    .pod_server
+                    .as_ref()
+                    .is_some_and(|handle| handle.is_alive())
+                && self.has_event_loop())
         {
             return false;
         }
@@ -544,6 +689,7 @@ impl PodConnection {
     }
 
     pub fn pause_pod_repair(&self) {
+        self.connection_requested.store(false, Ordering::SeqCst);
         self.repair_state.pause();
     }
 
@@ -594,6 +740,8 @@ impl PodConnection {
             resources.git_tunnel = Some(handle);
             resources.validate_pod_before_git_tunnel_repair = false;
         }
+        drop(resources);
+        self.finish_connection_request();
     }
 
     pub fn host(&self) -> Host {
@@ -604,21 +752,50 @@ impl PodConnection {
         replace_and_emit(&self.status, status, &self.events_tx, &self.key);
     }
 
+    pub(super) fn mark_event_disconnected(&self, epoch: u64) {
+        let _update = self.activity_update.lock().unwrap();
+        if self.pod_repair_epoch() == epoch {
+            self.set_status(PodConnectionStatus::PodDisconnected);
+        }
+    }
+
     pub(super) fn emit_reconnect(&self, event: ReconnectEvent) {
         let _ = self.tx.send(event);
     }
 
+    pub(super) fn apply_greeting_at_epoch(&self, greeting: GreetingState, epoch: u64) -> bool {
+        self.update_agent_activity(Some(epoch), || {
+            *self.claude_state.lock().unwrap() = greeting.claude;
+            *self.codex_state.lock().unwrap() = greeting.codex;
+            self.set_status(PodConnectionStatus::Connected);
+        })
+    }
+
+    pub(super) fn set_claude_state_at_epoch(&self, state: Option<ClaudeState>, epoch: u64) {
+        self.update_agent_activity(Some(epoch), || {
+            *self.claude_state.lock().unwrap() = state;
+        });
+    }
+
+    pub(super) fn set_codex_state_at_epoch(&self, state: Option<CodexState>, epoch: u64) {
+        self.update_agent_activity(Some(epoch), || {
+            *self.codex_state.lock().unwrap() = state;
+        });
+    }
+
+    #[cfg(test)]
     pub(super) fn apply_greeting(&self, greeting: GreetingState) {
-        self.set_claude_state(greeting.claude);
-        self.set_codex_state(greeting.codex);
+        self.apply_greeting_at_epoch(greeting, self.pod_repair_epoch());
     }
 
+    #[cfg(test)]
     pub(super) fn set_claude_state(&self, state: Option<ClaudeState>) {
-        replace_and_emit(&self.claude_state, state, &self.events_tx, &self.key);
+        self.set_claude_state_at_epoch(state, self.pod_repair_epoch());
     }
 
+    #[cfg(test)]
     pub(super) fn set_codex_state(&self, state: Option<CodexState>) {
-        replace_and_emit(&self.codex_state, state, &self.events_tx, &self.key);
+        self.set_codex_state_at_epoch(state, self.pod_repair_epoch());
     }
 
     pub(super) fn resume_repair(&self) {
@@ -728,7 +905,7 @@ impl PodConnection {
     }
 
     pub fn notify_host_connected(&self) {
-        if self.status() == PodConnectionStatus::Stopped {
+        if self.status() == PodConnectionStatus::Stopped || !self.wants_reconnect() {
             return;
         }
         self.repair_state.resume();
@@ -766,6 +943,11 @@ impl PodConnection {
 
     pub fn stop_events(&self) {
         self.stop_event_loop();
+        self.update_agent_activity(None, || {
+            *self.claude_state.lock().unwrap() = None;
+            *self.codex_state.lock().unwrap() = None;
+        });
+        self.connection_requested.store(false, Ordering::SeqCst);
         self.set_status(PodConnectionStatus::Stopped);
         self.disable_git_tunnel_supervision();
         self.emit_reconnect(ReconnectEvent::Stopped);
@@ -788,10 +970,11 @@ impl PodConnection {
     }
 
     fn stop_event_loop(&self) {
-        if let Some(handle) = self.event_loop.lock().unwrap().take() {
+        let mut event_loop = self.event_loop.lock().unwrap();
+        if let Some(handle) = event_loop.take() {
             handle.stop.store(true, Ordering::SeqCst);
-            self.repair_state.signal();
         }
+        self.repair_state.signal();
     }
 }
 
@@ -891,20 +1074,6 @@ impl PodConnectionRegistry {
             .and_then(|connection| connection.endpoint())
     }
 
-    pub fn subscribe(
-        &self,
-        repo_path: &Path,
-        pod_name: &str,
-    ) -> Option<broadcast::Receiver<ReconnectEvent>> {
-        self.get(repo_path, pod_name).and_then(|connection| {
-            if connection.status() == PodConnectionStatus::Stopped || !connection.has_event_loop() {
-                None
-            } else {
-                Some(connection.subscribe())
-            }
-        })
-    }
-
     pub fn claude_state(&self, repo_path: &Path, pod_name: &str) -> Option<ClaudeState> {
         self.get(repo_path, pod_name)
             .and_then(|connection| connection.claude_state())
@@ -950,10 +1119,11 @@ pub(super) async fn connect_pod_events(
     client: &reqwest::Client,
     url: &str,
     token: &str,
+    on_connected: impl FnOnce(),
 ) -> Result<(PodEventReader, GreetingState)> {
     // Established streams send a heartbeat every 30 seconds. An idle read
     // deadline detects a blackhole even when the local proxy accepts TCP.
-    connect_pod_events_with_timeout(client, url, token, Duration::from_secs(45)).await
+    connect_pod_events_with_timeout(client, url, token, Duration::from_secs(45), on_connected).await
 }
 
 async fn connect_pod_events_with_timeout(
@@ -961,6 +1131,7 @@ async fn connect_pod_events_with_timeout(
     url: &str,
     token: &str,
     read_timeout: Duration,
+    on_connected: impl FnOnce(),
 ) -> Result<(PodEventReader, GreetingState)> {
     // Limit idle reads on this event stream, not on the shared client:
     // executions can legitimately remain silent for longer than this deadline.
@@ -979,6 +1150,10 @@ async fn connect_pod_events_with_timeout(
         let status = response.status();
         return Err(anyhow::anyhow!("pod events returned {status}"));
     }
+
+    // A live transport may stream setup progress indefinitely. Release host
+    // admission before readiness, since setup itself may need git repair.
+    on_connected();
 
     let stream = futures_util::stream::try_unfold(response, move |mut response| async move {
         let chunk = tokio::time::timeout(read_timeout, response.chunk())
@@ -1054,6 +1229,64 @@ mod tests {
     use super::*;
     use crate::config::ContainerEngine;
 
+    #[test]
+    fn reconnect_eligibility_requires_processing_or_current_demand() {
+        let (events, _) = broadcast::channel(16);
+        let pod = PodConnection::new(
+            events,
+            PodConnectionKey::new("/repo", "pod"),
+            Host::Localhost {
+                engine: ContainerEngine::Docker,
+            },
+            "token".into(),
+            PodConnectionStatus::HostDisconnected,
+            None,
+        );
+        assert!(!pod.wants_reconnect());
+        for (state, expected) in [
+            (ClaudeState::Processing, true),
+            (ClaudeState::WaitingForInput, false),
+            (ClaudeState::AuthError, false),
+            (ClaudeState::Stopped, false),
+        ] {
+            pod.set_claude_state(Some(state));
+            assert_eq!(pod.wants_reconnect(), expected, "{state:?}");
+        }
+        for (state, expected) in [
+            (CodexState::Processing, true),
+            (CodexState::Idle, false),
+            (CodexState::Error, false),
+        ] {
+            pod.set_codex_state(Some(state));
+            assert_eq!(pod.wants_reconnect(), expected, "{state:?}");
+        }
+        pod.restore_agent_processing();
+        assert!(pod.wants_reconnect());
+        pod.apply_greeting(GreetingState {
+            claude: None,
+            codex: Some(CodexState::Idle),
+        });
+        assert!(!pod.wants_reconnect());
+        pod.set_status(PodConnectionStatus::PodDisconnected);
+        pod.request_connection();
+        assert!(pod.wants_reconnect());
+        pod.set_status(PodConnectionStatus::Connected);
+        pod.finish_connection_request();
+        assert!(!pod.wants_reconnect());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let recorded = observed.clone();
+        pod.set_activity_observer(Arc::new(move |_, active| {
+            recorded.lock().unwrap().push(active)
+        }));
+        pod.set_codex_state(Some(CodexState::Processing));
+        let old_epoch = pod.pod_repair_epoch();
+        pod.stop_events();
+        pod.set_codex_state_at_epoch(Some(CodexState::Processing), old_epoch);
+        assert!(!pod.agent_is_processing());
+        assert_eq!(*observed.lock().unwrap(), [true, false]);
+        assert!(pod.begin_event_loop_at_epoch(Some(old_epoch)).is_none());
+    }
+
     #[tokio::test]
     async fn pod_events_idle_timeout_does_not_limit_shared_client_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1084,6 +1317,7 @@ mod tests {
             &url,
             "test-token",
             Duration::from_millis(100),
+            || {},
         )
         .await
         .unwrap();
@@ -1189,6 +1423,7 @@ mod tests {
                     &url,
                     "test-token",
                     Duration::from_millis(200),
+                    || {},
                 )
                 .await
                 {
@@ -1231,6 +1466,7 @@ mod tests {
             &url,
             "test-token",
             Duration::from_millis(500),
+            || {},
         )
         .await
         .unwrap();

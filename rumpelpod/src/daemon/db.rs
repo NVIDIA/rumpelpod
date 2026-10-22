@@ -95,6 +95,7 @@ pub struct PodRecord {
     /// JSON array of "KEY=VALUE" strings -- the --local-env arguments
     /// the pod was created with.
     pub local_env: String,
+    pub agent_processing: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -123,6 +124,7 @@ const SCHEMA_SQL: &str = indoc! {"
         on_create_ran INTEGER NOT NULL DEFAULT 0,
         post_create_ran INTEGER NOT NULL DEFAULT 0,
         claude_config_copied INTEGER NOT NULL DEFAULT 0,
+        agent_processing INTEGER NOT NULL DEFAULT 0,
         token TEXT NOT NULL,
         image TEXT NOT NULL,
         devcontainer_json TEXT NOT NULL,
@@ -168,6 +170,8 @@ const PRE_COMPOSE_MIGRATION_SQL: &str = indoc! {"
         ADD COLUMN compose_config TEXT NOT NULL DEFAULT '';
     ALTER TABLE forwarded_ports
         ADD COLUMN service TEXT NOT NULL DEFAULT '';
+    ALTER TABLE pods
+        ADD COLUMN agent_processing INTEGER NOT NULL DEFAULT 0;
 "};
 
 fn get_schema_hash() -> String {
@@ -404,6 +408,7 @@ fn row_to_pod_record(row: &rusqlite::Row) -> rusqlite::Result<PodRecord> {
         local_env: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+        agent_processing: row.get(13)?,
     })
 }
 
@@ -413,7 +418,7 @@ pub fn get_pod(conn: &Connection, repo_path: &Path, name: &str) -> Result<Option
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at
+            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at, agent_processing
              FROM pods WHERE repo_path = ? AND name = ?",
         )
         .context("failed to prepare query")?;
@@ -433,7 +438,7 @@ pub fn get_pod(conn: &Connection, repo_path: &Path, name: &str) -> Result<Option
 pub fn get_pod_by_id(conn: &Connection, id: PodId) -> Result<Option<PodRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at
+            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at, agent_processing
              FROM pods WHERE id = ?",
         )
         .context("failed to prepare query")?;
@@ -452,7 +457,7 @@ pub fn get_pod_by_id(conn: &Connection, id: PodId) -> Result<Option<PodRecord>> 
 pub fn get_pod_by_token(conn: &Connection, token: &str) -> Result<Option<PodRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at
+            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at, agent_processing
              FROM pods WHERE token = ?",
         )
         .context("failed to prepare query")?;
@@ -467,11 +472,28 @@ pub fn get_pod_by_token(conn: &Connection, token: &str) -> Result<Option<PodReco
     }
 }
 
+pub fn record_agent_activity(
+    conn: &Connection,
+    repo_path: &Path,
+    name: &str,
+    token: &str,
+    processing: bool,
+) -> Result<()> {
+    // Late observations from a removed or recreated pod must not wake its
+    // replacement after the next daemon restart.
+    conn.execute(
+        "UPDATE pods SET agent_processing = ? WHERE repo_path = ? AND name = ? AND token = ?",
+        rusqlite::params![processing, repo_path.to_string_lossy(), name, token],
+    )
+    .context("persisting last observed agent activity")?;
+    Ok(())
+}
+
 /// List all pods with the given status, across all repos.
 pub fn list_pods_by_status(conn: &Connection, status: PodStatus) -> Result<Vec<PodRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at
+            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at, agent_processing
              FROM pods WHERE status = ?
              ORDER BY repo_path ASC, name ASC",
         )
@@ -495,7 +517,7 @@ pub fn list_pods(conn: &Connection, repo_path: &Path) -> Result<Vec<PodRecord>> 
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at
+            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at, agent_processing
              FROM pods WHERE repo_path = ?
              ORDER BY name ASC",
         )
@@ -517,7 +539,7 @@ pub fn list_pods(conn: &Connection, repo_path: &Path) -> Result<Vec<PodRecord>> 
 pub fn list_all_pods(conn: &Connection) -> Result<Vec<PodRecord>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at
+            "SELECT id, repo_path, name, host, status, token, image, devcontainer_json, agent_service, compose_config, local_env, created_at, updated_at, agent_processing
              FROM pods
              ORDER BY repo_path ASC, name ASC",
         )
@@ -676,6 +698,46 @@ mod tests {
         assert_eq!(pod.name, "dev");
         assert_eq!(pod.host, serde_json::to_string(&localhost()).unwrap());
         assert_eq!(pod.status, PodStatus::Initializing);
+    }
+
+    #[test]
+    fn agent_activity_survives_restart_and_rejects_stale_tokens() {
+        let (directory, conn) = test_db();
+        let repo = Path::new("/repo");
+        create_pod(
+            &conn,
+            repo,
+            "active",
+            &localhost(),
+            "token",
+            "image",
+            "{}",
+            "[]",
+        )
+        .unwrap();
+        record_agent_activity(&conn, repo, "active", "token", true).unwrap();
+        drop(conn);
+        let conn = open_db(&directory.path().join("test.db")).unwrap();
+        assert!(
+            get_pod(&conn, repo, "active")
+                .unwrap()
+                .unwrap()
+                .agent_processing
+        );
+        record_agent_activity(&conn, repo, "active", "old-token", false).unwrap();
+        assert!(
+            get_pod(&conn, repo, "active")
+                .unwrap()
+                .unwrap()
+                .agent_processing
+        );
+        record_agent_activity(&conn, repo, "active", "token", false).unwrap();
+        assert!(
+            !get_pod(&conn, repo, "active")
+                .unwrap()
+                .unwrap()
+                .agent_processing
+        );
     }
 
     #[test]
