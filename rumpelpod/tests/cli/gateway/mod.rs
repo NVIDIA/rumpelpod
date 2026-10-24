@@ -15,12 +15,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use indoc::{formatdoc, indoc};
+use rumpelpod::daemon::protocol::{Daemon, DaemonClient, PodListMode, PodStatus};
+use rumpelpod::daemon::reconnect::ReconnectEvent;
 use rumpelpod::CommandExt;
 use sha2::{Digest, Sha256};
 
 use crate::common::{
-    create_commit, pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo,
-    TEST_REPO_PATH,
+    create_commit, pod_command, set_pod_codex_state, write_test_devcontainer, TestDaemon, TestHome,
+    TestRepo, TEST_REPO_PATH,
 };
 use crate::executor::{self, ExecutorResources};
 
@@ -3677,6 +3679,7 @@ fn gateway_tunnel_recovers_without_reenter() {
         .args(["enter", "--create", pod_name, "--", "true"])
         .success()
         .expect("initial enter failed");
+    set_pod_codex_state(&repo, &daemon, pod_name, "processing");
 
     let container_id = {
         let output = Command::new("docker")
@@ -3871,15 +3874,14 @@ fn gateway_reconnect_push() {
 }
 
 #[test]
-fn gateway_daemon_restart_pushes_without_reenter() {
-    // Restore-on-startup only works for localhost Docker pods.
+fn gateway_daemon_restart_only_restores_processing_pods() {
+    // This test creates the offline commit with local docker exec.
     if !matches!(executor::executor_mode(), executor::ExecutorMode::Docker) {
         executor::skip_test();
         return;
     }
-    // Commits made while the daemon is down should be pushed when the
-    // daemon restarts, without anyone re-entering the pod.  The daemon
-    // restores connections to running pods on startup.
+    // Only observed processing activity justifies unattended recovery after
+    // restart. An idle sibling must remain dormant until explicitly requested.
     let repo = TestRepo::new();
     let home = TestHome::new();
     let executor = ExecutorResources::setup(&home);
@@ -3893,6 +3895,13 @@ fn gateway_daemon_restart_pushes_without_reenter() {
         .args(["enter", "--create", pod_name, "--", "echo", "setup"])
         .success()
         .expect("initial enter failed");
+    set_pod_codex_state(&repo, &daemon, pod_name, "processing");
+
+    pod_command(&repo, &daemon)
+        .args(["enter", "--create", "idle-sibling", "--", "true"])
+        .success()
+        .unwrap();
+    set_pod_codex_state(&repo, &daemon, "idle-sibling", "idle");
 
     let host_head = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -3971,12 +3980,18 @@ fn gateway_daemon_restart_pushes_without_reenter() {
         "host should not have the offline commit yet"
     );
 
-    // Restart the daemon -- do NOT re-enter the pod.  The daemon
-    // should restore connections to running pods on startup and the
-    // gateway refresh queues a push of all branches.
-    let _daemon = TestDaemon::start(&home);
-
+    let restarted = TestDaemon::start(&home);
     wait_for_ref_commit(repo.path(), &expected_ref, &offline_commit);
+    let client = DaemonClient::new_unix(&restarted.socket_path);
+    let pods = client
+        .list_pods(repo.path().to_path_buf(), PodListMode::Offline, false)
+        .unwrap();
+    let idle = pods.iter().find(|pod| pod.name == "idle-sibling").unwrap();
+    assert_eq!(idle.status, PodStatus::Disconnected);
+    assert!(client
+        .pod_reconnect_events(repo.path(), "idle-sibling")
+        .unwrap()
+        .any(|event| matches!(event.unwrap(), ReconnectEvent::Connected)));
 }
 
 #[test]

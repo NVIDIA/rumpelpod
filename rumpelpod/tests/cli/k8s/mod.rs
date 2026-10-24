@@ -24,7 +24,8 @@ use retry::OperationResult;
 use rumpelpod::CommandExt;
 
 use crate::common::{
-    pod_command, write_test_devcontainer, TestDaemon, TestHome, TestRepo, TEST_REPO_PATH,
+    pod_command, set_pod_codex_state, write_test_devcontainer, TestDaemon, TestHome, TestRepo,
+    TEST_REPO_PATH,
 };
 use crate::executor::{
     executor_mode, json_kubernetes_context, skip_test, substitute_namespace, ExecutorMode,
@@ -1430,6 +1431,8 @@ fn k8s_tunnel_reconnect() {
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "first");
 
+    set_pod_codex_state(&repo, &daemon, pod_name, "processing");
+
     // Find the actual K8s pod name.
     let kubectl_output = Command::new("kubectl")
         .args(["--context", &executor.context])
@@ -1536,7 +1539,7 @@ fn k8s_tunnel_reconnect() {
     }
 }
 
-// K8s mirror of gateway_daemon_restart_pushes_without_reenter: a commit
+// K8s mirror of gateway_daemon_restart_only_restores_processing_pods: a commit
 // made while the daemon is down should be pushed when daemon-owned
 // tunnel supervision resumes, without another client command.
 #[test]
@@ -1594,6 +1597,8 @@ fn k8s_gateway_reconnect_push() {
         .trim()
         .to_string();
     assert!(!k8s_pod_a.is_empty(), "could not find k8s pod for {pod_a}");
+
+    set_pod_codex_state(&repo, &daemon, pod_a, "processing");
 
     // Kill the daemon so the tunnel to pod A goes down.
     daemon.kill();

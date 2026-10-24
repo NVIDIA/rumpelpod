@@ -29,11 +29,14 @@ use indoc::formatdoc;
 use super::{write_ssh_config, SshRemoteHost};
 use crate::codex::common::{setup_controlled_home, CodexSession};
 use crate::common::{
-    assert_process_exited, pod_command, wait_for_pid, write_test_devcontainer, TestDaemon,
-    TestHome, TestProcess, TestRepo, TEST_REPO_PATH,
+    assert_process_exited, pod_command, set_pod_codex_state, wait_for_pid, write_test_devcontainer,
+    TestDaemon, TestHome, TestProcess, TestRepo, TEST_REPO_PATH,
 };
 use crate::executor;
-use rumpelpod::daemon::protocol::{Daemon, DaemonClient, PodListMode, PodStatus};
+use rumpelpod::daemon::protocol::{
+    ConnectPodRequest, Daemon, DaemonClient, PodListMode, PodStatus,
+};
+use rumpelpod::daemon::reconnect::ReconnectEvent;
 use rumpelpod::CommandExt;
 
 const FAST_PROBE_MS: &str = "3000";
@@ -120,6 +123,7 @@ fn start_mux_harness_with_env(pod_names: &[&str], extra_env: &[(&str, &str)]) ->
             .args(["enter", "--create", name, "--", "true"])
             .success()
             .unwrap_or_else(|e| panic!("creating pod {name} failed: {e:#}"));
+        set_pod_codex_state(&repo, &daemon, name, "processing");
     }
 
     let harness = MuxHarness {
@@ -411,6 +415,199 @@ fn mux_both_pods_sync_after_client_blackhole() {
     drop(hole);
     wait_for_ref(harness.repo.path(), &pod_ref("alpha"), &oid_a);
     wait_for_ref(harness.repo.path(), &pod_ref("beta"), &oid_b);
+}
+
+#[test]
+fn mux_reconnect_only_wakes_processing_or_explicitly_requested_pods() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let harness = start_mux_harness(&["working", "requested", "idle"]);
+    set_pod_codex_state(&harness.repo, &harness.daemon, "requested", "idle");
+    set_pod_codex_state(&harness.repo, &harness.daemon, "idle", "idle");
+    let Some(hole) = ClientBlackhole::install(&harness.remote) else {
+        executor::skip_test();
+        return;
+    };
+    TestProcess::spawn(pod_command(&harness.repo, &harness.daemon).args(["connect", "working"]))
+        .failure(Duration::from_secs(10), "host probe must report outage");
+    let client = DaemonClient::new_unix(&harness.daemon.socket_path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pods = client
+            .list_pods(
+                harness.repo.path().to_path_buf(),
+                PodListMode::Offline,
+                false,
+            )
+            .unwrap();
+        if pods.iter().all(|pod| pod.status == PodStatus::Disconnected) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host loss not observed: {pods:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let working_commit = commit_in_pod(&harness.remote, "working", "active-offline");
+    let idle_commit = commit_in_pod(&harness.remote, "idle", "idle-offline");
+    drop(hole);
+    wait_for_ref(harness.repo.path(), &pod_ref("working"), &working_commit);
+
+    pod_command(&harness.repo, &harness.daemon)
+        .args(["connect", "requested"])
+        .success()
+        .unwrap();
+    // Allow several supervisor ticks; entering one sibling must not revive
+    // another idle pod or flush its pending commits.
+    std::thread::sleep(Duration::from_secs(3));
+    let pods = client
+        .list_pods(
+            harness.repo.path().to_path_buf(),
+            PodListMode::Offline,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        pods.iter().find(|pod| pod.name == "idle").unwrap().status,
+        PodStatus::Disconnected
+    );
+    let idle_ref = Command::new("git")
+        .args(["rev-parse", &pod_ref("idle")])
+        .current_dir(harness.repo.path())
+        .success()
+        .unwrap();
+    assert_ne!(String::from_utf8_lossy(&idle_ref).trim(), idle_commit);
+
+    assert!(client
+        .pod_reconnect_events(harness.repo.path(), "idle")
+        .unwrap()
+        .any(|event| matches!(event.unwrap(), ReconnectEvent::Connected)));
+    wait_for_ref(harness.repo.path(), &pod_ref("idle"), &idle_commit);
+}
+
+#[test]
+fn mux_recovery_bounds_event_and_git_handshakes_together() {
+    if skip_if_unsupported() {
+        return;
+    }
+    let pods = ["one", "two", "three", "four"];
+    let harness = start_mux_harness(&pods);
+    harness.home.link_local_bins(&["rmdir"]);
+    let Some(hole) = ClientBlackhole::install(&harness.remote) else {
+        executor::skip_test();
+        return;
+    };
+    TestProcess::spawn(pod_command(&harness.repo, &harness.daemon).args(["connect", "one"]))
+        .failure(Duration::from_secs(10), "host probe must report outage");
+    let client = DaemonClient::new_unix(&harness.daemon.socket_path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = client
+            .list_pods(
+                harness.repo.path().to_path_buf(),
+                PodListMode::Offline,
+                false,
+            )
+            .unwrap();
+        if status
+            .iter()
+            .all(|pod| pod.status == PodStatus::Disconnected)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pods still connected: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let docker = harness.home.bin_dir().join("docker");
+    let real_docker = fs::canonicalize(&docker).unwrap();
+    let fault = harness.home.path().join("handshakes");
+    fs::create_dir(&fault).unwrap();
+    fs::remove_file(&docker).unwrap();
+    // Both paths must share admission. A limit on each independently still
+    // overloads the host when event streams and git tunnels recover together.
+    fs::write(
+        &docker,
+        formatdoc! {r#"
+            #!/bin/sh
+            set -eu
+            case " $* " in
+                *" tcp-proxy "*|*" tunnel-server "*)
+                    slot=''
+                    for candidate in 1 2; do
+                        if mkdir '{fault}/slot-'"$candidate" 2>/dev/null; then
+                            slot='{fault}/slot-'"$candidate"
+                            break
+                        fi
+                    done
+                    if [ -z "$slot" ]; then
+                        touch '{fault}/overflow'
+                    fi
+                    printf '%s\n' "$*" >> '{fault}/attempts'
+                    sleep 2
+                    if [ -n "$slot" ]; then
+                        rmdir "$slot"
+                    fi
+                    ;;
+            esac
+            exec '{real_docker}' "$@"
+        "#, fault = fault.display(), real_docker = real_docker.display()},
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let commits: Vec<_> = pods
+        .iter()
+        .map(|name| {
+            (
+                pod_ref(name),
+                commit_in_pod(&harness.remote, name, "bounded-recovery"),
+            )
+        })
+        .collect();
+    drop(hole);
+    let expected: Vec<_> = commits
+        .iter()
+        .map(|(git_ref, oid)| (git_ref.as_str(), oid.as_str()))
+        .collect();
+    wait_for_refs(harness.repo.path(), &expected);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        // Cached listing also calls connecting pods "running". The prepared
+        // endpoint is available only after the event greeting has arrived.
+        if pods.iter().all(|name| {
+            client
+                .prepared_pod_connection(ConnectPodRequest {
+                    pod_name: (*name).into(),
+                    repo_path: harness.repo.path().to_path_buf(),
+                    client_context: Default::default(),
+                })
+                .unwrap()
+                .is_some()
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "event streams did not recover");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let attempts = fs::read_to_string(fault.join("attempts")).unwrap();
+    assert!(
+        attempts.matches("tcp-proxy").count() >= pods.len(),
+        "{attempts}"
+    );
+    assert!(
+        attempts.matches("tunnel-server").count() >= pods.len(),
+        "{attempts}"
+    );
+    assert!(
+        !fault.join("overflow").exists(),
+        "too many simultaneous handshakes:\n{attempts}"
+    );
 }
 
 /// The mux master process is killed and its socket is left behind.

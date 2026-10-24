@@ -19,8 +19,8 @@ use nix::sys::signal::kill;
 use nix::unistd::Pid;
 use rumpelpod::config::{load_json_config, ContainerEngine, Host};
 use rumpelpod::daemon::protocol::{
-    ContainerId, Daemon, DaemonClient, EnsurePiConfigRequest, LaunchProgress, LaunchResult,
-    PodLaunchParams, PodName,
+    ConnectPodRequest, ContainerId, Daemon, DaemonClient, EnsurePiConfigRequest, LaunchProgress,
+    LaunchResult, PodLaunchParams, PodListMode, PodName,
 };
 use rumpelpod::CommandExt;
 use tempfile::{NamedTempFile, TempDir};
@@ -33,6 +33,59 @@ pub const TEST_USER_UID: u32 = 1007;
 
 /// Standard repository path inside test containers.
 pub const TEST_REPO_PATH: &str = "/home/testuser/workspace";
+
+/// Model the state observation that determines whether unattended recovery is
+/// useful, without making connection tests depend on an actual agent turn.
+pub fn set_pod_codex_state(repo: &TestRepo, daemon: &TestDaemon, name: &str, state: &str) {
+    let client = DaemonClient::new_unix(&daemon.socket_path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let endpoint = loop {
+        if let Some(endpoint) = client
+            .prepared_pod_connection(ConnectPodRequest {
+                pod_name: name.into(),
+                repo_path: repo.path().to_path_buf(),
+                client_context: Default::default(),
+            })
+            .unwrap()
+        {
+            break endpoint;
+        }
+        assert!(Instant::now() < deadline, "pod {name} never became ready");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    reqwest::blocking::Client::new()
+        .post(format!("{}/codex-state", endpoint.container_url))
+        .bearer_auth(endpoint.container_token)
+        .json(&serde_json::json!({"state": state}))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    loop {
+        let pods = client
+            .list_pods(repo.path().to_path_buf(), PodListMode::Offline, false)
+            .unwrap();
+        if pods
+            .iter()
+            .any(|pod| pod.name == name && serde_json::to_value(pod.codex_state).unwrap() == state)
+        {
+            let db =
+                rumpelpod::daemon::db::open_db(&daemon.home_path.join("state/rumpelpod/db.sqlite"))
+                    .unwrap();
+            let record = rumpelpod::daemon::db::get_pod(&db, repo.path(), name)
+                .unwrap()
+                .unwrap();
+            if record.agent_processing == (state == "processing") {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not observe {state:?} for {name}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
 /// Environment variable used to configure the daemon socket path.
 pub const SOCKET_PATH_ENV: &str = "RUMPELPOD_DAEMON_SOCKET";

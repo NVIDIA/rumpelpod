@@ -550,6 +550,10 @@ fn compose_sidecar_forward_survives_project_restart() {
     daemon.kill();
     drop(daemon);
     let daemon = TestDaemon::start(&home);
+    pod_command(&repo, &daemon)
+        .args(["connect", "compose-forward"])
+        .success()
+        .unwrap();
     let local_port = forwarded_local_port(&repo, &daemon, "compose-forward", "db:19876");
     assert_eq!(
         try_echo(local_port, "after daemon restart"),
@@ -705,6 +709,10 @@ fn compose_runtime_sidecar_forward_persists() {
     daemon.kill();
     drop(daemon);
     let daemon = TestDaemon::start(&home);
+    pod_command(&repo, &daemon)
+        .args(["connect", "compose-runtime"])
+        .success()
+        .unwrap();
     let local_port = forwarded_local_port(&repo, &daemon, "compose-runtime", "db:19877");
     assert_eq!(
         try_echo(local_port, "restored runtime forward"),
