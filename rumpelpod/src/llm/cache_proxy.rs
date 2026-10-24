@@ -14,12 +14,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -99,8 +100,8 @@ static API_FORWARD_LOCK: Mutex<()> = Mutex::new(());
 // Cache key computation
 // ---------------------------------------------------------------------------
 
-/// Reduce Codex's `input` array to the turns that actually determine
-/// the answer: genuine user messages, minus the `<environment_context>`
+/// Reduce Codex's `input` array to user and inter-agent messages plus the
+/// completed tool-step count, minus the `<environment_context>`
 /// block Codex injects as a user turn.  That block carries the cwd,
 /// workspace root path, timezone, and date, all of which vary by machine
 /// and by day and would otherwise make the cache non-portable.
@@ -112,14 +113,31 @@ fn strip_openai_non_user_input(value: &mut serde_json::Value) {
         return;
     };
 
+    // A tool result starts a new model step even when no new user message has
+    // arrived. Without this distinction the cache replays the original tool
+    // call indefinitely, so tests can never observe a completed agent turn.
+    let tool_results = input
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(serde_json::Value::as_str),
+                Some("function_call_output" | "custom_tool_call_output")
+            )
+        })
+        .count();
+
     input.retain(|item| {
-        item.get("role").and_then(serde_json::Value::as_str) == Some("user")
-            && !is_environment_context(item)
+        (item.get("role").and_then(serde_json::Value::as_str) == Some("user")
+            && !is_environment_context(item))
+            || item.get("type").and_then(serde_json::Value::as_str) == Some("agent_message")
     });
     for item in input {
         if let Some(item) = item.as_object_mut() {
             item.remove("id");
         }
+    }
+    if tool_results > 0 {
+        value["tool_result_count"] = serde_json::json!(tool_results);
     }
 }
 
@@ -200,7 +218,22 @@ fn normalize_cache_fields(data: Vec<u8>) -> Vec<u8> {
     let data = replace_dates_between(data, b"<current_date>", b"</current_date>");
     let data = replace_dates_between(data, b"Today's date is ", b".");
     let data = replace_dates_between(data, b"Today's date: ", b"\\n");
-    replace_localhost_port(data)
+    let data = replace_localhost_port(data);
+    normalize_subagent_metadata(data)
+}
+
+fn normalize_subagent_metadata(data: Vec<u8>) -> Vec<u8> {
+    // These identities and accounting fields describe a CLI execution, not
+    // the delegated task. They change even when replaying identical tool calls.
+    static AGENT_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\ba[0-9a-f]{16}\b").unwrap());
+    static TASK_DIR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"/tmp/claude-[0-9]+/[^"\\\s]+/tasks/"#).unwrap());
+    static USAGE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<usage>.*?</usage>").unwrap());
+    let data = AGENT_ID.replace_all(&data, b"agent-id".as_slice());
+    let data = TASK_DIR.replace_all(&data, b"/tmp/claude-0/workspace/session/tasks/".as_slice());
+    USAGE
+        .replace_all(&data, b"<usage></usage>".as_slice())
+        .into_owned()
 }
 
 /// Replace the port in every `127.0.0.1:<port>` with a fixed
@@ -561,7 +594,88 @@ pub async fn handle_llm_cache_proxy(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{compute_cache_key, normalize_cache_fields};
+
+    #[test]
+    fn openai_cache_key_distinguishes_followup_model_steps() {
+        let mut request = json!({
+            "input": [{"role": "user", "content": "delegate this task"}],
+            "stream": true,
+        });
+        let fields = &["input", "stream"];
+        let mut previous = compute_cache_key(
+            "openai",
+            "POST",
+            "/v1/responses",
+            &serde_json::to_vec(&request).unwrap(),
+            fields,
+        );
+        for kind in ["function_call_output", "custom_tool_call_output"] {
+            request["input"].as_array_mut().unwrap().push(json!({
+                "type": kind, "call_id": "call-1", "output": "worker started"
+            }));
+            let next = compute_cache_key(
+                "openai",
+                "POST",
+                "/v1/responses",
+                &serde_json::to_vec(&request).unwrap(),
+                fields,
+            );
+            assert_ne!(next, previous);
+            previous = next;
+        }
+    }
+
+    #[test]
+    fn openai_cache_key_keeps_delegated_tasks_separate_from_the_parent() {
+        let mut request = json!({
+            "input": [{"role": "user", "content": "delegate this task"}],
+            "stream": true,
+        });
+        let fields = &["input", "stream"];
+        let parent = compute_cache_key(
+            "openai",
+            "POST",
+            "/v1/responses",
+            &serde_json::to_vec(&request).unwrap(),
+            fields,
+        );
+        request["input"].as_array_mut().unwrap().push(json!({
+            "type": "agent_message", "id": "random-id", "author": "/root", "recipient": "/root/worker",
+            "content": [{"type": "input_text", "text": "run the worker command"}],
+        }));
+        let child = compute_cache_key(
+            "openai",
+            "POST",
+            "/v1/responses",
+            &serde_json::to_vec(&request).unwrap(),
+            fields,
+        );
+        assert_ne!(child, parent);
+        request["input"][1]["id"] = json!("another-id");
+        assert_eq!(
+            child,
+            compute_cache_key(
+                "openai",
+                "POST",
+                "/v1/responses",
+                &serde_json::to_vec(&request).unwrap(),
+                fields,
+            )
+        );
+    }
+
+    #[test]
+    fn cache_key_normalizes_claude_subagent_execution_metadata() {
+        let first = br#"{"content":"agentId: a1111111111111111\noutput_file: /tmp/claude-1007/workspace/session-one/tasks/a1111111111111111.output\n<usage>total_tokens: 123\nduration_ms: 4000</usage>"}"#;
+        let second = br#"{"content":"agentId: a2222222222222222\noutput_file: /tmp/claude-2000/workspace/session-two/tasks/a2222222222222222.output\n<usage>total_tokens: 234\nduration_ms: 5000</usage>"}"#;
+        assert_eq!(
+            normalize_cache_fields(first.to_vec()),
+            normalize_cache_fields(second.to_vec())
+        );
+    }
 
     #[test]
     fn openai_cache_key_ignores_generated_message_ids() {

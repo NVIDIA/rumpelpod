@@ -919,42 +919,71 @@ fn list_shows_claude_state() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Use the built-in hook subcommand to set claude state.
-    let output = pod_command(&repo, &daemon)
-        .args([
-            "enter",
-            "--create",
-            "claude-st",
-            "--",
-            "/opt/rumpelpod/bin/rumpel",
-            "claude-hook",
-            "notify-state",
-            "processing",
-        ])
-        .output()
-        .expect("claude-hook failed");
-    assert!(
-        output.status.success(),
-        "claude-hook notify-state failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = retry::retry(Fixed::from_millis(500).take(60), || {
-        let output = pod_command(&repo, &daemon)
-            .arg("list")
-            .output()
-            .expect("rumpel list failed");
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if stdout.contains("CLAUDE") {
-            OperationResult::Ok(stdout)
-        } else {
-            OperationResult::Retry(stdout)
+    // A parent's Stop can precede its background agents' completion. Neither
+    // an idle parent nor one finishing child means the whole session is idle.
+    let events = [
+        ("main", "SessionStart", None, "idle"),
+        ("main", "UserPromptSubmit", None, "processing"),
+        ("main", "SubagentStart", Some("first"), "processing"),
+        ("main", "SubagentStart", Some("second"), "processing"),
+        ("main", "Stop", None, "processing"),
+        ("main", "SubagentStop", Some("first"), "processing"),
+        ("main", "SubagentStop", Some("first"), "processing"),
+        ("main", "SubagentStop", Some("second"), "idle"),
+        ("main", "UserPromptSubmit", None, "processing"),
+        ("main", "SubagentStart", Some("first"), "processing"),
+        ("main", "SubagentStop", Some("first"), "processing"),
+        ("other", "SessionStart", None, "processing"),
+        ("other", "Stop", None, "processing"),
+        ("other", "SessionEnd", None, "processing"),
+        ("main", "Stop", None, "idle"),
+        ("main", "StopFailure", None, "auth error"),
+        ("main", "UserPromptSubmit", None, "processing"),
+        ("main", "SubagentStart", Some("second"), "processing"),
+        ("main", "SessionEnd", None, "stopped"),
+        ("main", "SubagentStop", Some("second"), "stopped"),
+        ("main", "SessionStart", None, "idle"),
+    ];
+    for (session, event, agent, expected) in events {
+        let mut input = serde_json::json!({
+            "session_id": session,
+            "hook_event_name": event,
+        });
+        if let Some(agent) = agent {
+            input["agent_id"] = serde_json::json!(agent);
         }
-    })
-    .expect("CLAUDE column never appeared in list output");
+        let output = pod_command(&repo, &daemon)
+            .args([
+                "enter",
+                "claude-st",
+                "--",
+                "sh",
+                "-c",
+                r#"printf '%s' "$1" | /opt/rumpelpod/bin/rumpel claude-hook notify-state"#,
+                "sh",
+                &input.to_string(),
+            ])
+            .output()
+            .expect("claude-hook failed");
+        assert!(
+            output.status.success(),
+            "Claude {event} hook failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-    assert!(
-        stdout.contains("processing"),
-        "expected 'processing' in CLAUDE column: {stdout}",
-    );
+        retry::retry(Fixed::from_millis(100).take(100), || {
+            let output = pod_command(&repo, &daemon)
+                .arg("list")
+                .output()
+                .expect("rumpel list failed");
+            assert!(output.status.success());
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            if stdout.contains("CLAUDE") && stdout.contains(expected) {
+                OperationResult::Ok(())
+            } else {
+                OperationResult::Retry(stdout)
+            }
+        })
+        .unwrap_or_else(|error| panic!("expected {expected} after {input}: {error}"));
+    }
 }

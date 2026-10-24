@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "cli/agent_status.rs"]
+mod agent_status;
 #[path = "cli/claude/mod.rs"]
 mod claude;
 #[path = "cli/codex/mod.rs"]

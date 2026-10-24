@@ -12,12 +12,22 @@ them **realistic** (actual API responses, not hand-crafted mocks).
 
 The cache is served by an HTTP proxy on the host-side git server. Requests from
 inside the pod are routed to the proxy via the existing exec tunnel. Each
-request is hashed (method, path, headers, body) to produce a cache key; on hit
-the stored response is replayed, on miss the request is forwarded upstream and
-the response is stored.
+request is hashed (method, path, selected conversation fields) to produce a
+cache key; on hit the stored response is replayed, on miss the request is
+forwarded upstream and the response is stored.
 
 The cache key excludes the API key so cached responses work regardless of
 whether `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `XAI_API_KEY` is set.
+
+Codex keys retain inter-agent messages and count completed tool results so
+subagents and follow-up model steps do not replay the parent's initial response.
+Claude subagent IDs, task-directory paths, and usage statistics are normalized
+because fresh CLI sessions generate different values for the same task.
+
+Replay replaces API responses only: the real CLIs still spawn subagents, execute
+tools, and emit lifecycle events. Delegation tests hold worker commands at FIFO
+gates while checking status, then release workers individually. This makes the
+states observable without depending on model latency or brief timing windows.
 
 ## Workflow for tests
 

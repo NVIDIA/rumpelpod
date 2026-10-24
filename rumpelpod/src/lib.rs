@@ -252,8 +252,8 @@ pub fn run() -> Result<u8> {
             ClaudeHookSubcommand::PermissionRequest => {
                 hook::claude_permission_request()?;
             }
-            ClaudeHookSubcommand::NotifyState(ref args) => {
-                hook::claude_notify_state(&args.state)?;
+            ClaudeHookSubcommand::NotifyState => {
+                hook::claude_notify_state()?;
             }
         },
         Command::Hub(ref sub) => match sub {

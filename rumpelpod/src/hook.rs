@@ -12,7 +12,7 @@ use crate::cli::{PreCommitDescriptionCommand, ReferenceTransactionCommand};
 use crate::daemon;
 use crate::daemon::protocol::{Daemon, DaemonClient};
 use crate::pod::server::TOKEN_FILE;
-use crate::pod::types::{ClaudeState, NotifyClaudeStateRequest};
+use crate::pod::types::NotifyClaudeStateRequest;
 use crate::CommandExt;
 
 // -- Claude Code hooks -------------------------------------------------------
@@ -28,16 +28,10 @@ pub fn claude_permission_request() -> Result<()> {
 
 /// Report Claude Code session state to the in-container pod server.
 ///
-/// Invoked by Claude Code hooks (UserPromptSubmit, Stop, StopFailure,
-/// SessionEnd) so the daemon can track what Claude is doing.
-pub fn claude_notify_state(state_str: &str) -> Result<()> {
-    let state = match state_str {
-        "processing" => ClaudeState::Processing,
-        "waiting_for_input" => ClaudeState::WaitingForInput,
-        "auth_error" => ClaudeState::AuthError,
-        "stopped" => ClaudeState::Stopped,
-        other => return Err(anyhow::anyhow!("unknown claude state: {other}")),
-    };
+/// Session and subagent lifecycle hooks supply their identities on stdin.
+pub fn claude_notify_state() -> Result<()> {
+    let request: NotifyClaudeStateRequest =
+        serde_json::from_reader(std::io::stdin().lock()).context("reading Claude hook input")?;
 
     let token = std::fs::read_to_string(TOKEN_FILE).context("reading pod server token")?;
     let port_path = std::path::Path::new(crate::port_file::SERVER_PORT_FILE);
@@ -48,7 +42,7 @@ pub fn claude_notify_state(state_str: &str) -> Result<()> {
     let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
-        .json(&NotifyClaudeStateRequest { state })
+        .json(&request)
         .send()
         .context("posting claude state to pod server")?;
 

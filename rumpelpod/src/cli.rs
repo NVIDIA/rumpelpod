@@ -915,13 +915,7 @@ pub enum ClaudeHookSubcommand {
     /// Auto-approve permission dialogs
     PermissionRequest,
     /// Report Claude Code session state to the pod server
-    NotifyState(NotifyStateArgs),
-}
-
-#[derive(Args)]
-pub struct NotifyStateArgs {
-    /// The session state to report (processing, waiting_for_input, auth_error, stopped)
-    pub state: String,
+    NotifyState,
 }
 
 #[derive(Args)]

@@ -2336,6 +2336,7 @@ dependencies = [
  "portable-pty",
  "rand 0.10.1",
  "reflink-copy",
+ "regex",
  "reqwest",
  "retry",
  "rusqlite",

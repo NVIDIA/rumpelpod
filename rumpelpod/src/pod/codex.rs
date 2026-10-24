@@ -8,9 +8,12 @@
 //! A separate connection tracks thread status even without an attached TUI.
 
 mod snapshot;
+#[cfg(test)]
+mod status_tests;
 
 pub(super) use snapshot::{archive as archive_state, reset_fork_identity, SNAPSHOT_SOURCE_FILE};
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
@@ -364,6 +367,7 @@ async fn run_codex_monitor(
     socket_path: &Path,
 ) -> Result<()> {
     let mut ws = connect_app_server(socket_path).await?;
+    let mut threads = CodexThreads::default();
 
     // -- Initialize handshake --
     // Opt out of high-volume notifications we do not need for state
@@ -403,8 +407,14 @@ async fn run_codex_monitor(
         if let tungstenite::Message::Text(ref text) = msg {
             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(text.as_ref()) {
                 // Process any notifications that arrive before the response.
-                extract_codex_state(&obj, tx);
+                threads.notification(&obj)?;
+                threads.publish(tx);
                 if obj.get("id").and_then(|v| v.as_str()) == Some("rumpelpod-init") {
+                    if let Some(error) = obj.get("error") {
+                        return Err(anyhow::anyhow!(
+                            "Codex monitor initialization failed: {error}"
+                        ));
+                    }
                     break;
                 }
             }
@@ -417,12 +427,50 @@ async fn run_codex_monitor(
     .await
     .context("sending initialized")?;
 
+    // Reconnecting does not replay status transitions. Read every loaded
+    // thread, including subagents, without resuming or subscribing to them.
+    let mut cursor = None;
+    loop {
+        let result = monitor_request(
+            &mut ws,
+            &mut threads,
+            "thread/loaded/list",
+            serde_json::json!({"cursor": cursor}),
+        )
+        .await?;
+        let page: LoadedThreads =
+            serde_json::from_value(result).context("parsing loaded Codex threads")?;
+        for id in page.data {
+            let result = monitor_request(
+                &mut ws,
+                &mut threads,
+                "thread/read",
+                serde_json::json!({"threadId": id, "includeTurns": false}),
+            )
+            .await?;
+            let response: ReadThread =
+                serde_json::from_value(result).context("parsing Codex thread snapshot")?;
+            // Notifications observed during startup take precedence over a
+            // snapshot that might have been captured before the transition.
+            threads
+                .threads
+                .entry(response.thread.id)
+                .or_insert(response.thread.status);
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    threads.publish(tx);
+
     // -- Read notifications until disconnect --
     while let Some(msg) = ws.next().await {
         let msg = msg.context("reading notification")?;
         if let tungstenite::Message::Text(ref text) = msg {
             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(text.as_ref()) {
-                extract_codex_state(&obj, tx);
+                threads.notification(&obj)?;
+                threads.publish(tx);
             }
         }
     }
@@ -430,55 +478,150 @@ async fn run_codex_monitor(
     Ok(())
 }
 
-/// Update codex state from a parsed JSON message if it is a
-/// `thread/status/changed` notification.
-///
-/// The status field is a tagged enum:
-///   `{"type": "active", "activeFlags": ["waitingOnUserInput"]}`
-///   `{"type": "idle"}`
-///   `{"type": "systemError"}`
-fn extract_codex_state(
-    msg: &serde_json::Value,
-    tx: &tokio::sync::watch::Sender<Option<super::types::CodexState>>,
-) {
-    if msg.get("method").and_then(|m| m.as_str()) != Some("thread/status/changed") {
-        return;
-    }
-    let Some(params) = msg.get("params") else {
-        return;
-    };
-    let Some(status) = params.get("status") else {
-        return;
-    };
-    let Some(status_type) = status.get("type").and_then(|t| t.as_str()) else {
-        return;
-    };
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadedThreads {
+    data: Vec<String>,
+    next_cursor: Option<String>,
+}
 
-    let state = match status_type {
-        "active" => {
-            // waitingOnUserInput means the agent needs text from the
-            // user, which looks like idle from the outside.
-            let waiting = status
-                .get("activeFlags")
-                .and_then(|f| f.as_array())
-                .is_some_and(|flags| {
-                    flags
-                        .iter()
-                        .any(|v| v.as_str() == Some("waitingOnUserInput"))
-                });
-            if waiting {
-                CodexState::Idle
+#[derive(Deserialize)]
+struct ReadThread {
+    thread: ThreadSnapshot,
+}
+
+#[derive(Deserialize)]
+struct ThreadSnapshot {
+    id: String,
+    status: ThreadStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadStatusChanged {
+    thread_id: String,
+    status: ThreadStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ThreadStatus {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active {
+        #[serde(rename = "activeFlags")]
+        active_flags: Vec<ThreadActiveFlag>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ThreadActiveFlag {
+    WaitingOnApproval,
+    WaitingOnUserInput,
+}
+
+#[derive(Default)]
+struct CodexThreads {
+    threads: HashMap<String, ThreadStatus>,
+}
+
+impl CodexThreads {
+    fn notification(&mut self, msg: &serde_json::Value) -> Result<()> {
+        match msg.get("method").and_then(|m| m.as_str()) {
+            Some("thread/status/changed") => {
+                let change: ThreadStatusChanged = serde_json::from_value(msg["params"].clone())
+                    .context("parsing Codex thread status notification")?;
+                self.threads.insert(change.thread_id, change.status);
+            }
+            Some("thread/started") => {
+                let started: ReadThread = serde_json::from_value(msg["params"].clone())
+                    .context("parsing Codex thread started notification")?;
+                self.threads
+                    .insert(started.thread.id, started.thread.status);
+            }
+            // This connection also receives unrelated app-server notifications
+            // and responses. Only thread lifecycle messages describe activity.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn publish(&self, tx: &tokio::sync::watch::Sender<Option<CodexState>>) {
+        let current = self.state();
+        tx.send_if_modified(|state| {
+            if *state == current {
+                false
             } else {
-                CodexState::Processing
+                *state = current;
+                true
+            }
+        });
+    }
+
+    fn state(&self) -> Option<CodexState> {
+        let mut result = None;
+        for status in self.threads.values() {
+            let state = match status {
+                ThreadStatus::NotLoaded => continue,
+                ThreadStatus::Idle => CodexState::Idle,
+                ThreadStatus::SystemError => CodexState::Error,
+                ThreadStatus::Active { active_flags } => {
+                    let waiting = active_flags.iter().any(|flag| match flag {
+                        ThreadActiveFlag::WaitingOnApproval
+                        | ThreadActiveFlag::WaitingOnUserInput => true,
+                    });
+                    if !waiting {
+                        return Some(CodexState::Processing);
+                    }
+                    CodexState::Idle
+                }
+            };
+            if result != Some(CodexState::Error) {
+                result = Some(state);
             }
         }
-        "idle" => CodexState::Idle,
-        "systemError" => CodexState::Error,
-        // notLoaded and unknown values -- not actionable.
-        _ => return,
-    };
+        result
+    }
+}
 
-    tx.send_replace(Some(state));
+/// Requests are sequential on this dedicated connection. Keep consuming status
+/// changes while awaiting responses so startup cannot miss a finishing agent.
+async fn monitor_request(
+    ws: &mut WebSocketStream<UnixStream>,
+    threads: &mut CodexThreads,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let request = serde_json::json!({"id": "rumpelpod-state", "method": method, "params": params});
+    ws.send(tungstenite::Message::Text(request.to_string().into()))
+        .await
+        .with_context(|| format!("sending Codex {method}"))?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = ws.next().await {
+            let msg = msg.context("reading Codex monitor response")?;
+            if let tungstenite::Message::Text(text) = msg {
+                let obj: serde_json::Value =
+                    serde_json::from_str(&text).context("parsing Codex monitor response")?;
+                if obj.get("id").and_then(|id| id.as_str()) == Some("rumpelpod-state") {
+                    if let Some(error) = obj.get("error") {
+                        return Err(anyhow::anyhow!("Codex {method} failed: {error}"));
+                    }
+                    return obj
+                        .get("result")
+                        .cloned()
+                        .context("Codex response missing result");
+                }
+                threads.notification(&obj)?;
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Codex monitor disconnected during {method}"
+        ))
+    })
+    .await
+    .with_context(|| format!("timed out reading Codex {method}"))?
 }
 
 // ---------------------------------------------------------------------------

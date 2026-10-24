@@ -160,7 +160,7 @@ pub struct WriteHomeFilesResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeState {
-    /// Claude is actively generating a response.
+    /// Claude or one of its subagents is working.
     Processing,
     /// Claude finished its turn and is waiting for user input.
     WaitingForInput,
@@ -170,10 +170,25 @@ pub enum ClaudeState {
     Stopped,
 }
 
-/// Hook -> pod server: report a state change.
+/// Hook -> pod server: retain identities so concurrent agents cannot overwrite
+/// each other's activity. Unused hook fields are not forwarded to the server.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NotifyClaudeStateRequest {
-    pub state: ClaudeState,
+    pub session_id: String,
+    #[serde(flatten)]
+    pub event: ClaudeHookEvent,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "hook_event_name")]
+pub enum ClaudeHookEvent {
+    SessionStart,
+    UserPromptSubmit,
+    Stop,
+    StopFailure,
+    SessionEnd,
+    SubagentStart { agent_id: String },
+    SubagentStop { agent_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -187,9 +202,9 @@ pub struct NotifyClaudeStateRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexState {
-    /// A turn is running and the agent is actively working.
+    /// At least one loaded thread, including subagents, is working.
     Processing,
-    /// The thread is loaded but no turn is running.
+    /// Loaded threads are inactive or waiting for user input or approval.
     Idle,
     /// The agent hit a system error.
     Error,
