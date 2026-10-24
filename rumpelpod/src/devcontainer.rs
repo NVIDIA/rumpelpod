@@ -1070,12 +1070,10 @@ pub struct SubstitutionContext {
 pub fn substitute_vars(value: &str, ctx: &SubstitutionContext) -> String {
     let mut result = value.to_string();
     let mut i = 0;
-    while i < result.len() {
-        if !result[i..].starts_with("${") {
-            i += 1;
-            continue;
-        }
-        let start = i;
+    // Jump from one `${` to the next: advancing one byte at a time would
+    // land inside multi-byte UTF-8 characters, where slicing panics.
+    while let Some(offset) = result[i..].find("${") {
+        let start = i + offset;
         let after_dollar_brace = start + 2;
         let Some(close) = result[after_dollar_brace..].find('}') else {
             break;
@@ -1494,6 +1492,15 @@ mod tests {
     fn substitute_no_vars() {
         let ctx = full_ctx();
         assert_eq!(substitute_vars("plain string", &ctx), "plain string");
+    }
+
+    #[test]
+    fn substitute_non_ascii_text() {
+        let ctx = full_ctx();
+        assert_eq!(
+            substitute_vars("caf\u{e9}-${devcontainerId}-\u{2713}", &ctx),
+            "caf\u{e9}-abc123def456-\u{2713}"
+        );
     }
 
     #[test]
