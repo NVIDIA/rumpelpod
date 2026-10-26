@@ -12,6 +12,6 @@ attempt; transport failures and ambiguous server errors still cannot
 replay commands. Wait for connection readiness after launch before
 starting the command.
 
-Cover creation consent, terminal restoration, piped input, restart,
-reconnection, and the connected command's single RPC in integration
-tests.
+Cover creation consent, terminal restoration, piped input, clean stdout,
+restart, reconnection, and the connected command's single RPC in
+integration tests.

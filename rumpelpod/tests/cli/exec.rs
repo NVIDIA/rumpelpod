@@ -82,7 +82,8 @@ fn exec_response_proxy(daemon: &TestDaemon, status: StatusCode) -> (PathBuf, Run
             .fallback(move |request: Request| {
                 let client = client.clone();
                 async move {
-                    let url = format!("http://localhost{}", request.uri());
+                    let path = request.uri().path_and_query().unwrap();
+                    let url = format!("http://localhost{path}");
                     let response = client
                         .request(request.method().clone(), url)
                         .headers(request.headers().clone())
@@ -1299,7 +1300,8 @@ fn exec_reuses_connected_transport_for_first_and_concurrent_commands() {
             requests_tx.send(request.uri().path().to_string()).unwrap();
             let client = client.clone();
             async move {
-                let url = format!("http://localhost{}", request.uri());
+                let path = request.uri().path_and_query().unwrap();
+                let url = format!("http://localhost{path}");
                 let response = client
                     .request(request.method().clone(), url)
                     .headers(request.headers().clone())
@@ -1781,8 +1783,7 @@ fn exec_lifecycle_create_preserves_command_and_stdin() {
         "",
         indoc! {r#",
             "remoteEnv": {"EXEC_REMOTE": "${localEnv:EXEC_LOCAL}"},
-            "postCreateCommand": "printf 'exec-hook-%s\\n' output",
-            "waitFor": "postCreateCommand"
+            "initializeCommand": "printf 'exec-hook-%s\\n' output"
         "#},
     );
     fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
