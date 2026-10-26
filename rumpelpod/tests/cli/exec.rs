@@ -22,7 +22,9 @@ use indoc::{formatdoc, indoc};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use rumpelpod::daemon::protocol::{ClientContext, ConnectPodRequest, Daemon, DaemonClient};
+use rumpelpod::daemon::protocol::{
+    ClientContext, ConnectPodRequest, Daemon, DaemonClient, PodListMode, PodStatus,
+};
 use rumpelpod::CommandExt;
 use tokio::net::UnixListener;
 use tokio::runtime::Runtime;
@@ -80,7 +82,8 @@ fn exec_response_proxy(daemon: &TestDaemon, status: StatusCode) -> (PathBuf, Run
             .fallback(move |request: Request| {
                 let client = client.clone();
                 async move {
-                    let url = format!("http://localhost{}", request.uri());
+                    let path = request.uri().path_and_query().unwrap();
+                    let url = format!("http://localhost{path}");
                     let response = client
                         .request(request.method().clone(), url)
                         .headers(request.headers().clone())
@@ -367,6 +370,7 @@ fn exec_does_not_fall_back_on_other_http_errors() {
         StatusCode::UNAUTHORIZED,
         StatusCode::FORBIDDEN,
         StatusCode::CONFLICT,
+        StatusCode::PRECONDITION_FAILED,
         StatusCode::INTERNAL_SERVER_ERROR,
         StatusCode::BAD_GATEWAY,
     ] {
@@ -1072,9 +1076,21 @@ fn exec_tty_restores_terminal_after_startup_failure() {
     let repo = TestRepo::new();
     let home = TestHome::new();
     let daemon = TestDaemon::start(&home);
-    let mut terminal =
-        ExecTerminal::spawn(&repo, &daemon, &["exec", "-t", "missing", "--", "true"]);
-    terminal.wait_for("not found");
+    let mut terminal = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "-t",
+            "--create",
+            "--devcontainer",
+            "missing-devcontainer.json",
+            "missing",
+            "--",
+            "true",
+        ],
+    );
+    terminal.wait_for("invalid --devcontainer");
     assert!(!terminal.wait().success());
     terminal.assert_restored();
 }
@@ -1269,6 +1285,52 @@ fn exec_reuses_connected_transport_for_first_and_concurrent_commands() {
         "invalid json",
     )
     .unwrap();
+
+    let socket = home.path().join("exec-count.sock");
+    let runtime = Runtime::new().unwrap();
+    let (requests_tx, requests_rx) = mpsc::channel();
+    runtime.block_on(async {
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .unix_socket(daemon.socket_path.as_path())
+            .build()
+            .unwrap();
+        let app = Router::new().fallback(move |request: Request| {
+            requests_tx.send(request.uri().path().to_string()).unwrap();
+            let client = client.clone();
+            async move {
+                let path = request.uri().path_and_query().unwrap();
+                let url = format!("http://localhost{path}");
+                let response = client
+                    .request(request.method().clone(), url)
+                    .headers(request.headers().clone())
+                    .body(reqwest::Body::wrap_stream(
+                        request.into_body().into_data_stream(),
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                Response::builder()
+                    .status(response.status())
+                    .body(Body::from_stream(response.bytes_stream()))
+                    .unwrap()
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    pod_command(&repo, &daemon)
+        .env("RUMPELPOD_DAEMON_SOCKET", &socket)
+        .args(["exec", "test", "--", "true"])
+        .success()
+        .unwrap();
+    assert_eq!(
+        requests_rx.try_iter().collect::<Vec<_>>(),
+        ["/pod/exec"],
+        "a connected exec must not need a separate preparation roundtrip"
+    );
     let started = Instant::now();
     pod_command(&repo, &daemon)
         .args([
@@ -1644,7 +1706,128 @@ fn exec_does_not_replay_a_command_when_the_server_dies() {
 }
 
 #[test]
-fn exec_requires_an_existing_connected_pod() {
+fn exec_lifecycle_missing_pod_requires_creation_consent() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let daemon = TestDaemon::start(&home);
+    let missing = pod_command(&repo, &daemon)
+        .args(["exec", "test", "--", "true"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("does not exist"), "{stderr}");
+    assert!(stderr.contains("--create"), "{stderr}");
+    assert!(DaemonClient::new_unix(&daemon.socket_path)
+        .list_pods(repo.path().to_path_buf(), PodListMode::Offline, false)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn exec_lifecycle_prompts_before_creating_a_missing_pod() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+
+    let mut declined = ExecTerminal::spawn(&repo, &daemon, &["exec", "-t", "test", "--", "true"]);
+    declined.wait_for("Create it? [Y/n]");
+    declined.writer.write_all(b"n\n").unwrap();
+    assert_ne!(declined.wait().exit_code(), 0);
+    assert!(String::from_utf8_lossy(&declined.output).contains("pod creation cancelled"));
+    declined.assert_restored();
+    assert!(DaemonClient::new_unix(&daemon.socket_path)
+        .list_pods(repo.path().to_path_buf(), PodListMode::Offline, false)
+        .unwrap()
+        .is_empty());
+
+    let mut accepted = ExecTerminal::spawn(
+        &repo,
+        &daemon,
+        &[
+            "exec",
+            "-t",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "test -t 0 && test -t 1 && test -t 2 || exit 1; printf created-command; exit 42",
+        ],
+    );
+    accepted.wait_for("Create it? [Y/n]");
+    accepted.writer.write_all(b"yes\n").unwrap();
+    accepted.wait_for("created-command");
+    assert_eq!(accepted.wait().exit_code(), 42);
+    accepted.assert_restored();
+}
+
+#[test]
+fn exec_lifecycle_create_preserves_command_and_stdin() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let daemon = TestDaemon::start(&home);
+    fs::create_dir(repo.path().join("nested dir")).unwrap();
+    fs::write(repo.path().join("nested dir/keep"), "").unwrap();
+    Command::new("git")
+        .current_dir(repo.path())
+        .args(["add", "nested dir/keep"])
+        .success()
+        .unwrap();
+    create_commit(repo.path(), "Keep the exec working directory in the pod");
+    write_test_devcontainer(
+        &repo,
+        "",
+        indoc! {r#",
+            "remoteEnv": {"EXEC_REMOTE": "${localEnv:EXEC_LOCAL}"},
+            "initializeCommand": "printf 'exec-hook-%s\\n' output"
+        "#},
+    );
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    let mut child = pod_command(&repo, &daemon)
+        .env("EXEC_LOCAL", "from-exec")
+        .current_dir(repo.path().join("nested dir"))
+        .args([
+            "exec",
+            "--create",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "cat; id -un; pwd; printf '%s\\n' \"$EXEC_REMOTE\" \"$1\"; exit 42",
+            "sh",
+            "$HOME 'quoted'",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input: Vec<u8> = (0..128 * 1024).map(|index| index as u8).collect();
+    let mut expected = input.clone();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || stdin.write_all(&input).unwrap());
+    let output = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    expected.extend_from_slice(
+        format!("{TEST_USER}\n{TEST_REPO_PATH}/nested dir\nfrom-exec\n$HOME 'quoted'\n").as_bytes(),
+    );
+    assert_eq!(output.stdout, expected);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("exec-hook-output\n"), "{stderr}");
+}
+
+#[test]
+fn exec_lifecycle_starts_a_stopped_pod() {
     if !executor_supports_stop() {
         return;
     }
@@ -1654,24 +1837,77 @@ fn exec_requires_an_existing_connected_pod() {
     let daemon = TestDaemon::start(&home);
     write_test_devcontainer(&repo, "", "");
     fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
-    let missing = pod_command(&repo, &daemon)
-        .args(["exec", "test", "--", "true"])
-        .output()
-        .unwrap();
-    assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("not found"));
     pod_command(&repo, &daemon)
-        .args(["enter", "--create", "test", "--", "true"])
+        .args([
+            "enter",
+            "--create",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "printf preserved > /tmp/exec-lifecycle-marker",
+        ])
         .success()
         .unwrap();
     pod_command(&repo, &daemon)
         .args(["stop", "--wait", "test"])
         .success()
         .unwrap();
-    let stopped = pod_command(&repo, &daemon)
-        .args(["exec", "test", "--", "true"])
-        .output()
+    let output = pod_command(&repo, &daemon)
+        .args(["exec", "test", "--", "cat", "/tmp/exec-lifecycle-marker"])
+        .success()
         .unwrap();
-    assert!(!stopped.status.success());
-    assert!(String::from_utf8_lossy(&stopped.stderr).contains("not connected"));
+    assert_eq!(output, b"preserved");
+    wait_connected(&repo, &daemon);
+}
+
+#[test]
+fn exec_lifecycle_reconnects_after_daemon_restart() {
+    let repo = TestRepo::new();
+    let home = TestHome::new();
+    let executor = ExecutorResources::setup(&home);
+    let mut daemon = TestDaemon::start(&home);
+    write_test_devcontainer(&repo, "", "");
+    fs::write(repo.path().join(".rumpelpod.json"), &executor.json).unwrap();
+    pod_command(&repo, &daemon)
+        .args([
+            "enter",
+            "--create",
+            "test",
+            "--",
+            "sh",
+            "-c",
+            "printf preserved > /tmp/exec-lifecycle-marker",
+        ])
+        .success()
+        .unwrap();
+    wait_connected(&repo, &daemon);
+    let request = || ConnectPodRequest {
+        pod_name: "test".into(),
+        repo_path: repo.path().to_path_buf(),
+        client_context: ClientContext::default(),
+    };
+    let original = DaemonClient::new_unix(&daemon.socket_path)
+        .prepared_pod_connection(request())
+        .unwrap()
+        .unwrap();
+    daemon.kill();
+    drop(daemon);
+
+    let daemon = TestDaemon::start(&home);
+    let client = DaemonClient::new_unix(&daemon.socket_path);
+    let pods = client
+        .list_pods(repo.path().to_path_buf(), PodListMode::Offline, false)
+        .unwrap();
+    assert_eq!(pods.len(), 1);
+    assert_eq!(pods[0].status, PodStatus::Disconnected);
+    assert!(client.prepared_pod_connection(request()).unwrap().is_none());
+    let output = pod_command(&repo, &daemon)
+        .args(["exec", "test", "--", "cat", "/tmp/exec-lifecycle-marker"])
+        .success()
+        .unwrap();
+    assert_eq!(output, b"preserved");
+    wait_connected(&repo, &daemon);
+    let reconnected = client.prepared_pod_connection(request()).unwrap().unwrap();
+    assert_eq!(reconnected.container_id.0, original.container_id.0);
 }
