@@ -151,12 +151,14 @@ pub enum Command {
     #[command(verbatim_doc_comment)]
     Enter(EnterCommand),
 
-    /// Execute a program in a connected pod without starting a shell.
+    /// Execute a program in a pod without starting a shell.
     ///
     /// Uses the pod user and resolved environment. The working directory
     /// corresponds to your current directory relative to the repository root.
     /// Streams stdin, stdout, and stderr. Use --tty for terminal programs
     /// such as SSH password prompts; terminal output combines stdout and stderr.
+    /// Creates missing pods after confirmation, starts stopped pods, and
+    /// connects disconnected pods. Use --create to skip creation confirmation.
     /// Commands are never retried after a connection failure.
     ///
     /// Examples:
@@ -491,9 +493,16 @@ pub struct ExecCommand {
     #[arg(short = 't', long)]
     pub tty: bool,
 
-    /// Name of an existing connected pod
+    /// Name for this pod instance (e.g., 'dev', 'test')
     #[arg(value_parser = validate_pod_name, add = PodNameCompleter::candidates())]
     pub name: String,
+
+    #[command(flatten)]
+    pub container_config: ContainerConfigArgs,
+
+    /// Create the pod if it doesn't exist
+    #[arg(long)]
+    pub create: bool,
 
     /// Executable and arguments (use sh -c explicitly for shell syntax)
     #[arg(last = true, required = true, value_name = "COMMAND")]

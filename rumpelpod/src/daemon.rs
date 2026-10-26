@@ -400,53 +400,55 @@ pub struct DaemonServer {
     ambient_ssh_agents: AmbientSshAgents,
 }
 
+pub(crate) struct ExecConnection {
+    pub client: reqwest::Client,
+    pub endpoint: pod_connection::PodEndpoint,
+    pub http_version: reqwest::Version,
+}
+
 impl DaemonServer {
     pub(crate) fn exec_connection(
         &self,
         request: &ConnectPodRequest,
-    ) -> Result<(
-        reqwest::Client,
-        crate::daemon::pod_connection::PodEndpoint,
-        reqwest::Version,
-    )> {
+    ) -> Result<Option<ExecConnection>> {
         self.remember_client_context(&request.client_context);
         let record = {
             let conn = self.db.lock().unwrap();
-            db::get_pod(&conn, &request.repo_path, &request.pod_name)?
-                .with_context(|| format!("pod '{}' not found", request.pod_name))?
+            let Some(record) = db::get_pod(&conn, &request.repo_path, &request.pod_name)? else {
+                return Ok(None);
+            };
+            record
         };
         let name = &request.pod_name;
-        let unavailable = || {
-            anyhow::anyhow!("pod '{name}' is not connected; use 'rumpel enter {name}' to connect")
-        };
         match record.status {
             db::PodStatus::Ready => {}
             db::PodStatus::Initializing
             | db::PodStatus::Error
             | db::PodStatus::Stopping
             | db::PodStatus::Deleting
-            | db::PodStatus::DeleteFailed => return Err(unavailable()),
+            | db::PodStatus::DeleteFailed => return Ok(None),
         }
-        let connection = self
-            .connections
-            .pod(&request.repo_path, name)
-            .ok_or_else(unavailable)?;
+        let Some(connection) = self.connections.pod(&request.repo_path, name) else {
+            return Ok(None);
+        };
         match connection.status() {
             PodConnectionStatus::Connected => {}
             PodConnectionStatus::Connecting
             | PodConnectionStatus::HostDisconnected
             | PodConnectionStatus::PodDisconnected
-            | PodConnectionStatus::Stopped => return Err(unavailable()),
+            | PodConnectionStatus::Stopped => return Ok(None),
         }
-        let endpoint = connection.endpoint().ok_or_else(unavailable)?;
+        let Some(endpoint) = connection.endpoint() else {
+            return Ok(None);
+        };
         if endpoint.token != record.token {
-            return Err(unavailable());
+            return Ok(None);
         }
-        Ok((
-            connection.http_client.clone(),
+        Ok(Some(ExecConnection {
+            client: connection.http_client.clone(),
             endpoint,
-            connection.event_http_version()?,
-        ))
+            http_version: connection.event_http_version()?,
+        }))
     }
 
     fn prepared_connection(

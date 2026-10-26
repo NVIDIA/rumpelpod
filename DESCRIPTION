@@ -1,0 +1,17 @@
+Prepare pods without slowing connected exec
+
+Allow exec to create missing pods with confirmation or --create,
+restart stopped pods, and reconnect disconnected pods through enter's
+launch path. Keep stdin untouched until execution is accepted and send
+launch progress to stderr so preparation cannot corrupt command input
+or output.
+
+Preserve the single-request connected path. Only a daemon response
+proving that no command was forwarded permits preparation and another
+attempt; transport failures and ambiguous server errors still cannot
+replay commands. Wait for connection readiness after launch before
+starting the command.
+
+Cover creation consent, terminal restoration, piped input, restart,
+reconnection, and the connected command's single RPC in integration
+tests.

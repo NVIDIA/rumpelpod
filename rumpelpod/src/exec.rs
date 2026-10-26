@@ -4,8 +4,9 @@
 use std::env::VarError;
 use std::io::{self, IsTerminal};
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -26,13 +27,16 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::async_runtime::block_on;
 use crate::cli::ExecCommand;
 use crate::daemon::protocol::{ClientContext, ConnectPodRequest, Daemon, DaemonClient};
-use crate::daemon::{self, DaemonServer};
+use crate::daemon::reconnect::ReconnectEvent;
+use crate::daemon::{self, DaemonServer, ExecConnection};
+use crate::enter::{confirm_pod_creation, launch_pod_with_progress};
 use crate::exec_pty::RawTerminal;
 use crate::exec_stream::{
     self, ExecSignal, ExecSpec, ExecutionId, Frame, ResizeRequest, SignalRequest, TerminalSize,
     TerminalSpec, CHUNK_SIZE, CONTENT_TYPE, UNKNOWN_OUTCOME,
 };
 use crate::git::get_repo_root;
+use crate::image::OutputLine;
 
 #[derive(Serialize, Deserialize)]
 struct ExecRequest {
@@ -40,7 +44,98 @@ struct ExecRequest {
     spec: ExecSpec,
 }
 
+// This header is never copied from pod responses: it permits preparation only
+// when the daemon rejected the request before forwarding it.
+const PREPARE_HEADER: &str = "x-rumpel-exec-prepare";
+
+enum ExecOutcome {
+    Exited(u8),
+    Prepare,
+    Legacy,
+}
+
 pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
+    let repo_path = get_repo_root()?;
+    let mut prepared = false;
+    loop {
+        match streaming_exec(command, &repo_path)? {
+            ExecOutcome::Exited(code) => return Ok(code),
+            ExecOutcome::Legacy => break,
+            ExecOutcome::Prepare => {
+                if prepared {
+                    return Err(anyhow::anyhow!("pod disconnected before exec could start"));
+                }
+                let host = command.container_config.resolve_host()?;
+                confirm_pod_creation(&command.name, &repo_path, command.create)?;
+                launch_pod_with_progress(
+                    &command.name,
+                    host,
+                    command.container_config.devcontainer.clone(),
+                    |line| match line {
+                        // Startup hooks must not contaminate the program's stdout.
+                        OutputLine::Stdout(line) | OutputLine::Stderr(line) => eprintln!("{line}"),
+                    },
+                )?;
+                wait_connected(&repo_path, &command.name)?;
+                prepared = true;
+            }
+        }
+    }
+
+    let socket = daemon::socket_path()?;
+    let connection = DaemonClient::new_unix(&socket)
+        .prepared_pod_connection(ConnectPodRequest {
+            pod_name: command.name.clone(),
+            repo_path: repo_path.clone(),
+            client_context: ClientContext::current(),
+        })?
+        .context("pod is no longer connected for exec fallback")?;
+    let status = crate::enter::enter_prepared(
+        &connection,
+        &repo_path,
+        &command.command,
+        command.tty,
+        false,
+    )?;
+    let code = match (status.code(), status.signal()) {
+        (Some(code), None) => code,
+        (None, Some(signal)) => 128 + signal,
+        (code, signal) => {
+            return Err(anyhow::anyhow!(
+                "unexpected exec status: {code:?}, {signal:?}"
+            ));
+        }
+    };
+    u8::try_from(code).context("exec exit status is outside 0..=255")
+}
+
+fn wait_connected(repo_path: &Path, pod_name: &str) -> Result<()> {
+    let socket = daemon::socket_path()?;
+    let client = DaemonClient::new_unix_with_timeout(&socket, Some(Duration::from_secs(60)));
+    // Launch can finish before the event observer receives the ready greeting.
+    // Subscribing also reports an already-established connection without polling.
+    for event in client.pod_reconnect_events(repo_path, pod_name)? {
+        match event? {
+            ReconnectEvent::Connected => return Ok(()),
+            ReconnectEvent::Attempting | ReconnectEvent::HostConnected => {}
+            ReconnectEvent::Failed { error } => {
+                return Err(anyhow::anyhow!(
+                    "connecting pod '{pod_name}' for exec: {error}"
+                ));
+            }
+            ReconnectEvent::Stopped => {
+                return Err(anyhow::anyhow!(
+                    "pod '{pod_name}' stopped before exec could start"
+                ));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "pod connection stream ended before exec could start"
+    ))
+}
+
+fn streaming_exec(command: &ExecCommand, repo_path: &Path) -> Result<ExecOutcome> {
     let interactive = command.tty && io::stdin().is_terminal();
     let terminal_fd = if !command.tty {
         None
@@ -53,13 +148,12 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
     } else {
         None
     };
-    let repo_path = get_repo_root()?;
     let relative_workdir = std::env::current_dir()?
-        .strip_prefix(&repo_path)
+        .strip_prefix(repo_path)
         .context("current directory is outside the repository")?
         .to_path_buf();
     let socket = daemon::socket_path()?;
-    let exit_code = block_on(async {
+    block_on(async {
         let window_change = if terminal_fd.is_some() {
             Some(signal(SignalKind::window_change())?)
         } else {
@@ -85,7 +179,7 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
         let request = ExecRequest {
             connection: ConnectPodRequest {
                 pod_name: command.name.clone(),
-                repo_path: repo_path.clone(),
+                repo_path: repo_path.to_path_buf(),
                 client_context: ClientContext::current(),
             },
             spec: ExecSpec {
@@ -109,10 +203,18 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
             .send()
             .await
             .context(UNKNOWN_OUTCOME)?;
-        // Only a missing endpoint proves that the command was never started.
-        // Retrying other failures could execute a command twice.
+        // Only the daemon can certify that no exec request reached the pod.
+        // A generic HTTP error or a transport failure could follow execution.
+        if response.status() == StatusCode::PRECONDITION_FAILED
+            && response
+                .headers()
+                .get(PREPARE_HEADER)
+                .is_some_and(|value| value == "true")
+        {
+            return Ok(ExecOutcome::Prepare);
+        }
         if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
+            return Ok(ExecOutcome::Legacy);
         }
         if !response.status().is_success() {
             let status = response.status();
@@ -202,36 +304,8 @@ pub(crate) fn exec(command: &ExecCommand) -> Result<u8> {
             result = signals => result,
             result = resizes => result,
         };
-        result.map(Some)
-    })?;
-    if let Some(code) = exit_code {
-        return Ok(code);
-    }
-
-    let connection = DaemonClient::new_unix(&socket)
-        .prepared_pod_connection(ConnectPodRequest {
-            pod_name: command.name.clone(),
-            repo_path: repo_path.clone(),
-            client_context: ClientContext::current(),
-        })?
-        .context("pod is no longer connected for exec fallback")?;
-    let status = crate::enter::enter_prepared(
-        &connection,
-        &repo_path,
-        &command.command,
-        command.tty,
-        false,
-    )?;
-    let code = match (status.code(), status.signal()) {
-        (Some(code), None) => code,
-        (None, Some(signal)) => 128 + signal,
-        (code, signal) => {
-            return Err(anyhow::anyhow!(
-                "unexpected exec status: {code:?}, {signal:?}"
-            ));
-        }
-    };
-    u8::try_from(code).context("exec exit status is outside 0..=255")
+        result.map(ExecOutcome::Exited)
+    })
 }
 
 async fn read_output(response: reqwest::Response) -> Result<u8> {
@@ -293,9 +367,20 @@ async fn daemon_exec(
     let request: ExecRequest = exec_stream::read_request(&mut reader)
         .await
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
-    let (client, endpoint, http_version) = daemon
+    let Some(ExecConnection {
+        client,
+        endpoint,
+        http_version,
+    }) = daemon
         .exec_connection(&request.connection)
-        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?
+    else {
+        return Ok(Response::builder()
+            .status(StatusCode::PRECONDITION_FAILED)
+            .header(PREPARE_HEADER, "true")
+            .body(Body::empty())
+            .expect("valid exec preparation response"));
+    };
     match http_version {
         reqwest::Version::HTTP_10 | reqwest::Version::HTTP_11 => {
             // Streaming exec needs HTTP/2; reject before a command can start.
@@ -354,13 +439,18 @@ async fn daemon_resize(
     State(daemon): State<Arc<DaemonServer>>,
     Query(request): Query<ExecResizeRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let (client, endpoint, _) = daemon
+    let ExecConnection {
+        client,
+        endpoint,
+        http_version: _,
+    } = daemon
         .exec_connection(&ConnectPodRequest {
             repo_path: request.repo_path,
             pod_name: request.pod_name,
             client_context: ClientContext::default(),
         })
-        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?
+        .ok_or_else(|| (StatusCode::CONFLICT, "pod is no longer connected".into()))?;
     let response = client
         .post(format!("{}/exec/resize", endpoint.url))
         .bearer_auth(&endpoint.token)
@@ -387,13 +477,18 @@ async fn daemon_signal(
     State(daemon): State<Arc<DaemonServer>>,
     Query(request): Query<ExecSignalRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let (client, endpoint, _) = daemon
+    let ExecConnection {
+        client,
+        endpoint,
+        http_version: _,
+    } = daemon
         .exec_connection(&ConnectPodRequest {
             repo_path: request.repo_path,
             pod_name: request.pod_name,
             client_context: ClientContext::default(),
         })
-        .map_err(|error| (StatusCode::CONFLICT, format!("{error:#}")))?;
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))?
+        .ok_or_else(|| (StatusCode::CONFLICT, "pod is no longer connected".into()))?;
     let response = client
         .post(format!("{}/exec/signal", endpoint.url))
         .bearer_auth(&endpoint.token)

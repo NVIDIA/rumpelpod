@@ -339,6 +339,23 @@ pub fn launch_pod(
     host_override: Option<Host>,
     devcontainer_override: Option<PathBuf>,
 ) -> Result<LaunchResult> {
+    launch_pod_with_progress(
+        pod_name,
+        host_override,
+        devcontainer_override,
+        |line| match line {
+            OutputLine::Stdout(s) => println!("{s}"),
+            OutputLine::Stderr(s) => eprintln!("{s}"),
+        },
+    )
+}
+
+pub(crate) fn launch_pod_with_progress(
+    pod_name: &str,
+    host_override: Option<Host>,
+    devcontainer_override: Option<PathBuf>,
+    mut output: impl FnMut(OutputLine),
+) -> Result<LaunchResult> {
     let t = Instant::now();
     let repo_root = get_repo_root()?;
     let docker_host = determine_host(&repo_root, host_override)?;
@@ -383,10 +400,7 @@ pub fn launch_pod(
         client_context: ClientContext::current(),
     })?;
     for line in &mut progress {
-        match line {
-            OutputLine::Stdout(s) => println!("{s}"),
-            OutputLine::Stderr(s) => eprintln!("{s}"),
-        }
+        output(line);
     }
     let result = progress.finish()?;
     let elapsed = t.elapsed();
