@@ -49,19 +49,23 @@ impl ImageRef {
 /// registry references (e.g. "ghcr.io/user/repo:tag").
 pub(crate) fn parse_image_ref(image: &str) -> ImageRef {
     // Split off @sha256:... digest if present.
-    let (name, reference) = if let Some((name, digest)) = image.split_once('@') {
-        (name, digest.to_string())
-    } else if let Some((name, tag)) = image.rsplit_once(':') {
-        // Distinguish "registry:port/repo" from "repo:tag":
-        // if the part after ':' contains '/', it is a port number
-        // followed by a repository path, not a tag.
-        if tag.contains('/') {
-            (image, "latest".to_string())
-        } else {
-            (name, tag.to_string())
-        }
-    } else {
-        (image, "latest".to_string())
+    let (name_and_tag, digest) = match image.split_once('@') {
+        Some((name_and_tag, digest)) => (name_and_tag, Some(digest)),
+        None => (image, None),
+    };
+    // Distinguish "registry:port/repo" from "repo:tag": if the part
+    // after ':' contains '/', it is a port number followed by a
+    // repository path, not a tag.
+    let (name, tag) = match name_and_tag.rsplit_once(':') {
+        Some((name, tag)) if !tag.contains('/') => (name, Some(tag)),
+        Some(_) | None => (name_and_tag, None),
+    };
+    // In "name:tag@digest" the digest alone identifies the manifest;
+    // docker ignores the tag in that case, so we do too.
+    let reference = match (digest, tag) {
+        (Some(digest), _) => digest.to_string(),
+        (None, Some(tag)) => tag.to_string(),
+        (None, None) => "latest".to_string(),
     };
 
     // Split registry from repository.
@@ -78,11 +82,17 @@ pub(crate) fn parse_image_ref(image: &str) -> ImageRef {
         ("docker.io".to_string(), format!("library/{name}"))
     };
 
-    // Docker Hub's API lives at registry-1.docker.io.
-    let registry = if registry == "docker.io" {
-        "registry-1.docker.io".to_string()
+    // Docker Hub's API lives at registry-1.docker.io, and official
+    // images such as "docker.io/ubuntu" live under "library/" there.
+    let (registry, repository) = if registry == "docker.io" {
+        let repository = if repository.contains('/') {
+            repository
+        } else {
+            format!("library/{repository}")
+        };
+        ("registry-1.docker.io".to_string(), repository)
     } else {
-        registry
+        (registry, repository)
     };
 
     ImageRef {
@@ -611,6 +621,39 @@ mod tests {
         assert_eq!(r.registry, "registry-1.docker.io");
         assert_eq!(r.repository, "library/ubuntu");
         assert_eq!(r.reference, "sha256:abcdef");
+    }
+
+    #[test]
+    fn parse_tag_and_digest_reference() {
+        // Docker accepts "name:tag@digest" and resolves by digest, which is
+        // how tools like Renovate pin images in devcontainer.json.
+        let r = parse_image_ref("ubuntu:22.04@sha256:abcdef");
+        assert_eq!(r.registry, "registry-1.docker.io");
+        assert_eq!(r.repository, "library/ubuntu");
+        assert_eq!(r.reference, "sha256:abcdef");
+
+        let r = parse_image_ref("mcr.microsoft.com/devcontainers/base:ubuntu@sha256:abcdef");
+        assert_eq!(r.registry, "mcr.microsoft.com");
+        assert_eq!(r.repository, "devcontainers/base");
+        assert_eq!(r.reference, "sha256:abcdef");
+
+        let r = parse_image_ref("localhost:5000/repo:v1@sha256:abcdef");
+        assert_eq!(r.registry, "localhost:5000");
+        assert_eq!(r.repository, "repo");
+        assert_eq!(r.reference, "sha256:abcdef");
+    }
+
+    #[test]
+    fn parse_explicit_docker_hub_official_image() {
+        let r = parse_image_ref("docker.io/ubuntu:22.04");
+        assert_eq!(r.registry, "registry-1.docker.io");
+        assert_eq!(r.repository, "library/ubuntu");
+        assert_eq!(r.reference, "22.04");
+
+        let r = parse_image_ref("docker.io/library/ubuntu");
+        assert_eq!(r.registry, "registry-1.docker.io");
+        assert_eq!(r.repository, "library/ubuntu");
+        assert_eq!(r.reference, "latest");
     }
 
     #[test]
